@@ -44,3 +44,11 @@ Private transactional state selection and authorization; atomic revision/epoch/i
 - Runtime logs confirm Contents/Metadata read permissions and checkout `persist-credentials: false`.
 - Existing v4 actions emitted a Node 20 action-runtime deprecation warning and ran under Node 24; the test runtime was Node 22 as recorded above.
 - This run verifies the identified source revision, not later documentation commits. Earlier pending-CI statements above describe the pre-publication snapshot. PR remained draft/open; main was not merged and the schedule was not activated.
+
+## Bounded action-validation follow-on
+- Baseline: `cf27275afbe3a2690bff0c9a3c0989338992fc63`. Its [run 40745643479](https://github.com/haji84/PERSONAL-AI-HQ/actions/runs/40745643479) passed 58 tests on Node v22.23.4 using synthetic merge `1efa47d3d23ce7b0a63c12c8ed44974c665c2c18` with the same base. This is baseline evidence, not evidence for the following repair.
+- Reproduced: missing or unknown actions could be classified READY. The documented synthetic `test` action is now the only safe action; unknown, missing, empty, malformed and sparse action arrays are BLOCKED.
+- The eight existing approval actions remain gated, including when combined with `test`; unknown actions mixed with approval actions are BLOCKED. Valid-base merge tasks still await approval regardless of actions. No execution authority or approval bypass was added.
+- Focused RED: 8 tests, 7 passed and 1 failed. Whole-suite GREEN after repair: 61 passed, 0 failed on Node v24.22.1. Remote CI for this change remains pending publication.
+- Scope is action validation only. Existing cost/retry behavior is unchanged; explicit null context is not hardened by this slice. This remains a synthetic planner, not a trusted runtime authorization boundary.
+- Separate-agent code critique found no blocking finding and independently reran all 61 tests plus mixed-action and nonmutation probes. The model-identity and formal-approval limitations above still apply.

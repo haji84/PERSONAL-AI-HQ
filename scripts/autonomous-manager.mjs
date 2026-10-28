@@ -4,7 +4,11 @@ import {readFileSync} from 'node:fs';
 export const APPROVAL_ACTIONS=new Set(['spend','publish','delete','permissions','security-policy','architecture','goal-change','merge-main']);
 export function decide(task,context={}){
  if(!task||typeof task.id!=='string'||!task.goal||!Array.isArray(task.acceptance)) return {status:'BLOCKED',reason:'invalid-task'};
- if(task.kind==='merge'||task.actions?.some(a=>APPROVAL_ACTIONS.has(a))) return {status:'AWAITING_APPROVAL',reason:'verified-human-gate-not-implemented'};
+ if(task.kind==='merge') return {status:'AWAITING_APPROVAL',reason:'verified-human-gate-not-implemented'};
+ // Only the documented synthetic test action is safe. Iterate holes as undefined.
+ if(!Array.isArray(task.actions)||task.actions.length===0) return {status:'BLOCKED',reason:'invalid-task'};
+ for(const action of task.actions) if(typeof action!=='string'||(action!=='test'&&!APPROVAL_ACTIONS.has(action))) return {status:'BLOCKED',reason:'invalid-task'};
+ if(task.actions.some(a=>APPROVAL_ACTIONS.has(a))) return {status:'AWAITING_APPROVAL',reason:'verified-human-gate-not-implemented'};
  if(!Number.isFinite(context.costYen??0)||(context.costYen??0)!==0) return {status:'AWAITING_APPROVAL',reason:'nonzero-or-unknown-cost'};
  if(task.retryCount>=3) return {status:'BLOCKED',reason:'retry-limit'};
  // No merge authority is implemented. Never trust caller-supplied approval/review booleans.
