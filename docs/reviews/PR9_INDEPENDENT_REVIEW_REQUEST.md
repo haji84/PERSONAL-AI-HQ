@@ -26,3 +26,6 @@ For each finding: severity, exact path/line, scenario, reproduction commands wit
 
 ## Release gate
 No main merge until independently verified reviewer output, reproducible fixes, current-HEAD CI, negative/positive E2E, and explicit policy approval. Do not equate passing CI with prevention of initial public disclosure.
+
+## Repair addendum (2026-10-28)
+The frozen subject above is historical and MUST NOT be reused for approval of a later HEAD. Repair baseline: 1fc8b98ac5211301620434353f2aa8e4bb9dbb8d. The current repair must receive exact-commit independent review and terminal CI before any evidence promotion. Separate-model identity and independent enforcement are still unverified; no autonomous-write activation or merge is authorized. See `docs/SECRET_GUARD.md` for external fixed-scanner evidence requirements.
