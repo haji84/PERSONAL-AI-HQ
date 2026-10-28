@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.sqlite
+*.sqlite3
+*.db
+secrets/
+private/
+userdata/
+logs/
+artifacts/
+node_modules/
+.DS_Store
