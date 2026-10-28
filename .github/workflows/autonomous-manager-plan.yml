@@ -19,6 +19,6 @@ jobs:
         with:
           node-version: '22'
       - name: Test policy engine
-        run: node --test tests/autonomous-manager.test.mjs
+        run: node --test tests/autonomous-manager.test.mjs tests/job-state.test.mjs
       - name: Run synthetic planning
         run: node scripts/autonomous-manager.mjs examples/synthetic-task.json
