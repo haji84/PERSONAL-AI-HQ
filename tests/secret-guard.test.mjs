@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {inspect} from '../scripts/secret-guard.mjs';
 const b=s=>Buffer.from(s);
 test('rejects secret-bearing paths even without secret content',()=>{assert.deepEqual(inspect('.env',b('X=1')),['forbidden-path']);assert.ok(inspect('private/notes.txt',b('x')).includes('forbidden-path'));});
-test('rejects private key without printing value',()=>assert.ok(inspect('sample.txt',b('-----BEGIN PRIVATE KEY-----')).includes('private-key')));
+test('rejects private key without printing value',()=>assert.ok(inspect('sample.txt',b(['-----BEGIN','PRIVATE KEY-----'].join(' '))).includes('private-key')));
 test('rejects synthetic GitHub token',()=>assert.ok(inspect('sample.txt',b('ghp_'+'A'.repeat(30))).includes('github-token')));
 test('rejects synthetic AWS key',()=>assert.ok(inspect('sample.txt',b('AKIA'+'A'.repeat(16))).includes('aws-access-key')));
 test('rejects generic literal credential',()=>assert.ok(inspect('sample.txt',b('api_key = "'+'a'.repeat(25)+'"')).includes('generic-credential')));
