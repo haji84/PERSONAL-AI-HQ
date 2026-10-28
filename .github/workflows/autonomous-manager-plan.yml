@@ -1,5 +1,7 @@
 name: Autonomous manager read-only planning
 on:
+  pull_request:
+    branches: [main]
   workflow_dispatch:
   schedule:
     - cron: '17 */6 * * *'
@@ -19,6 +21,6 @@ jobs:
         with:
           node-version: '22'
       - name: Test policy engine
-        run: node --test tests/autonomous-manager.test.mjs tests/job-state.test.mjs tests/builder-contract.test.mjs tests/state-lease.test.mjs
+        run: node --test tests/*.test.mjs
       - name: Run synthetic planning
         run: node scripts/autonomous-manager.mjs examples/synthetic-task.json
