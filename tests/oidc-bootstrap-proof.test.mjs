@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {readFileSync,existsSync} from 'node:fs';
+import {readFileSync,existsSync,readdirSync,lstatSync} from 'node:fs';
 import {spawnSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
 import {runBootstrapProof} from '../scripts/oidc-bootstrap-proof.mjs';
@@ -65,9 +65,22 @@ test('CLI without explicit flag fails generically and never prints environment',
  const result=spawnSync(process.execPath,['scripts/oidc-bootstrap-proof.mjs'],{cwd:new URL('..',import.meta.url),encoding:'utf8',env:{PATH:process.env.PATH,ACTIONS_ID_TOKEN_REQUEST_TOKEN:'private-sentinel'}});
  assert.equal(result.status,1);assert.equal(result.stdout,'');assert.equal(result.stderr,'OIDC_BOOTSTRAP_FAILED\n');
 });
-test('stage B template is inactive, exact reviewed source pinned, and one shot',async()=>{
+test('installed bootstrap matches exact reviewed workflow and one-shot contract',async()=>{
  const file=new URL('../templates/oidc-bootstrap.yml.example',import.meta.url);assert.equal(existsSync(file),true);const yaml=readFileSync(file,'utf8');
- assert.equal(existsSync(new URL('../'+PATH,import.meta.url)),false);assert.equal(yaml.includes('REQUIRES_REVIEWED_SOURCE_COMMIT'),false);
+ // Exact reviewed lifecycle contract; changing these bytes requires fresh review.
+ const workflowDir=new URL('../.github/workflows/',import.meta.url);
+ const activePath=new URL('../'+PATH,import.meta.url);
+ const digest=value=>createHash('sha256').update(value).digest('hex');
+ assert.equal(digest(yaml),'8d9f705e240e05b7bc13beb4a9a022d0fdd13c33b35d4fbcfa3ac3bd1778b4e4');
+ const readOnlyPath=new URL('../.github/workflows/autonomous-manager-plan.yml',import.meta.url);
+ assert.equal(lstatSync(readOnlyPath).isFile(),true);
+ assert.equal(digest(readFileSync(readOnlyPath)),'5dab11b6e988c9d3313c4725588263c6e31ca074c94fe3143fa529d135c7f974');
+ assert.deepEqual(readdirSync(workflowDir).sort(),['autonomous-manager-plan.yml','hq-oidc-bootstrap-pr11-v1.yml']);
+ assert.equal(lstatSync(activePath).isFile(),true);
+ const activeBytes=readFileSync(activePath);
+ assert.equal(digest(activeBytes),'8d9f705e240e05b7bc13beb4a9a022d0fdd13c33b35d4fbcfa3ac3bd1778b4e4');
+ assert.equal(activeBytes.equals(Buffer.from(yaml)),true);
+ assert.equal(yaml.includes('REQUIRES_REVIEWED_SOURCE_COMMIT'),false);
  const source=yaml.match(/^          ref: (.+)$/m)?.[1];assert.equal(source,'8342cbc80f72d2240aaa4bdc6058e78733027f20');
  assert.equal(yaml.match(/^          HQ_BOOTSTRAP_SOURCE_SHA: (.+)$/m)?.[1],source);
  for(const [path,expected]of [['scripts/oidc-bootstrap-proof.mjs','d5b24bea4e5d175b268570032b9b906868bbbc840c2c73269404d582306b9a65'],['package-lock.json','e916fdf8a7cb83062ec8a11b30cd6bc45ddde4df59c4fa79628894ec6be987eb'],['package.json','3a4614679461b159207434356aa5c71a9940186f6b2371b707eca83d6b48268e']])assert.equal(createHash('sha256').update(readFileSync(new URL('../'+path,import.meta.url))).digest('hex'),expected);
