@@ -126,3 +126,9 @@ test('expiry during awaited identity hashing denies at authorization completion'
  crypto.subtle.digest=async function(...args){f.advance(1000);return original.apply(this,args);};
  try{await deny(f.authorize,jwt);}finally{crypto.subtle.digest=original;}
 });
+
+test('reserved bootstrap audience can never authorize state even with matching configuration',async()=>{
+ for(const audience of ['urn:personal-ai-hq:oidc-bootstrap:repo-1437383396:pr-11:v1','urn:personal-ai-hq:oidc-bootstrap:future']){
+  const f=fixture({cfg:{...config(),audience}});await deny(f.authorize,await token({aud:audience}));assert.equal(f.calls.length,0);
+ }
+});

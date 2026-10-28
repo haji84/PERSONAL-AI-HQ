@@ -23,7 +23,7 @@ function tupleValid(value){
  ((value.job_workflow_ref===null&&value.job_workflow_sha===null)||(text(value.job_workflow_ref,512)&&sha(value.job_workflow_sha)));
 }
 function policySnapshot(config){
- if(!exactKeys(config,['audience','goal','allowed'])||!text(config.audience,512)||!(typeof config.goal==='string'&&/^[A-Za-z0-9_-]{1,80}$/.test(config.goal))||!Array.isArray(config.allowed)||config.allowed.length===0||config.allowed.length>32)throw Error();
+ if(!exactKeys(config,['audience','goal','allowed'])||!text(config.audience,512)||config.audience.startsWith('urn:personal-ai-hq:oidc-bootstrap:')||!(typeof config.goal==='string'&&/^[A-Za-z0-9_-]{1,80}$/.test(config.goal))||!Array.isArray(config.allowed)||config.allowed.length===0||config.allowed.length>32)throw Error();
  if(!config.allowed.every(tupleValid))throw Error();
  return {audience:config.audience,goal:config.goal,allowed:config.allowed.map(tuple=>Object.fromEntries(TUPLE_KEYS.map(key=>[key,tuple[key]])))};
 }
