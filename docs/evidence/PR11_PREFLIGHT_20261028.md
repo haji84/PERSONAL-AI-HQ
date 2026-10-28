@@ -35,3 +35,12 @@
 
 ## Remaining work
 Private transactional state selection and authorization; atomic revision/epoch/idempotency commits; real cross-run contention and restart evidence; eligible actual coding-model execution; test-failure repair loop; independently verifiable review; protected merge; next-Issue continuation; 24-hour E2E.
+
+## Observed publication and PR CI
+- Published source HEAD: `fdfdc53435ea79fbe63735109cf118cdc7fbc7e1`; fetched tree `9c94a9358be0d92ed777f67fd68e10a9de94cb76` exactly matched the reviewed local tree.
+- [Actions run 40744980382](https://github.com/haji84/PERSONAL-AI-HQ/actions/runs/40744980382), job `123016244343`, attempt 1, event `pull_request`: completed/success; run `updated_at` is `2026-10-28T18:25:37Z`.
+- Checkout logs identify tested synthetic merge `4665581d5dae08e9a78989109a6683bdfe511587`, combining that source HEAD with base `dd135fccbfa872ddbb3d082985b2cbf14d7ef56e`.
+- Actual Node v22.23.4: 58 tests passed, 0 failed, 0 skipped. Synthetic planning returned READY; this does not demonstrate a live coding model or autonomous issue-to-merge execution.
+- Runtime logs confirm Contents/Metadata read permissions and checkout `persist-credentials: false`.
+- Existing v4 actions emitted a Node 20 action-runtime deprecation warning and ran under Node 24; the test runtime was Node 22 as recorded above.
+- This run verifies the identified source revision, not later documentation commits. Earlier pending-CI statements above describe the pre-publication snapshot. PR remained draft/open; main was not merged and the schedule was not activated.
