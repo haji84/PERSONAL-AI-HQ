@@ -65,7 +65,7 @@ test('CLI without explicit flag fails generically and never prints environment',
  const result=spawnSync(process.execPath,['scripts/oidc-bootstrap-proof.mjs'],{cwd:new URL('..',import.meta.url),encoding:'utf8',env:{PATH:process.env.PATH,ACTIONS_ID_TOKEN_REQUEST_TOKEN:'private-sentinel'}});
  assert.equal(result.status,1);assert.equal(result.stdout,'');assert.equal(result.stderr,'OIDC_BOOTSTRAP_FAILED\n');
 });
-test('installed bootstrap matches exact reviewed workflow and one-shot contract',async()=>{
+test('bootstrap cleanup restores absence and the exact read-only workflow inventory',async()=>{
  const file=new URL('../templates/oidc-bootstrap.yml.example',import.meta.url);assert.equal(existsSync(file),true);const yaml=readFileSync(file,'utf8');
  // Exact reviewed lifecycle contract; changing these bytes requires fresh review.
  const workflowDir=new URL('../.github/workflows/',import.meta.url);
@@ -75,11 +75,8 @@ test('installed bootstrap matches exact reviewed workflow and one-shot contract'
  const readOnlyPath=new URL('../.github/workflows/autonomous-manager-plan.yml',import.meta.url);
  assert.equal(lstatSync(readOnlyPath).isFile(),true);
  assert.equal(digest(readFileSync(readOnlyPath)),'5dab11b6e988c9d3313c4725588263c6e31ca074c94fe3143fa529d135c7f974');
- assert.deepEqual(readdirSync(workflowDir).sort(),['autonomous-manager-plan.yml','hq-oidc-bootstrap-pr11-v1.yml']);
- assert.equal(lstatSync(activePath).isFile(),true);
- const activeBytes=readFileSync(activePath);
- assert.equal(digest(activeBytes),'8d9f705e240e05b7bc13beb4a9a022d0fdd13c33b35d4fbcfa3ac3bd1778b4e4');
- assert.equal(activeBytes.equals(Buffer.from(yaml)),true);
+ assert.deepEqual(readdirSync(workflowDir).sort(),['autonomous-manager-plan.yml']);
+ assert.equal(existsSync(activePath),false);
  assert.equal(yaml.includes('REQUIRES_REVIEWED_SOURCE_COMMIT'),false);
  const source=yaml.match(/^          ref: (.+)$/m)?.[1];assert.equal(source,'8342cbc80f72d2240aaa4bdc6058e78733027f20');
  assert.equal(yaml.match(/^          HQ_BOOTSTRAP_SOURCE_SHA: (.+)$/m)?.[1],source);
