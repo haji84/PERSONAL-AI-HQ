@@ -1,5 +1,5 @@
-# INACTIVE DRAFT: never install without exact, separate user activation approval.
-# Stage A intentionally fails activation validation until its reviewed source commit exists.
+# INACTIVE CANDIDATE: never install without exact, separate user activation approval.
+# Stage B pins the reviewed verifier source; this file grants no active permission.
 name: HQ OIDC bootstrap PR11 v1
 on:
   pull_request:
@@ -36,7 +36,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: haji84/PERSONAL-AI-HQ
-          ref: REQUIRES_REVIEWED_SOURCE_COMMIT
+          ref: 8342cbc80f72d2240aaa4bdc6058e78733027f20
           persist-credentials: false
           fetch-depth: 1
           submodules: false
@@ -55,7 +55,7 @@ jobs:
           fi
       - name: Verify once and emit only public identity fields
         env:
-          HQ_BOOTSTRAP_SOURCE_SHA: REQUIRES_REVIEWED_SOURCE_COMMIT
+          HQ_BOOTSTRAP_SOURCE_SHA: 8342cbc80f72d2240aaa4bdc6058e78733027f20
           HQ_BOOTSTRAP_CHECKOUT_SHA: ${{ steps.source.outputs.commit }}
           HQ_BOOTSTRAP_CHECK_RUN_ID: ${{ job.check_run_id }}
           NODE_OPTIONS: ''

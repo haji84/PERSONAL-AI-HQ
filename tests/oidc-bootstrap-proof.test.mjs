@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync,existsSync} from 'node:fs';
 import {spawnSync} from 'node:child_process';
+import {createHash} from 'node:crypto';
 import {runBootstrapProof} from '../scripts/oidc-bootstrap-proof.mjs';
 
 const REPO='haji84/PERSONAL-AI-HQ',RID='1437383396',OID='173585154',BRANCH='feature/autonomous-manager-bootstrap';
@@ -64,10 +65,14 @@ test('CLI without explicit flag fails generically and never prints environment',
  const result=spawnSync(process.execPath,['scripts/oidc-bootstrap-proof.mjs'],{cwd:new URL('..',import.meta.url),encoding:'utf8',env:{PATH:process.env.PATH,ACTIONS_ID_TOKEN_REQUEST_TOKEN:'private-sentinel'}});
  assert.equal(result.status,1);assert.equal(result.stdout,'');assert.equal(result.stderr,'OIDC_BOOTSTRAP_FAILED\n');
 });
-test('stage A draft is inactive, pinned except deliberately invalid source, and one shot',async()=>{
+test('stage B template is inactive, exact reviewed source pinned, and one shot',async()=>{
  const file=new URL('../templates/oidc-bootstrap.yml.example',import.meta.url);assert.equal(existsSync(file),true);const yaml=readFileSync(file,'utf8');
- assert.equal(existsSync(new URL('../'+PATH,import.meta.url)),false);assert.equal(yaml.includes('REQUIRES_REVIEWED_SOURCE_COMMIT'),true);
- const source=yaml.match(/^          ref: (.+)$/m)?.[1];const ctx=context();ctx.env.HQ_BOOTSTRAP_SOURCE_SHA=source;ctx.env.HQ_BOOTSTRAP_CHECKOUT_SHA=source;const draft=await fixture({ctx});assert.equal(await draft.run(),null);assert.equal(draft.calls.length,0);
+ assert.equal(existsSync(new URL('../'+PATH,import.meta.url)),false);assert.equal(yaml.includes('REQUIRES_REVIEWED_SOURCE_COMMIT'),false);
+ const source=yaml.match(/^          ref: (.+)$/m)?.[1];assert.equal(source,'8342cbc80f72d2240aaa4bdc6058e78733027f20');
+ assert.equal(yaml.match(/^          HQ_BOOTSTRAP_SOURCE_SHA: (.+)$/m)?.[1],source);
+ for(const [path,expected]of [['scripts/oidc-bootstrap-proof.mjs','d5b24bea4e5d175b268570032b9b906868bbbc840c2c73269404d582306b9a65'],['package-lock.json','e916fdf8a7cb83062ec8a11b30cd6bc45ddde4df59c4fa79628894ec6be987eb'],['package.json','3a4614679461b159207434356aa5c71a9940186f6b2371b707eca83d6b48268e']])assert.equal(createHash('sha256').update(readFileSync(new URL('../'+path,import.meta.url))).digest('hex'),expected);
+ const ctx=context();ctx.env.HQ_BOOTSTRAP_SOURCE_SHA=source;ctx.env.HQ_BOOTSTRAP_CHECKOUT_SHA=source;const pinned=await fixture({ctx});assert.ok(await pinned.run());assert.equal(pinned.calls.length,2);
+ const draftContext=context();draftContext.env.HQ_BOOTSTRAP_SOURCE_SHA='REQUIRES_REVIEWED_SOURCE_COMMIT';draftContext.env.HQ_BOOTSTRAP_CHECKOUT_SHA='REQUIRES_REVIEWED_SOURCE_COMMIT';const draft=await fixture({ctx:draftContext});assert.equal(await draft.run(),null);assert.equal(draft.calls.length,0);
  assert.equal((yaml.split('jobs:\n')[1].match(/^  [a-z]+:/gm)||[]).length,1);assert.equal((yaml.match(/id-token: write/g)||[]).length,1);
  assert.equal((yaml.match(/--github-oidc-bootstrap-once/g)||[]).length,1);assert.match(yaml,/timeout-minutes: 5/);assert.match(yaml,/node-version: '22\.23\.4'/);assert.match(yaml,/run_number == '1'/);assert.match(yaml,/run_attempt == '1'/);
  assert.match(yaml,/types: \[synchronize\]/);assert.match(yaml,/package-manager-cache: false/);assert.match(yaml,/persist-credentials: false/);
