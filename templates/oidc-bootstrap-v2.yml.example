@@ -1,5 +1,5 @@
 # INACTIVE CANDIDATE: never install without exact, separate user activation approval.
-# V2 source draft: placeholder deliberately denies until reviewed source commit exists.
+# V2 inactive candidate pins reviewed diagnostic source; separate live approval is required.
 name: HQ OIDC bootstrap PR11 v2
 on:
   pull_request:
@@ -36,7 +36,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: haji84/PERSONAL-AI-HQ
-          ref: REQUIRES_REVIEWED_V2_SOURCE_COMMIT
+          ref: d92d452f6a3beb0f9ae10c1ac7d1083720f86308
           persist-credentials: false
           fetch-depth: 1
           submodules: false
@@ -55,7 +55,7 @@ jobs:
           fi
       - name: Verify once and emit only public identity fields
         env:
-          HQ_BOOTSTRAP_SOURCE_SHA: REQUIRES_REVIEWED_V2_SOURCE_COMMIT
+          HQ_BOOTSTRAP_SOURCE_SHA: d92d452f6a3beb0f9ae10c1ac7d1083720f86308
           HQ_BOOTSTRAP_CHECKOUT_SHA: ${{ steps.source.outputs.commit }}
           HQ_BOOTSTRAP_CHECK_RUN_ID: ${{ job.check_run_id }}
           NODE_OPTIONS: ''

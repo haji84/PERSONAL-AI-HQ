@@ -1,6 +1,6 @@
 # Local-only diagnostic successor design
 
-Status: independently approved for isolated local TDD; fixed v2 preparation amendment below also independently approved for local implementation. Actual code/artifact review remains required. No activation approval. The consumed v1 run is not rerun. No active workflow, permissions, mint, state endpoint or Cloudflare resource action is proposed.
+Status: independent design and actual-code review found no blocker for the inactive v2 source draft. Final source pin and lifecycle artifacts below also passed independent narrow review as an inactive package. No activation approval. The consumed v1 run is not rerun. No active workflow, permissions, mint, state endpoint or Cloudflare resource action is proposed.
 
 ## Proven evidence and limit
 
@@ -8,13 +8,13 @@ Run 40768550319 / job 123099195190 was first run/attempt, correct branch. Checko
 
 GitHub-owned archived actions-oidc-debugger README (read 2026-10-28, sample timestamps from 2025-07-03) shows an ordinary-job example with job_workflow_ref/job_workflow_sha and 21600-second exp-iat. Its workflow does not use a reusable job. Current GitHub OIDC reference describes these claims as reusable-workflow claims. This motivates synthetic tests only: it neither proves the current provider behavior nor this run's token shape. No trust/lifetime check may be loosened from this sample.
 
-Sources: https://raw.githubusercontent.com/github/actions-oidc-debugger/main/README.md ; https://raw.githubusercontent.com/github/actions-oidc-debugger/main/.github/workflows/action-test.yml ; https://docs.github.com/en/actions/reference/security/oidc .
+Sources: [archived GitHub example](https://raw.githubusercontent.com/github/actions-oidc-debugger/main/README.md), [its ordinary workflow](https://raw.githubusercontent.com/github/actions-oidc-debugger/main/.github/workflows/action-test.yml), [current GitHub OIDC reference](https://docs.github.com/en/actions/reference/security/oidc).
 
 ## Isolation and interfaces
 
 Owned files are `scripts/oidc-bootstrap-diagnostic.mjs`, `tests/oidc-bootstrap-diagnostic.test.mjs`, `templates/oidc-bootstrap-v2.yml.example` and this document. The final pinned-template/lifecycle contract is a subsequent local preparation step after the source commit exists. Keep the consumed v1 verifier, template, lifecycle patches and existing tests byte-identical. The old template checks out an immutable historical verifier and its tests deliberately bind that hash; mutating v1 would confuse its evidence contract.
 
-The successor copies the reviewed verifier's bounded validation/transport logic with diagnostic annotations, except for the exact v2 workflow identity and reserved v2 audience approved below. First-run/first-attempt gates and every other acceptance check remain unchanged. The new template is inactive and initially has an invalid source placeholder.
+The successor copies the reviewed verifier's bounded validation/transport logic with diagnostic annotations, except for the exact v2 workflow identity and reserved v2 audience approved below. First-run/first-attempt gates and every other acceptance check remain unchanged. The new template remains inactive. Source-stage tests rejected its initial placeholder; the pinning stage binds the actual reviewed source commit below.
 
 Export `runBootstrapDiagnostic(context, dependencies)` returning either `{ok:true, proof}` or `{ok:false, stage, field}`. `proof` retains exactly the eleven existing validated public keys. Importing never requests credentials. CLI requires the same explicit one-shot flag and GitHub context; it emits only the old success JSON or `OIDC_BOOTSTRAP_FAILED stage=<fixed> field=<fixed>` and exits nonzero. No field values, arbitrary names, error text, token, request URL, headers or credentials may enter a diagnostic. Failure output is one bounded fixed-enum line; success output remains the eleven-key proof only. The pure `classifyVerificationFailure(error)` test seam never reads/returns payload, token, message, stack or cause properties; errors may contain them. It cannot change acceptance.
 
@@ -28,7 +28,7 @@ Use a private branded failure helper validating stage/field membership before co
 
 Keep the existing jose jwtVerify operation (no crypto refactor). A caught official jose `JWSSignatureVerificationFailed` may map to SIGNATURE/NONE. Official JWTExpired/JWTClaimValidationFailed may map to REGISTERED_CLAIMS with only an exact allowlisted field from the literal requiredClaims plus iss/aud; registered claims use REGISTERED_CLAIMS and custom required fields use JWT_VERIFICATION. Unknown/throwing claim getters yield NONE. Do not print/read exception message, stack, payload or arbitrary error fields; unknown errors remain JWT_VERIFICATION/NONE. This classification identifies failure class, not a signature claim about failed/unverified tokens.
 
-MINT_TRANSPORT means the single request function was entered, not proof of token issuance. TOKEN_FORMAT means a bounded JSON envelope was returned, not proof that a valid token was issued. Final claim stages occur only after jose verification. Diagnostics cannot retrospectively identify the consumed v1 failure and cannot justify a retry.
+MINT_TRANSPORT means the single request function was entered, not proof of token issuance. TOKEN_FORMAT means a bounded JSON envelope was returned, not proof that a valid token was issued. Final claim stages occur only after jose verification. Diagnostics report the first detected failure only; later checks may not have run, so the code is not an exhaustive list of every mismatch. Diagnostics cannot retrospectively identify the consumed v1 failure and cannot justify a retry.
 
 ## Required invariants/tests
 
@@ -56,4 +56,14 @@ Separate exact user approval is still required for any real v2 permission/mint a
 
 The missing-module and missing-required-claim diagnostics were observed failing before implementation/fix; the exact v2 context regression also failed before changing the two fixed identity literals. Synthetic tests cover hostile unknown/proxy errors, private property getters, malformed/uncertain responses, signature versus final policy failures, no credential access on invalid context, body timeout/no retry, immutable inputs and bounded CLI output. Canonical v1/v2 fixtures compare acceptance and exact proofs after the sole reviewed workflow-ref normalization; cross-version inputs are rejected. Archived ordinary-job/long-lifetime example shapes remain rejected.
 
-The v2 source draft deliberately uses `REQUIRES_REVIEWED_V2_SOURCE_COMMIT`; synthetic tests prove it denies before runtime credential access. It is not a runnable activation candidate. Historical v1 source/template/patch files are not edited. No actual failure stage or issuance fact has been recovered from the v1 generic log.
+The v2 source draft deliberately used `REQUIRES_REVIEWED_V2_SOURCE_COMMIT`; synthetic tests continue to prove that placeholder denies before runtime credential access. The later pinned template is still inactive and not authorized for execution. Historical v1 source/template/patch files are not edited. No actual failure stage or issuance fact has been recovered from the v1 generic log.
+
+Independent actual-source review inspected the complete v1-to-successor diff and reran the exact public baseline `0f0dc1f31432ff36e3e1f6d43295fe2b363fcbcd` plus only these four new files: **189/189 tests, zero skips**, including 18 diagnostic tests. The fixed v2 workflow/audience are the only acceptance-identity changes. This is local source evidence, not a successful live proof or retrospective diagnosis of v1.
+
+## Verified source pin and ordinary CI
+
+Source commit `d92d452f6a3beb0f9ae10c1ac7d1083720f86308` passed [ordinary CI 40771462026](https://github.com/haji84/PERSONAL-AI-HQ/actions/runs/40771462026) on Node 22.23.4: 189 passed, zero failures/skips, no active bootstrap permission. A fresh public GitHub fetch verified this commit contains diagnostic source SHA-256 `b5ec2cae53940b151d82e0e273fc5a4f24d8f02445364427d18c241d1d8dff4c`, lock `e916fdf8a7cb83062ec8a11b30cd6bc45ddde4df59c4fa79628894ec6be987eb` and manifest `3a4614679461b159207434356aa5c71a9940186f6b2371b707eca83d6b48268e`, equal to the reviewed bytes.
+
+The inactive pinned template SHA-256 is `22d8d1a19f11714d3dc89295348b18ee41c299c658b22c945340b9a5bc95f490`. Both source-pin occurrences use that actual commit. See `docs/OIDC_BOOTSTRAP_V2_ACTIVATION_CONTRACT.md` for exact future activation/cleanup test transitions and the separate authorization gate; no patch is applied during preparation.
+
+The final pin/lifecycle review independently reran 189/189 tests (zero skips), checked d92d Git-object hashes and both template pins, reconstructed both two-file patches in memory, verified exact active/cleanup postimages and syntax, and passed 16 lifecycle probes. Current v1 files were unchanged and both active paths absent. This qualifies the inert preparation only; separate exact user approval and fresh history/head/CI checks remain required.
