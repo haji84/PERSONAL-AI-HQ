@@ -1,0 +1,24 @@
+name: Autonomous manager read-only planning
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 */6 * * *'
+permissions:
+  contents: read
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Test policy engine
+        run: node --test tests/autonomous-manager.test.mjs
+      - name: Run synthetic planning
+        run: node scripts/autonomous-manager.mjs examples/synthetic-task.json
