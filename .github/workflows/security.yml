@@ -20,5 +20,7 @@ jobs:
           node-version: '22'
       - name: Test scanner
         run: node --test tests/secret-guard.test.mjs
+      - name: Real Git pre-commit E2E
+        run: node --test tests/git-hook-e2e.mjs
       - name: Scan tracked repository files
         run: node scripts/secret-guard.mjs
