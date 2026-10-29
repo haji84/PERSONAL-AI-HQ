@@ -113,5 +113,9 @@ export async function reviewGeneratedSource({request,reviewer}){
  return evaluate({request,reviewer,actual:false});
 }
 export async function runActualGeneratedReview({request,artifacts}){
+ const cwd=fileURLToPath(new URL('..',import.meta.url));
+ const observed=await runBoundedProcess('/usr/bin/git',['--no-replace-objects','rev-parse','HEAD'],
+  {cwd,env:{PATH:'/usr/bin:/bin'},timeoutMs:5000,maxBytes:4096});
+ if(request?.baseSha!==observed.stdout.trim())throw Error('Git HEAD mismatch');
  return evaluate({request,reviewer:args=>observedReviewer({...args,artifacts}),actual:true});
 }
