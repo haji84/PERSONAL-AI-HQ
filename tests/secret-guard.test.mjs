@@ -1,0 +1,20 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {inspect} from '../scripts/secret-guard.mjs';
+const b=s=>Buffer.from(s);
+test('rejects secret-bearing paths even without secret content',()=>{assert.deepEqual(inspect('.env',b('X=1')),['forbidden-path']);assert.ok(inspect('private/notes.txt',b('x')).includes('forbidden-path'));});
+test('rejects private key without printing value',()=>assert.ok(inspect('sample.txt',b(['-----BEGIN','PRIVATE KEY-----'].join(' '))).includes('private-key')));
+test('rejects synthetic GitHub token',()=>assert.ok(inspect('sample.txt',b('ghp_'+'A'.repeat(30))).includes('github-token')));
+test('rejects synthetic AWS key',()=>assert.ok(inspect('sample.txt',b('AKIA'+'A'.repeat(16))).includes('aws-access-key')));
+test('rejects generic literal credential',()=>assert.ok(inspect('sample.txt',b('api_key = "'+'a'.repeat(25)+'"')).includes('generic-credential')));
+test('allows placeholder template',()=>assert.deepEqual(inspect('.env.example',b('HQ_GITHUB_TOKEN=REPLACE_WITH_RUNTIME_SECRET')),[]));
+test('rejects binary and oversize rather than skipping',()=>{assert.ok(inspect('x.bin',Buffer.from([0,1])).includes('binary-uninspected'));assert.ok(inspect('x.txt',Buffer.alloc(1024*1024+1,65)).includes('oversize-uninspected'));});
+
+test('rejects common local credential files before public commit',()=>{
+ for(const path of ['.npmrc','.netrc','.pypirc','.git-credentials','keys/AuthKey.p8','keys/upload.jks','.kube/config','private/id_ecdsa'])
+   assert.ok(inspect(path,b('ordinary data')).includes('forbidden-path'),path);
+});
+test('rejects token-shaped data in the filename itself',()=>{
+ const token='ghp_'+'T'.repeat(30);
+ assert.ok(inspect('notes/'+token+'.txt',b('harmless file body')).includes('credential-in-path'));
+});
