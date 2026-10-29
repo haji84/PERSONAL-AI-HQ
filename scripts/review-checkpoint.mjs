@@ -4,12 +4,13 @@ import {openSync,closeSync,readFileSync,writeFileSync,fstatSync,fsyncSync,consta
 import {createHash} from 'node:crypto';
 const hash=s=>createHash('sha256').update(s).digest('hex');
 const SHA=/^[a-f0-9]{64}$/,HEAD=/^[a-f0-9]{40}$/;
+const digest=value=>typeof value==='string'&&SHA.test(value);
 const fields=new Set(['status','authority','advisoryOnly','modelExecuted','baseSha','sourceSha256',
  'promptSourceSha256','canonicalSourceSha256','testsSha256','testCaseCount','witnessValid','advisoryAgrees',
  'reviewerModelSha256','reviewerResponseSha256','requestSha256','promptSha256','failedStage','reviewReceiptSha256']);
 const stages=new Set(['review-process','format','witness','preflight','model-artifact','source-check','process','integrity']);
 function validate({baseSha,source,review}){
- if(!HEAD.test(baseSha??'')||typeof source!=='string'||Buffer.byteLength(source)>2048||
+ if(typeof baseSha!=='string'||!HEAD.test(baseSha)||typeof source!=='string'||Buffer.byteLength(source)>2048||
     !/^[a-zA-Z0-9_(),:+*\- \t\r\n]+$/.test(source)||!review||Array.isArray(review)||
     Object.keys(review).some(k=>!fields.has(k)))throw Error('Invalid checkpoint payload');
  if(review.baseSha!==baseSha||review.sourceSha256!==hash(source)||review.promptSourceSha256!==hash(source)||
@@ -17,11 +18,19 @@ function validate({baseSha,source,review}){
     !['ADVISORY_AGREEMENT','INCONCLUSIVE','FAILED'].includes(review.status)||
     !['modelExecuted','witnessValid','advisoryAgrees'].every(k=>typeof review[k]==='boolean'))
   throw Error('Checkpoint source or review mismatch');
+ // Hashes bind bytes, not the logical consistency or origin of a review.
+ if(review.status==='ADVISORY_AGREEMENT'&&(!review.witnessValid||!review.advisoryAgrees)||
+    review.status!=='ADVISORY_AGREEMENT'&&review.advisoryAgrees)
+  throw Error('Inconsistent checkpoint review status');
+ if((review.status==='FAILED')!==Object.hasOwn(review,'failedStage'))
+  throw Error('Inconsistent checkpoint failure stage');
+ if('requestSha256' in review&&review.requestSha256!==hash(JSON.stringify({baseSha,source})))
+  throw Error('Checkpoint request source mismatch');
  for(const k of ['canonicalSourceSha256','testsSha256','reviewReceiptSha256'])
-  if(!SHA.test(review[k]??''))throw Error('Missing checkpoint digest');
+  if(!digest(review[k]))throw Error('Missing checkpoint digest');
  for(const k of ['reviewerModelSha256','reviewerResponseSha256','requestSha256','promptSha256'])
-  if(k in review&&!SHA.test(review[k]))throw Error('Invalid checkpoint digest');
- if(review.modelExecuted&&(!SHA.test(review.reviewerModelSha256??'')||!SHA.test(review.reviewerResponseSha256??'')))
+  if(k in review&&!digest(review[k]))throw Error('Invalid checkpoint digest');
+ if(review.modelExecuted&&(!digest(review.reviewerModelSha256)||!digest(review.reviewerResponseSha256)))
   throw Error('Observed model identity missing');
  if('failedStage' in review&&!stages.has(review.failedStage))throw Error('Invalid failure stage');
  const {reviewReceiptSha256,...body}=review;
@@ -35,7 +44,7 @@ export function saveReviewCheckpoint(file,input){
  return {sha256:hash(text),authority:'none'};
 }
 export function loadReviewCheckpoint(file,{baseSha,expectedDigest}={}){
- if(!HEAD.test(baseSha??'')||!SHA.test(expectedDigest??''))throw Error('Expected checkpoint identity required');
+ if(typeof baseSha!=='string'||!HEAD.test(baseSha)||!digest(expectedDigest))throw Error('Expected checkpoint identity required');
  const fd=openSync(file,constants.O_RDONLY|constants.O_NOFOLLOW);
  let bytes;
  try{const st=fstatSync(fd);if(!st.isFile()||st.size>65536)throw Error('Unsafe checkpoint file');bytes=readFileSync(fd)}
