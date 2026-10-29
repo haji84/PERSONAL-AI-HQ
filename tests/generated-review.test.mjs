@@ -57,3 +57,25 @@ test('review invocation errors retain bounded stage only, never exception or mod
  assert.equal(r.failedStage,'review-process');
  assert.ok(!JSON.stringify(r).includes('PRIVATE_SENTINEL'));
 });
+
+test('review model failure retains exact bounded stage without model output',async()=>{
+ for(const stage of ['model-artifact','source-check','process','integrity']){
+  const r=await api.reviewGeneratedSource({request:{baseSha:base,source},reviewer:async()=>{
+   const failure=Error('PRIVATE_EXCEPTION_CONTENT');
+   failure.receipt={failedStage:stage,rawResponse:'PRIVATE_MODEL_BYTES'};
+   throw failure;
+  }});
+  assert.equal(r.status,'FAILED');
+  assert.equal(r.failedStage,stage);
+  assert.equal(r.modelExecuted,false);
+  assert.equal(r.authority,'none');
+  assert.doesNotMatch(JSON.stringify(r),/PRIVATE_/);
+ }
+});
+test('untrusted exception stage is never stored verbatim',async()=>{
+ const r=await api.reviewGeneratedSource({request:{baseSha:base,source},reviewer:async()=>{
+  const failure=Error('private');failure.receipt={failedStage:'PRIVATE_STAGE_CONTENT'};throw failure;
+ }});
+ assert.equal(r.failedStage,'review-process');
+ assert.doesNotMatch(JSON.stringify(r),/PRIVATE_/);
+});
