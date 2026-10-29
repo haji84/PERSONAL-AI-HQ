@@ -56,3 +56,8 @@ test('restart rejects internally contradictory receipt even when file and review
  const bytes=JSON.stringify(payload);writeFileSync(file,bytes);
  assert.throws(()=>loadReviewCheckpoint(file,{baseSha,expectedDigest:hash(bytes)}),/review|status/i);
 }));
+test('request key order does not reject the same exact source and HEAD',()=>fixture(file=>{
+ const requestSha256=hash(JSON.stringify({source,baseSha}));
+ const saved=saveReviewCheckpoint(file,{baseSha,source,review:review({requestSha256})});
+ assert.equal(loadReviewCheckpoint(file,{baseSha,expectedDigest:saved.sha256}).source,source);
+}));
