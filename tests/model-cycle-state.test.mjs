@@ -66,3 +66,19 @@ test('wrong job SHA blocks before invoking any model',async()=>{
   assert.equal(calls,0);
  });
 });
+
+test('model receipts expose only bounded source identity and review stage, not raw model text',async()=>{
+ await workspace(async dir=>{
+  const r=await api.continueModelCycle({root:dir,baseSha:head,
+   bridge:async()=>({state:'BLOCKED',reason:'review-source-unverified',
+     builder:{modelExecuted:true,sourceSha256:'b'.repeat(64),rawResponse:'PRIVATE_MODEL_OUTPUT_SENTINEL'},
+     reviewer:{modelExecuted:false,status:'NOT_RUN'},releaseAuthorized:false})});
+  assert.equal(r.state,'BLOCKED');
+  const raw=readFileSync(join(dir,'model-cycle-result.json'),'utf8');
+  const receipt=JSON.parse(raw);
+  assert.equal(receipt.builderSourceSha256,'b'.repeat(64));
+  assert.equal(receipt.reviewerStatus,'NOT_RUN');
+  assert.equal(receipt.reason,'review-source-unverified');
+  assert.doesNotMatch(raw,/PRIVATE_MODEL_OUTPUT_SENTINEL/);
+ });
+});
