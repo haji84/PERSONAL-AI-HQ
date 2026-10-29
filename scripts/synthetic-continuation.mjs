@@ -41,6 +41,7 @@ function replaceFixture(root){
  try{writeFileSync(fd,REPAIRED)}finally{closeSync(fd)}
  renameSync(tmp,source);
 }
+
 function receiptOnce(file,value){
  if(!existsSync(file)){receipt(file,value);return}
  if(JSON.stringify(json(file))!==JSON.stringify(value))throw Error('Conflicting persisted evidence');
@@ -54,6 +55,7 @@ function verifyPass(root,job){
  receiptOnce(join(root,'pass.json'),evidence);
  return evidence;
 }
+
 function execute(operation,root){
  const jobfile=join(root,'job.json'),source=join(root,'fixture.py');
  if(operation==='init'){
