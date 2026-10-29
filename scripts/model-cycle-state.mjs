@@ -4,6 +4,8 @@ import {realpathSync,lstatSync,existsSync,openSync,closeSync,writeFileSync,readF
 import {resolve,join,sep} from 'node:path';
 import {tmpdir} from 'node:os';
 import {createHash} from 'node:crypto';
+import {execFileSync} from 'node:child_process';
+import {fileURLToPath} from 'node:url';
 import {loadJob,transition,saveRevision} from './job-state.mjs';
 import {SEEDED_SOURCE} from './local-builder-adapter.mjs';
 import {runVerifiedCachedCycle} from './model-cycle-bridge.mjs';
@@ -35,6 +37,10 @@ function block(root,job,reason){
 }
 export async function continueModelCycle({root,baseSha,bridge}={}){
  if(!SHA40.test(baseSha??'')||typeof bridge!=='function')throw Error('Invalid bridge request');
+ const repoRoot=fileURLToPath(new URL('..',import.meta.url));
+ const observedHead=execFileSync('/usr/bin/git',['--no-replace-objects','rev-parse','HEAD'],
+  {cwd:repoRoot,env:{PATH:'/usr/bin:/bin'},timeout:5000,maxBuffer:4096,encoding:'utf8'}).trim();
+ if(baseSha!==observedHead)throw Error('Git HEAD mismatch');
  const dir=scratch(root),jobfile=join(dir,'job.json'),job=loadJob(jobfile);
  if(job.id!=='synthetic-cycle-v1'||job.baseSha!==digest(SEEDED_SOURCE))throw Error('Invalid stored synthetic job');
  if(job.state==='BLOCKED')return {state:'BLOCKED',reason:'already-blocked',nextTaskDispatched:false,releaseAuthorized:false,modelExecuted:false};
