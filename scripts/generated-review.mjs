@@ -14,6 +14,7 @@ const wrapper=fileURLToPath(new URL('./local-model-limit.py',import.meta.url));
 const templateSource='def add(a,b): return a + b';
 const approvedCanonical='def add(a, b):\n    return a + b';
 const HASH=/^[a-f0-9]{64}$/;
+const observedStages=new Set(['preflight','model-artifact','source-check','process','integrity','format']);
 export async function prepareGeneratedReview(request,model){
  if(!request||Object.keys(request).sort().join(',')!=='baseSha,source'||
     !/^[a-f0-9]{40}$/.test(request.baseSha??'')||typeof request.source!=='string'||
@@ -98,7 +99,9 @@ async function evaluate({request,reviewer,actual=false}){
   result.advisoryAgrees=result.witnessValid&&!witness.mismatch&&advisory.verdict==='no_defect';
   result.status=result.advisoryAgrees?'ADVISORY_AGREEMENT':'INCONCLUSIVE';
  }catch(e){
-  result.status='FAILED';result.failedStage=stage;
+  result.status='FAILED';
+  const cause=e?.receipt?.failedStage;
+  result.failedStage=stage==='review-process'&&observedStages.has(cause)?cause:stage;
   if(actual&&observedIdentity(e.receipt,request)){
    result.modelExecuted=true;
    result.reviewerModelSha256=e.receipt.modelSha256;
