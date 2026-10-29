@@ -50,3 +50,20 @@ test('checkpoint refuses forged source binding and extra raw output fields',asyn
   assert.throws(()=>cp.saveReviewCheckpoint(join(dir,'raw.json'),{baseSha:base,source,review:{...r.reviewer,rawResponse:'not approved for storage'}}));
  }finally{rmSync(dir,{recursive:true,force:true})}
 });
+
+test('failed reviewer checkpoint preserves bounded origin stage across a restart',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'hq-review-stage-'));
+ try{
+  const r=await bridge.runGeneratedSyntheticCycle({baseSha:base,builder,reviewer:async()=>{
+   const error=Error('PRIVATE_OUTPUT');error.receipt={failedStage:'model-artifact',rawResponse:'PRIVATE_RESPONSE'};
+   throw error;
+  }});
+  assert.equal(r.reviewer.status,'FAILED');
+  assert.equal(r.reviewer.failedStage,'model-artifact');
+  const file=join(dir,'review-stage.json');
+  const saved=cp.saveReviewCheckpoint(file,{baseSha:base,source:r.generatedSource,review:r.reviewer});
+  const loaded=cp.loadReviewCheckpoint(file,{baseSha:base,expectedDigest:saved.sha256});
+  assert.equal(loaded.review.failedStage,'model-artifact');
+  assert.doesNotMatch(readFileSync(file,'utf8'),/PRIVATE_/);
+ }finally{rmSync(dir,{recursive:true,force:true})}
+});
