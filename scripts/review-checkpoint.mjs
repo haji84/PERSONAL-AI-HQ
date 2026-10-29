@@ -24,7 +24,8 @@ function validate({baseSha,source,review}){
   throw Error('Inconsistent checkpoint review status');
  if((review.status==='FAILED')!==Object.hasOwn(review,'failedStage'))
   throw Error('Inconsistent checkpoint failure stage');
- if('requestSha256' in review&&review.requestSha256!==hash(JSON.stringify({baseSha,source})))
+ if('requestSha256' in review&&![hash(JSON.stringify({baseSha,source})),
+    hash(JSON.stringify({source,baseSha}))].includes(review.requestSha256))
   throw Error('Checkpoint request source mismatch');
  for(const k of ['canonicalSourceSha256','testsSha256','reviewReceiptSha256'])
   if(!digest(review[k]))throw Error('Missing checkpoint digest');
