@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtempSync,readFileSync,rmSync,writeFileSync} from 'node:fs';
+import {mkdtempSync,readFileSync,rmSync,writeFileSync,symlinkSync,unlinkSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {spawnSync} from 'node:child_process';
@@ -76,4 +76,35 @@ test('replay after crash during verification uses exact receipt without duplicat
   r=call('resume',dir);assert.equal(r.status,0,r.stderr);
   assert.equal(parse(join(dir,'job.json')).state,'BLOCKED');
  }finally{rmSync(dir,{recursive:true,force:true});}
+});
+
+test('rejects a symlinked scratch source during failing baseline',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'hq-continuation-'));
+ const other=mkdtempSync(join(tmpdir(),'hq-target-'));
+ try{
+  assert.equal(call('init',dir).status,0);
+  const external=join(other,'outside.py');
+  writeFileSync(external,readFileSync(join(dir,'fixture.py'),'utf8'));
+  unlinkSync(join(dir,'fixture.py'));symlinkSync(external,join(dir,'fixture.py'));
+  const r=call('observe-failure',dir);
+  assert.notEqual(r.status,0);
+  assert.equal(parse(join(dir,'job.json')).state,'QUEUED');
+  assert.match(readFileSync(external,'utf8'),/return a - b/);
+ }finally{rmSync(dir,{recursive:true,force:true});rmSync(other,{recursive:true,force:true})}
+});
+
+test('rejects a swapped symlink before repaired code write',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'hq-continuation-'));
+ const other=mkdtempSync(join(tmpdir(),'hq-target-'));
+ try{
+  assert.equal(call('init',dir).status,0);
+  assert.equal(call('observe-failure',dir).status,0);
+  const external=join(other,'outside.py');
+  writeFileSync(external,readFileSync(join(dir,'fixture.py'),'utf8'));
+  unlinkSync(join(dir,'fixture.py'));symlinkSync(external,join(dir,'fixture.py'));
+  const r=call('resume',dir);
+  assert.notEqual(r.status,0);
+  assert.equal(parse(join(dir,'job.json')).state,'RUNNING');
+  assert.match(readFileSync(external,'utf8'),/return a - b/);
+ }finally{rmSync(dir,{recursive:true,force:true});rmSync(other,{recursive:true,force:true})}
 });
