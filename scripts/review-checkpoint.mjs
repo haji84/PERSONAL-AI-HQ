@@ -7,7 +7,7 @@ const SHA=/^[a-f0-9]{64}$/,HEAD=/^[a-f0-9]{40}$/;
 const fields=new Set(['status','authority','advisoryOnly','modelExecuted','baseSha','sourceSha256',
  'promptSourceSha256','canonicalSourceSha256','testsSha256','testCaseCount','witnessValid','advisoryAgrees',
  'reviewerModelSha256','reviewerResponseSha256','requestSha256','promptSha256','failedStage','reviewReceiptSha256']);
-const stages=new Set(['review-process','format','witness']);
+const stages=new Set(['review-process','format','witness','preflight','model-artifact','source-check','process','integrity']);
 function validate({baseSha,source,review}){
  if(!HEAD.test(baseSha??'')||typeof source!=='string'||Buffer.byteLength(source)>2048||
     !/^[a-zA-Z0-9_(),:+*\- \t\r\n]+$/.test(source)||!review||Array.isArray(review)||
