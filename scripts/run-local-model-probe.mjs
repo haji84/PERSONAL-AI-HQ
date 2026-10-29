@@ -27,7 +27,9 @@ try{
   builderObserved:evidence.builderClaimedObserved===true,
   reviewerObserved:evidence.reviewerClaimedObserved===true,
   state:state.state,releaseGate:evidence.reviewGate,
-  nextTaskDispatched:false,remoteCheckpointVerified:false};
+  nextTaskDispatched:false,remoteCheckpointVerified:false,
+  blockedReason:evidence.reason,sourceSha256:evidence.builderSourceSha256,
+  reviewerStatus:evidence.reviewerStatus};
  console.log(JSON.stringify(measured));
  if(!measured.builderObserved||!measured.reviewerObserved||
    measured.state!=='BLOCKED'||measured.releaseGate!=='NOT_AUTHORIZED')
