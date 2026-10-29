@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Bounded, synthetic-only proof. NOT an AI builder, independent AI reviewer or GitHub writer.
-import {readFileSync,writeFileSync,openSync,closeSync,unlinkSync,realpathSync,existsSync} from 'node:fs';
+import {readFileSync,writeFileSync,openSync,closeSync,unlinkSync,realpathSync,existsSync,lstatSync,renameSync} from 'node:fs';
 import {join,resolve,sep} from 'node:path';
 import {tmpdir} from 'node:os';
 import {createHash} from 'node:crypto';
@@ -30,12 +30,23 @@ function locked(root,fn){
 }
 function receipt(file,value){const fd=openSync(file,'wx',0o600);try{writeFileSync(fd,JSON.stringify(value,null,2))}finally{closeSync(fd)}}
 function json(file){return JSON.parse(readFileSync(file,'utf8'))}
+function assertSafeSource(root){
+ const source=join(root,'fixture.py');const info=lstatSync(source);
+ if(!info.isFile()||info.isSymbolicLink())throw Error('Unsafe synthetic fixture source');
+ return source;
+}
+function replaceFixture(root){
+ const source=assertSafeSource(root),tmp=join(root,'fixture.repaired.tmp');
+ const fd=openSync(tmp,'wx',0o600);
+ try{writeFileSync(fd,REPAIRED)}finally{closeSync(fd)}
+ renameSync(tmp,source);
+}
 function receiptOnce(file,value){
  if(!existsSync(file)){receipt(file,value);return}
  if(JSON.stringify(json(file))!==JSON.stringify(value))throw Error('Conflicting persisted evidence');
 }
 function verifyPass(root,job){
- const source=readFileSync(join(root,'fixture.py'),'utf8');
+ const source=readFileSync(assertSafeSource(root),'utf8');
  if(source!==REPAIRED)throw Error('Unverified repaired source');
  const observed=testFixture(root);
  if(observed.exit!==0||observed.failedCases!==0)throw Error('Repaired tests not passing');
@@ -53,7 +64,7 @@ function execute(operation,root){
  let job=loadJob(jobfile);
  if(operation==='observe-failure'){
   if(job.state!=='QUEUED')throw Error('Duplicate or illegal initial attempt');
-  if(sha256(readFileSync(source,'utf8'))!==job.baseSha)throw Error('Seed SHA mismatch');
+  assertSafeSource(root);if(sha256(readFileSync(source,'utf8'))!==job.baseSha)throw Error('Seed SHA mismatch');
   const observed=testFixture(root);if(observed.exit!==1||observed.failedCases===0)throw Error('Expected failing tests not observed');
   receiptOnce(join(root,'failure.json'),{kind:'observed-test-failure',sourceSha256:job.baseSha,...observed});
   const next=transition(job,'RUNNING',{expectedRevision:job.revision,reason:'failure-observed',attemptId:'synthetic-attempt-1'});
@@ -69,9 +80,9 @@ function execute(operation,root){
   if(job.state!=='RUNNING')throw Error('Missing observed failed state');
   const failure=json(join(root,'failure.json'));
   if(failure.kind!=='observed-test-failure'||failure.sourceSha256!==job.baseSha||failure.failedCases===0||failure.exit!==1)throw Error('Unverified prior failure');
-  const current=readFileSync(source,'utf8');
+  const current=readFileSync(assertSafeSource(root),'utf8');
   if(current!==SEED && current!==REPAIRED)throw Error('Unauthorized source mutation');
-  if(current===SEED)writeFileSync(source,REPAIRED,{mode:0o600});
+  if(current===SEED)replaceFixture(root);
   const evidence=verifyPass(root,job);
   const sourceSha256=evidence.sourceSha256;
   let next=transition(job,'VERIFYING',{expectedRevision:job.revision,reason:'real-tests-passed-scripted-synthetic',evidence});
