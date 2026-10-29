@@ -9,3 +9,12 @@ test('rejects synthetic AWS key',()=>assert.ok(inspect('sample.txt',b('AKIA'+'A'
 test('rejects generic literal credential',()=>assert.ok(inspect('sample.txt',b('api_key = "'+'a'.repeat(25)+'"')).includes('generic-credential')));
 test('allows placeholder template',()=>assert.deepEqual(inspect('.env.example',b('HQ_GITHUB_TOKEN=REPLACE_WITH_RUNTIME_SECRET')),[]));
 test('rejects binary and oversize rather than skipping',()=>{assert.ok(inspect('x.bin',Buffer.from([0,1])).includes('binary-uninspected'));assert.ok(inspect('x.txt',Buffer.alloc(1024*1024+1,65)).includes('oversize-uninspected'));});
+
+test('rejects common local credential files before public commit',()=>{
+ for(const path of ['.npmrc','.netrc','.pypirc','.git-credentials','keys/AuthKey.p8','keys/upload.jks','.kube/config','private/id_ecdsa'])
+   assert.ok(inspect(path,b('ordinary data')).includes('forbidden-path'),path);
+});
+test('rejects token-shaped data in the filename itself',()=>{
+ const token='ghp_'+'T'.repeat(30);
+ assert.ok(inspect('notes/'+token+'.txt',b('harmless file body')).includes('credential-in-path'));
+});
