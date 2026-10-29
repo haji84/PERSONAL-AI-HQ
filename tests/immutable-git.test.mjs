@@ -37,3 +37,12 @@ test('unmerged index fails closed',()=>fixture(({git,scan,put})=>{const base=git
 test('explicit annotated tag object is not a commit identity',()=>fixture(({git,scan})=>{git('tag','-a','synthetic-tag','-m','synthetic');blocked(scan('--commit',git('rev-parse','synthetic-tag')));}));
 test('CLI invoked through scanner symlink cannot silently pass',()=>fixture(({dir,git,scan,put,env})=>{put('bad.txt',token());git('add','bad.txt');symlinkSync(join(dir,'scanner.mjs'),join(dir,'scanner-link.mjs'));blocked(spawnSync(process.execPath,[join(dir,'scanner-link.mjs'),'--staged'],{cwd:dir,env,encoding:'utf8'}));}));
 test('CLI symlink works with preserve-symlinks-main',()=>fixture(({dir,git,put,env})=>{put('bad.txt',token());git('add','bad.txt');symlinkSync(join(dir,'scanner.mjs'),join(dir,'scanner-link.mjs'));blocked(spawnSync(process.execPath,['--preserve-symlinks-main',join(dir,'scanner-link.mjs'),'--staged'],{cwd:dir,env,encoding:'utf8'}));}));
+
+test('scanner diagnostics redact synthetic credentials embedded in file paths',()=>fixture(({git,scan,put})=>{
+ const secret=token(), filename='synthetic-'+secret+'.txt';
+ put(filename,secret);
+ git('add','--',filename);
+ const result=scan('--staged');
+ blocked(result);
+ assert.doesNotMatch(result.stderr+result.stdout,new RegExp(secret));
+}));
