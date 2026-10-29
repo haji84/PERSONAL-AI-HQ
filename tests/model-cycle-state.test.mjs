@@ -7,12 +7,12 @@ import {spawnSync} from 'node:child_process';
 let api;try{api=await import('../scripts/model-cycle-state.mjs')}catch{}
 const runner=new URL('../scripts/synthetic-continuation.mjs',import.meta.url).pathname;
 function localRun(operation,dir){return spawnSync(process.execPath,[runner,operation,dir],{encoding:'utf8',timeout:15000});}
-function workspace(fn){
+async function workspace(fn){
  const dir=mkdtempSync(join(tmpdir(),'hq-model-cycle-'));
  try{
   assert.equal(localRun('init',dir).status,0);
   assert.equal(localRun('observe-failure',dir).status,0);
-  return fn(dir);
+  return await fn(dir);
  }finally{rmSync(dir,{force:true,recursive:true})}
 }
 function stored(dir){return JSON.parse(readFileSync(join(dir,'job.json'),'utf8'))}
