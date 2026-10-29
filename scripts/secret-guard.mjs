@@ -2,10 +2,11 @@
 import { execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { realpathSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 const MAX_BYTES = 1024 * 1024;
-const DENY_PATH = /(^|\/)(\.env(?:\.[^/]*)?|id_(?:rsa|ed25519)|credentials(?:\.[^/]*)?|secrets?\/|private\/|userdata\/)|\.(?:pem|p12|pfx|key|sqlite3?|db)$/i;
+const DENY_PATH = /(^|\/)(?:\.env(?:\.[^/]*)?|id_(?:rsa|ed25519|ecdsa|dsa)|credentials(?:\.[^/]*)?|secrets?(?:\/|$)|private(?:\/|$)|userdata(?:\/|$)|\.npmrc|\.netrc|\.pypirc|\.git-credentials|\.ssh(?:\/|$)|\.aws(?:\/|$)|\.kube(?:\/|$))|\.(?:pem|p12|pfx|key|sqlite3?|db|p8|jks|keystore)$/i;
 const RULES = [
   ['private-key', /-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----/],
   ['github-token', /\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/],
@@ -22,6 +23,7 @@ export function inspect(path, bytes) {
   try { content = new TextDecoder('utf-8', {fatal:true}).decode(bytes); }
   catch { findings.push('encoding-uninspected'); return findings; }
   for (const [name, regex] of RULES) if (regex.test(content)) findings.push(name);
+  if (RULES.some(([, regex]) => regex.test(path))) findings.push('credential-in-path');
   return findings;
 }
 // Git data, not the checkout, is the inspected subject. Preserve GIT_INDEX_FILE
@@ -64,7 +66,8 @@ function scanTree(tree) {
     }
     if (findings.length) {
       failures++;
-      process.stderr.write('BLOCKED '+JSON.stringify(path)+' rules='+findings.join(',')+'\n');
+      const pathTag = createHash('sha256').update(path).digest('hex').slice(0,16);
+      process.stderr.write('BLOCKED path_sha256_16='+pathTag+' rules='+findings.join(',')+'\n');
     }
   }
   return failures;
