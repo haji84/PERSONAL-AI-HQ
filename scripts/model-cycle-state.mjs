@@ -11,6 +11,8 @@ import {SEEDED_SOURCE} from './local-builder-adapter.mjs';
 import {runVerifiedCachedCycle} from './model-cycle-bridge.mjs';
 const SHA40=/^[a-f0-9]{40}$/;
 const digest=s=>createHash('sha256').update(s).digest('hex');
+const HASH64=/^[a-f0-9]{64}$/;
+const safeReviewStatus=new Set(['NOT_RUN','ADVISORY_AGREEMENT','INCONCLUSIVE','FAILED','SKIPPED']);
 const allowedReasons=new Set(['builder-not-verified','builder-model-not-proven','review-source-unverified',
  'model-execution-unverified','review-inconclusive','independent-review-advisory-only',
  'independent-model-review-unverified']);
@@ -70,6 +72,8 @@ export async function continueModelCycle({root,baseSha,bridge}={}){
   sourceKind:'injected-bridge-not-independent-proof',reason,
   builderClaimedObserved:result?.builder?.modelExecuted===true,
   reviewerClaimedObserved:result?.reviewer?.modelExecuted===true,
+  builderSourceSha256:HASH64.test(result?.builder?.sourceSha256??'')?result.builder.sourceSha256:null,
+  reviewerStatus:safeReviewStatus.has(result?.reviewer?.status)?result.reviewer.status:'UNKNOWN',
   releaseAuthorized:false,nextTaskDispatched:false});
  return block(dir,job,'model-cycle-advisory-only');
 }
