@@ -78,6 +78,7 @@ test('replay after crash during verification uses exact receipt without duplicat
  }finally{rmSync(dir,{recursive:true,force:true});}
 });
 
+
 test('rejects a symlinked scratch source during failing baseline',()=>{
  const dir=mkdtempSync(join(tmpdir(),'hq-continuation-'));
  const other=mkdtempSync(join(tmpdir(),'hq-target-'));
