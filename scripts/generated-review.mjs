@@ -14,6 +14,17 @@ const wrapper=fileURLToPath(new URL('./local-model-limit.py',import.meta.url));
 const templateSource='def add(a,b): return a + b';
 const approvedCanonical='def add(a, b):\n    return a + b';
 const HASH=/^[a-f0-9]{64}$/;
+const APPROVED_QWEN_15_SHA='cc324af070c2ecbfd324a30884d2f951a7ff756aba85cb811a6ec436933bb046';
+// Only publisher-hash-pinned builder profiles can be associated with a model review.
+// This is NOT a claim that the builder model actually ran.
+export function validateBuilderIdentity(identity){
+ const b=identity===undefined?{family:'qwen2',sha256:builder.model.sha256}:identity;
+ if(!b||Object.keys(b).sort().join(',')!=='family,sha256'||b.family!=='qwen2'||
+   ![builder.model.sha256,APPROVED_QWEN_15_SHA].includes(b.sha256))
+   throw Error('Unapproved builder identity');
+ assertDifferentModel(b,profile);
+ return {family:b.family,sha256:b.sha256};
+}
 const observedStages=new Set(['preflight','model-artifact','source-check','process','integrity','format']);
 export async function prepareGeneratedReview(request,model){
  if(!request||Object.keys(request).sort().join(',')!=='baseSha,source'||
@@ -37,12 +48,12 @@ export async function prepareGeneratedReview(request,model){
  return {...template,prompt,args,promptSource:request.source,sourceSha256,
   promptSourceSha256:sourceSha256,preflight,canonicalSourceSha256:sha256(preflight.canonicalSource)};
 }
-async function observedReviewer({request,artifacts}){
+async function observedReviewer({request,artifacts,builderIdentity}){
  let stage='preflight';const receipt={kind:'observed-local-reviewer-process',modelExecuted:false,
   advisoryOnly:true,authority:'none',status:'FAILED'};
  try{
   if(!artifacts||Object.keys(artifacts).sort().join(',')!=='modelFile,runtimeDir')throw Error('Invalid artifacts');
-  assertDifferentModel({family:'qwen2',sha256:builder.model.sha256},profile);
+  assertDifferentModel(builderIdentity,profile);
   stage='model-artifact';const {runtime,model}=await verifyReviewerArtifacts({artifacts});
   stage='source-check';const invocation=await prepareGeneratedReview(request,model);
   const wrapperHash=sha256(await readFile(wrapper));
@@ -50,7 +61,7 @@ async function observedReviewer({request,artifacts}){
    promptSourceSha256:invocation.promptSourceSha256,canonicalSourceSha256:invocation.canonicalSourceSha256,
    testsSha256:invocation.preflight.testsSha256,requestSha256:sha256(JSON.stringify(request)),
    promptSha256:sha256(invocation.prompt),grammarSha256:sha256(invocation.grammar),
-   modelSha256:profile.sha256,builderModelSha256:builder.model.sha256,modelFamily:profile.family,
+   modelSha256:profile.sha256,builderModelSha256:builderIdentity.sha256,modelFamily:profile.family,
    adapterSha256:sha256(await readFile(new URL(import.meta.url))),wrapperSha256:wrapperHash});
   const cwd=await mkdtemp(join(tmpdir(),'hq-generated-review-'));stage='process';
   const start=performance.now();receipt.startedAt=new Date().toISOString();
@@ -65,14 +76,16 @@ async function observedReviewer({request,artifacts}){
   return {advisory,receipt};
  }catch(e){e.receipt={...receipt,status:'FAILED',failedStage:stage};throw e}
 }
-function observedIdentity(receipt,request){
+function observedIdentity(receipt,request,builderIdentity){
  return receipt?.kind==='observed-local-reviewer-process'&&receipt.modelExecuted===true&&
   receipt.exitCode===0&&receipt.modelSha256===profile.sha256&&
+  receipt.builderModelSha256===builderIdentity?.sha256&&
   receipt.baseSha===request.baseSha&&receipt.sourceSha256===sha256(request.source)&&
   receipt.promptSourceSha256===sha256(request.source)&&
   receipt.requestSha256===sha256(JSON.stringify(request))&&HASH.test(receipt.rawResponseSha256??'');
 }
-async function evaluate({request,reviewer,actual=false}){
+async function evaluate({request,reviewer,actual=false,builderIdentity}){
+ const selectedBuilder=actual?validateBuilderIdentity(builderIdentity):null;
  const invocation=await prepareGeneratedReview(request,'/host-selected/reviewer.gguf');
  const result={status:'PENDING',authority:'none',advisoryOnly:true,modelExecuted:false,
   baseSha:request.baseSha,sourceSha256:invocation.sourceSha256,
@@ -80,9 +93,9 @@ async function evaluate({request,reviewer,actual=false}){
   testsSha256:invocation.preflight.testsSha256,testCaseCount:6,witnessValid:false,advisoryAgrees:false};
  let stage='review-process';
  try{
-  const observed=await reviewer({request});const receipt=observed.receipt;
+  const observed=await reviewer({request,builderIdentity:selectedBuilder});const receipt=observed.receipt;
   if(receipt?.sourceSha256!==undefined&&receipt.sourceSha256!==result.sourceSha256)throw Error('Wrong reviewed source');
-  result.modelExecuted=actual&&observedIdentity(receipt,request);
+  result.modelExecuted=actual&&observedIdentity(receipt,request,selectedBuilder);
   if(actual&&!result.modelExecuted)throw Error('Model identity unverified');
   if(result.modelExecuted){
    result.reviewerModelSha256=receipt.modelSha256;
@@ -102,7 +115,7 @@ async function evaluate({request,reviewer,actual=false}){
   result.status='FAILED';
   const cause=e?.receipt?.failedStage;
   result.failedStage=stage==='review-process'&&observedStages.has(cause)?cause:stage;
-  if(actual&&observedIdentity(e.receipt,request)){
+  if(actual&&observedIdentity(e.receipt,request,selectedBuilder)){
    result.modelExecuted=true;
    result.reviewerModelSha256=e.receipt.modelSha256;
    result.reviewerResponseSha256=e.receipt.rawResponseSha256;
@@ -115,10 +128,10 @@ export async function reviewGeneratedSource({request,reviewer}){
  if(typeof reviewer!=='function')throw Error('Reviewer required');
  return evaluate({request,reviewer,actual:false});
 }
-export async function runActualGeneratedReview({request,artifacts}){
+export async function runActualGeneratedReview({request,artifacts,builderIdentity}){
  const cwd=fileURLToPath(new URL('..',import.meta.url));
  const observed=await runBoundedProcess('/usr/bin/git',['--no-replace-objects','rev-parse','HEAD'],
   {cwd,env:{PATH:'/usr/bin:/bin'},timeoutMs:5000,maxBytes:4096});
  if(request?.baseSha!==observed.stdout.trim())throw Error('Git HEAD mismatch');
- return evaluate({request,reviewer:args=>observedReviewer({...args,artifacts}),actual:true});
+ return evaluate({request,reviewer:args=>observedReviewer({...args,artifacts}),actual:true,builderIdentity});
 }
