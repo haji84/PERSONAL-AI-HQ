@@ -73,24 +73,31 @@ export async function runBoundedRecovery({baseSha,initialSource,sourceOrigin,bui
  const initialCheck=await runArithmeticCheck(initialSource);assertBaselineFailure(initialCheck);
  const identity={checkerSha256,testsSha256:initialCheck.testsSha256};
  const inputProvenance={origin:sourceOrigin,complete:false,note:'origin is a host claim; incomplete input provenance is never upgraded'};
- const signature=r=>`${r.semanticSha256}:${r.failure}`;
- const seen=new Set([signature(initialCheck)]),attempts=[];let current=initialCheck.canonicalSource;
+ // The trusted Python AST digest detects semantically identical repairs regardless of formatting.
+ const seenAst=new Set([initialCheck.semanticSha256]),attempts=[];let current=initialCheck.canonicalSource;
  for(let i=0;i<maxCalls;i++){
   try{
    const result=await runSyntheticProof({baseSha,builder,initialSource:current,recovery:true,expectedIdentity:identity});
    try{assertRecoveryIdentity(identity,result)}catch(e){e.receipt={...result,status:'FAILED',failedStage:'integrity',error:e.message};throw e}
    attempts.push(result);
-   return {status:'PASS',inferenceVerified:false,inputProvenance,initialCheck,attempts};
+   return {status:'PASS',semanticNoOp:false,inferenceVerified:false,inputProvenance,initialCheck,attempts};
   }catch(e){
    const receipt=e.receipt??{status:'FAILED',failedStage:'unknown',error:e.message};attempts.push(receipt);
    if(receipt.failedStage!=='retest'||receipt.retest?.status!=='ASSERTION_FAILURE')return {status:'BLOCKED',reason:'non-repairable-stage',inferenceVerified:false,inputProvenance,initialCheck,attempts};
    const next=receipt.retest;
    try{assertRecoveryIdentity(identity,receipt)}catch(e){receipt.failedStage='integrity';receipt.error=e.message;return {status:'BLOCKED',reason:'identity-changed',inferenceVerified:false,inputProvenance,initialCheck,attempts};}
-   if(seen.has(signature(next)))return {status:'BLOCKED',reason:'repeated-canonical-ast-failure',inferenceVerified:false,inputProvenance,initialCheck,attempts};
-   seen.add(signature(next));current=next.canonicalSource;
+   if(!/^[a-f0-9]{64}$/.test(next.semanticSha256??''))
+    return {status:'BLOCKED',reason:'unverified-retest-semantics',semanticNoOp:false,
+      inferenceVerified:false,inputProvenance,initialCheck,attempts};
+   if(seenAst.has(next.semanticSha256)){
+    receipt.semanticNoOp=true;
+    return {status:'BLOCKED',reason:'repeated-canonical-ast-failure',semanticNoOp:true,
+      inferenceVerified:false,inputProvenance,initialCheck,attempts};
+   }
+   seenAst.add(next.semanticSha256);current=next.canonicalSource;
   }
  }
- return {status:'BLOCKED',reason:'corrective-call-budget-exhausted',inferenceVerified:false,inputProvenance,initialCheck,attempts};
+ return {status:'BLOCKED',reason:'corrective-call-budget-exhausted',semanticNoOp:false,inferenceVerified:false,inputProvenance,initialCheck,attempts};
 }
 // Report only bounded, public-synthetic retest facts; never serialize model code,
 // exception text, the raw assertion or a fabricated zero-case count.
