@@ -101,7 +101,7 @@ try{
   evidence.builderRetestDiagnostic=summarizeRetestDiagnostic(attempt);
   evidence.builderOutcome=recovery.reason??null;
   evidence.retestCases=attempt?.retest?.status==='PASS'&&attempt.retest.caseCount===6?6:null;
-  ensure(recovery.modelInvocationsAttempted===1&&recovery.attempts?.length===1);
+  ensure(evidence.builderInvocationsAttempted===1&&recovery.attempts?.length===1);
   if(recovery.status!=='PASS'||!evidence.builderObserved||attempt?.retest?.status!=='PASS'){
     evidence.failedPhase='qwen';
     return {state:'BLOCKED',reason:'builder-not-verified',
