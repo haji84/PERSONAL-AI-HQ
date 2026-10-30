@@ -60,3 +60,21 @@ test('failed public synthetic retest reaches the bridge as a bounded diagnostic,
  assert.equal(r.nextTaskDispatched,false);
  assert.equal(r.releaseAuthorized,false);
 });
+
+test('bridge records genuine AST no-op and does not invoke reviewer on one-call-equivalent output',async()=>{
+ let builderCalls=0,reviewerCalls=0;
+ const r=await bridge.runGeneratedSyntheticCycle({baseSha:base,
+  builder:async({request})=>{builderCalls++;return {proposal:{
+   baseSha:request.baseSha,changes:[{path:'fixture.py',content:'def add(a,b): return a - b'}]
+  },receipt:{kind:'unit-fake-not-inference'}}},
+  reviewer:async()=>{reviewerCalls++;return fakeReviewer()}
+ });
+ assert.equal(r.state,'BLOCKED');
+ assert.equal(r.builder.status,'BLOCKED');
+ assert.equal(r.builder.semanticNoOp,true);
+ assert.equal(r.reviewer.status,'NOT_RUN');
+ assert.equal(builderCalls,1);
+ assert.equal(reviewerCalls,0);
+ assert.equal(r.releaseAuthorized,false);
+ assert.equal(r.nextTaskDispatched,false);
+});
