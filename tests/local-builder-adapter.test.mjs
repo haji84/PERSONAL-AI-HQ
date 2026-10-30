@@ -96,3 +96,16 @@ test('bounded recovery prompt diagnoses subtraction as the actual defect without
  assert.ok(result.args.includes('--grammar'));
  assert.equal(result.args[result.args.indexOf('--temp')+1],'0');
 });
+
+test('repair prompt describes a non-subtraction candidate accurately and never reveals an answer',()=>{
+ const source='def add(a, b):\n    return a * b';
+ const request={taskId:'synthetic-add-v1',baseSha:'a'.repeat(40),
+  failure:'add(2, 3): expected 5, got 6',currentSource:source,currentSourceSha256:hash(source),
+  testsSha256:'f0088dc4e91c70eb811ecc44725e2366ea0f65fd616db9aae3e2bfb72b51d536'};
+ const invocation=api.buildSyntheticInvocation(request,'/synthetic/model.gguf');
+ assert.doesNotMatch(invocation.prompt,/subtraction in the current code is wrong/i);
+ assert.match(invocation.prompt,/arithmetic operation/i);
+ assert.match(invocation.prompt,/not a formatting/i);
+ assert.match(invocation.prompt,/AST-equivalent/i);
+ assert.doesNotMatch(invocation.prompt,/return a\s*\+\s*b/);
+});
