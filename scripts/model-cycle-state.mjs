@@ -15,11 +15,13 @@ const safeReviewStatus=new Set(['NOT_RUN','ADVISORY_AGREEMENT','INCONCLUSIVE','F
 // Only a fixed status and one of six trusted synthetic test IDs may enter durable
 // job metadata. No raw model output, source, assertion, count=0 or exception text.
 const safeRetestOutcomes=new Set(['ASSERTION_FAILURE','SAFETY_REJECTED','NOT_RETEST','UNVERIFIED']);
+const safeRejectCodes=new Set(['SOURCE_BOUNDS','SYNTAX_ERROR','STRUCTURAL_LIMIT','FUNCTION_SHAPE','ARGUMENT_SHAPE','EXPRESSION_NOT_ALLOWED','INPUT_FORMAT']);
 function safeRetestDiagnostic(value){
  const outcome=safeRetestOutcomes.has(value?.outcome)?value.outcome:'UNVERIFIED';
  const caseId=outcome==='ASSERTION_FAILURE'&&typeof value?.caseId==='string'&&
    /^case-[1-6]$/.test(value.caseId)?value.caseId:null;
- return {outcome,caseId,observedCaseCount:null};
+ return {outcome,caseId,observedCaseCount:null,
+  ...(outcome==='SAFETY_REJECTED'&&safeRejectCodes.has(value?.rejectCode)?{rejectCode:value.rejectCode}:{})};
 }
 
 const allowedReasons=new Set(['builder-not-verified','builder-model-not-proven','review-source-unverified',
