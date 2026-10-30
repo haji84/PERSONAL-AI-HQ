@@ -18,6 +18,7 @@ function summarizeRecovery(recovery,observed=false){
    /^[a-f0-9]{64}$/.test(attempt.model.rawResponseSha256??'');
  return {status:recovery.status,attempts:recovery.attempts?.length??0,
   sourceSha256:attempt?.sourceSha256??null,modelExecuted,
+  semanticNoOp:recovery.semanticNoOp===true,
   retestDiagnostic:summarizeRetestDiagnostic(attempt),
   ...(modelExecuted?{modelSha256:attempt.model.modelSha256,responseSha256:attempt.model.rawResponseSha256}:{})};
 }
