@@ -55,7 +55,7 @@ test('failed public synthetic retest reaches the bridge as a bounded diagnostic,
  });
  assert.equal(r.state,'BLOCKED');
  assert.equal(r.builder.status,'BLOCKED');
- assert.deepEqual(r.builder.retestDiagnostic,{outcome:'SAFETY_REJECTED',caseId:null,observedCaseCount:null});
+ assert.deepEqual(r.builder.retestDiagnostic,{outcome:'SAFETY_REJECTED',caseId:null,observedCaseCount:null,rejectCode:'SYNTAX_ERROR'});
  assert.equal(reviewerCalls,0);
  assert.equal(r.nextTaskDispatched,false);
  assert.equal(r.releaseAuthorized,false);
