@@ -95,7 +95,7 @@ test('bounded retest diagnostic separates checker safety rejection from missing 
  }catch(error){failure=error.receipt}
  assert.equal(failure?.failedStage,'retest');
  assert.equal(failure?.retest?.status,'SAFETY_REJECTED');
- assert.deepEqual(api.summarizeRetestDiagnostic(failure),{outcome:'SAFETY_REJECTED',caseId:null,observedCaseCount:null});
+ assert.deepEqual(api.summarizeRetestDiagnostic(failure),{outcome:'SAFETY_REJECTED',caseId:null,observedCaseCount:null,rejectCode:'SYNTAX_ERROR'});
  assert.deepEqual(api.summarizeRetestDiagnostic({failedStage:'retest'}),{outcome:'UNVERIFIED',caseId:null,observedCaseCount:null});
  assert.deepEqual(api.summarizeRetestDiagnostic({failedStage:'model',retest:{status:'ASSERTION_FAILURE',failure:'PRIVATE_SENTINEL'}}),
   {outcome:'NOT_RETEST',caseId:null,observedCaseCount:null});
@@ -127,4 +127,16 @@ test('synthetic checker classifies rejection stage without copying unsafe source
   assert.ok(!JSON.stringify(checked).includes(source.slice(0,30)));
   assert.equal(Object.hasOwn(checked,'error'),false);
  }
+});
+
+test('bounded rejection code retains only trusted checker enum values',()=>{
+ const diagnostic=api.summarizeRetestDiagnostic({failedStage:'retest',retest:{
+  status:'SAFETY_REJECTED',rejectCode:'EXPRESSION_NOT_ALLOWED',failure:'PRIVATE_ASSERTION'
+ }});
+ assert.deepEqual(diagnostic,{outcome:'SAFETY_REJECTED',caseId:null,observedCaseCount:null,rejectCode:'EXPRESSION_NOT_ALLOWED'});
+ const injected=api.summarizeRetestDiagnostic({failedStage:'retest',retest:{
+  status:'SAFETY_REJECTED',rejectCode:'PRIVATE_SECRETS',source:'PRIVATE_SOURCE'
+ }});
+ assert.deepEqual(injected,{outcome:'SAFETY_REJECTED',caseId:null,observedCaseCount:null});
+ assert.doesNotMatch(JSON.stringify(injected),/PRIVATE_/);
 });
