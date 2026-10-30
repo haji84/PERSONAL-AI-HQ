@@ -149,3 +149,26 @@ test('persisted retest report preserves only recognized safety rejection code',a
   assert.doesNotMatch(raw,/PRIVATE_UNTRUSTED_CODE/);
  });
 });
+
+test('model state persists only a boolean AST no-op signal and never claims reviewer proof',async()=>{
+ await workspace(async dir=>{
+  let calls=0;
+  const result=await api.continueModelCycle({root:dir,baseSha:head,bridge:async()=>{
+   calls++;
+   return {state:'BLOCKED',reason:'builder-not-verified',
+    builder:{semanticNoOp:true,modelExecuted:false,rawSource:'PRIVATE_OUTPUT'},
+    reviewer:{status:'NOT_RUN',modelExecuted:false},
+    releaseAuthorized:false,nextTaskDispatched:false};
+  }});
+  assert.equal(result.state,'BLOCKED');
+  const raw=readFileSync(join(dir,'model-cycle-result.json'),'utf8');
+  const saved=JSON.parse(raw);
+  assert.equal(saved.builderSemanticNoOp,true);
+  assert.equal(saved.reviewerStatus,'NOT_RUN');
+  assert.equal(saved.releaseAuthorized,false);
+  assert.equal(saved.nextTaskDispatched,false);
+  assert.doesNotMatch(raw,/PRIVATE_OUTPUT/);
+  await api.continueModelCycle({root:dir,baseSha:head,bridge:async()=>{calls++;throw Error('MUST_NOT_RUN')}});
+  assert.equal(calls,1);
+ });
+});
