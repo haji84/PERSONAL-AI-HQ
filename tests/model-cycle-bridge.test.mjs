@@ -44,3 +44,19 @@ test('malformed fake builder response never starts reviewer',async()=>{
 test('cached-model mode fails on stale HEAD before model artifact access',async()=>{
  await assert.rejects(bridge.runVerifiedCachedCycle({baseSha:'0'.repeat(40),builderArtifacts:null,reviewerArtifacts:null}),/base does not match HEAD/);
 });
+
+test('failed public synthetic retest reaches the bridge as a bounded diagnostic, without reviewing',async()=>{
+ let reviewerCalls=0;
+ const r=await bridge.runGeneratedSyntheticCycle({baseSha:base,
+  builder:async({request})=>({proposal:{baseSha:request.baseSha,changes:[{
+    path:'fixture.py',content:'import os\\ndef add(a,b): return a+b'
+  }]},receipt:{kind:'unit-fake-not-inference'}}),
+  reviewer:async()=>{reviewerCalls++;return fakeReviewer()}
+ });
+ assert.equal(r.state,'BLOCKED');
+ assert.equal(r.builder.status,'BLOCKED');
+ assert.deepEqual(r.builder.retestDiagnostic,{outcome:'SAFETY_REJECTED',caseId:null,observedCaseCount:null});
+ assert.equal(reviewerCalls,0);
+ assert.equal(r.nextTaskDispatched,false);
+ assert.equal(r.releaseAuthorized,false);
+});
