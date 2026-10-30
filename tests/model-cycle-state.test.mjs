@@ -82,3 +82,39 @@ test('model receipts expose only bounded source identity and review stage, not r
   assert.doesNotMatch(raw,/PRIVATE_MODEL_OUTPUT_SENTINEL/);
  });
 });
+
+test('failed retest diagnostics survive persisted restart without leaking raw source or error',async()=>{
+ await workspace(async dir=>{
+  const r=await api.continueModelCycle({root:dir,baseSha:head,bridge:async()=>({
+   state:'BLOCKED',reason:'builder-not-verified',
+   builder:{modelExecuted:false,retestDiagnostic:{outcome:'ASSERTION_FAILURE',caseId:'case-1',
+    observedCaseCount:null,rawSource:'PRIVATE_SOURCE',rawFailure:'PRIVATE_FAILURE'}},
+   reviewer:{status:'NOT_RUN',modelExecuted:false},releaseAuthorized:false
+  })});
+  assert.equal(r.state,'BLOCKED');
+  const filename=join(dir,'model-cycle-result.json');
+  const raw=readFileSync(filename,'utf8'),saved=JSON.parse(raw);
+  assert.deepEqual(saved.builderRetestDiagnostic,
+   {outcome:'ASSERTION_FAILURE',caseId:'case-1',observedCaseCount:null});
+  assert.doesNotMatch(raw,/PRIVATE_SOURCE|PRIVATE_FAILURE|rawFailure|rawSource/);
+  let calls=0;
+  await api.continueModelCycle({root:dir,baseSha:head,bridge:async()=>{calls++;throw Error('MUST_NOT_RETRY')}});
+  assert.equal(calls,0);
+  assert.deepEqual(JSON.parse(readFileSync(filename,'utf8')).builderRetestDiagnostic,saved.builderRetestDiagnostic);
+ });
+});
+
+test('model-cycle persistence rejects untrusted retest labels and fabricated zero-case counts',async()=>{
+ await workspace(async dir=>{
+  await api.continueModelCycle({root:dir,baseSha:head,bridge:async()=>({
+   reason:'builder-not-verified',
+   builder:{modelExecuted:false,retestDiagnostic:{outcome:'PRIVATE_KIND',caseId:'case-99',
+    observedCaseCount:0,failedAssertion:'PRIVATE_ASSERTION'}},
+   reviewer:{status:'NOT_RUN',modelExecuted:false}
+  })});
+  const saved=readFileSync(join(dir,'model-cycle-result.json'),'utf8');
+  assert.deepEqual(JSON.parse(saved).builderRetestDiagnostic,
+   {outcome:'UNVERIFIED',caseId:null,observedCaseCount:null});
+  assert.doesNotMatch(saved,/PRIVATE_KIND|PRIVATE_ASSERTION|case-99|failedAssertion/);
+ });
+});
