@@ -99,7 +99,9 @@ export function summarizeRetestDiagnostic(attempt){
  const result={outcome:'UNVERIFIED',caseId:null,observedCaseCount:null};
  if(attempt?.failedStage!=='retest')return {...result,outcome:'NOT_RETEST'};
  const retest=attempt?.retest;
- if(retest?.status==='SAFETY_REJECTED')return {...result,outcome:'SAFETY_REJECTED'};
+ const safetyCodes=new Set(['SOURCE_BOUNDS','SYNTAX_ERROR','STRUCTURAL_LIMIT','FUNCTION_SHAPE','ARGUMENT_SHAPE','EXPRESSION_NOT_ALLOWED','INPUT_FORMAT']);
+ if(retest?.status==='SAFETY_REJECTED')return {...result,outcome:'SAFETY_REJECTED',
+  ...(safetyCodes.has(retest.rejectCode)?{rejectCode:retest.rejectCode}:{})};
  if(retest?.status!=='ASSERTION_FAILURE')return result;
  const summary={...result,outcome:'ASSERTION_FAILURE'};
  // Only recognise a case from the fixed trusted six. An unfamiliar message stays unverified.
