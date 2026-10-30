@@ -111,3 +111,20 @@ test('bounded retest diagnostic never copies hostile messages, code, or fake cas
  assert.deepEqual(api.summarizeRetestDiagnostic({failedStage:'retest',retest:{status:'PASS',caseCount:6}}),
   {outcome:'UNVERIFIED',caseId:null,observedCaseCount:null});
 });
+
+test('synthetic checker classifies rejection stage without copying unsafe source',async()=>{
+ const cases=[
+  ['def add(a,b): return (','SYNTAX_ERROR'],
+  ['import os\\ndef add(a,b): return a+b','FUNCTION_SHAPE'],
+  ['def add(a,b=1): return a+b','ARGUMENT_SHAPE'],
+  ['def add(a,b): return __import__("os")','EXPRESSION_NOT_ALLOWED'],
+  ['def add(a,b): return a+b'+' '.repeat(20050),'SOURCE_BOUNDS']
+ ];
+ for(const [source,code] of cases){
+  const checked=await api.runArithmeticCheck(source);
+  assert.equal(checked.status,'SAFETY_REJECTED',code);
+  assert.equal(checked.rejectCode,code);
+  assert.ok(!JSON.stringify(checked).includes(source.slice(0,30)));
+  assert.equal(Object.hasOwn(checked,'error'),false);
+ }
+});
