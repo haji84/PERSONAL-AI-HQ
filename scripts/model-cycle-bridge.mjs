@@ -1,7 +1,7 @@
 // Optional local-only Qwen builder -> SmolLM2 reviewer bridge.
 // Bounded public synthetic evidence only; no security-review or merge authority.
 import {SEEDED_SOURCE,sha256} from './local-builder-adapter.mjs';
-import {runBoundedRecovery,runCachedRecovery} from './synthetic-builder-proof.mjs';
+import {runBoundedRecovery,runCachedRecovery,summarizeRetestDiagnostic} from './synthetic-builder-proof.mjs';
 import {runReviewProof} from './synthetic-review-proof.mjs';
 import {reviewGeneratedSource,runActualGeneratedReview} from './generated-review.mjs';
 const PINNED_REVIEW_SOURCE_SHA='25b512bc921c14cfd4b5ec288d55796fc77a8d11e28f2e5532eded10b9994974';
@@ -18,6 +18,7 @@ function summarizeRecovery(recovery,observed=false){
    /^[a-f0-9]{64}$/.test(attempt.model.rawResponseSha256??'');
  return {status:recovery.status,attempts:recovery.attempts?.length??0,
   sourceSha256:attempt?.sourceSha256??null,modelExecuted,
+  retestDiagnostic:summarizeRetestDiagnostic(attempt),
   ...(modelExecuted?{modelSha256:attempt.model.modelSha256,responseSha256:attempt.model.rawResponseSha256}:{})};
 }
 // Historical fixed-fixture test seam retained so old evidence is not reclassified.
