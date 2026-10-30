@@ -92,6 +92,7 @@ async function continueLocked({dir,baseSha,bridge,sourceKind}){
  }
  newReceipt(resultFile,{schema:1,baseSha,sourceSha256:job.baseSha,reviewGate:'NOT_AUTHORIZED',sourceKind,reason,
   builderClaimedObserved:result?.builder?.modelExecuted===true,reviewerClaimedObserved:result?.reviewer?.modelExecuted===true,
+  builderSemanticNoOp:result?.builder?.semanticNoOp===true,
   builderSourceSha256:HASH64.test(result?.builder?.sourceSha256??'')?result.builder.sourceSha256:null,
   builderModelSha256:HASH64.test(result?.builder?.modelSha256??'')?result.builder.modelSha256:null,
   builderResponseSha256:HASH64.test(result?.builder?.responseSha256??'')?result.builder.responseSha256:null,
