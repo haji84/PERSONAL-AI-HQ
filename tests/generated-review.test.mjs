@@ -79,3 +79,29 @@ test('untrusted exception stage is never stored verbatim',async()=>{
  assert.equal(r.failedStage,'review-process');
  assert.doesNotMatch(JSON.stringify(r),/PRIVATE_/);
 });
+
+test('different pinned Qwen1.5B identity can be bound to actual SmolLM2 review while old default stays intact',()=>{
+ const official={family:'qwen2',sha256:'cc324af070c2ecbfd324a30884d2f951a7ff756aba85cb811a6ec436933bb046'};
+ const bound=api.validateBuilderIdentity(official);
+ assert.deepEqual(bound,official);
+ assert.deepEqual(api.validateBuilderIdentity(),{family:'qwen2',sha256:'1d9614638d18024d0fbb36575a15f1302a3adf044df10345688ec4f6e1c4ff32'});
+ for(const bad of [
+  {family:'smollm2',sha256:official.sha256},
+  {family:'qwen2',sha256:'0'.repeat(64)},
+  {family:'qwen2',sha256:'bad'},
+  {family:'qwen2',sha256:official.sha256,untrusted:true}
+ ])assert.throws(()=>api.validateBuilderIdentity(bad));
+});
+
+test('real review entry explicitly accepts pinned builder identity without launching missing model',async()=>{
+ const head=(await import('node:child_process')).execFileSync('/usr/bin/git',['rev-parse','HEAD'],{encoding:'utf8'}).trim();
+ const r=await api.runActualGeneratedReview({
+  request:{baseSha:head,source},artifacts:null,
+  builderIdentity:{family:'qwen2',sha256:'cc324af070c2ecbfd324a30884d2f951a7ff756aba85cb811a6ec436933bb046'}
+ });
+ assert.equal(r.status,'FAILED');
+ assert.equal(r.modelExecuted,false);
+ assert.equal(r.failedStage,'preflight');
+ assert.equal(r.authority,'none');
+ assert.doesNotMatch(JSON.stringify(r),/rawResponse|PRIVATE/);
+});
