@@ -29,7 +29,10 @@ try{
   state:state.state,releaseGate:evidence.reviewGate,
   nextTaskDispatched:false,remoteCheckpointVerified:false,
   blockedReason:evidence.reason,sourceSha256:evidence.builderSourceSha256,
-  reviewerStatus:evidence.reviewerStatus};
+  reviewerStatus:evidence.reviewerStatus,
+  retestOutcome:evidence.builderRetestDiagnostic?.outcome??'UNVERIFIED',
+  retestCaseId:evidence.builderRetestDiagnostic?.caseId??null,
+  retestRejectCode:evidence.builderRetestDiagnostic?.rejectCode??null};
  console.log(JSON.stringify(measured));
  if(!measured.builderObserved||!measured.reviewerObserved||
    measured.state!=='BLOCKED'||measured.releaseGate!=='NOT_AUTHORIZED')
