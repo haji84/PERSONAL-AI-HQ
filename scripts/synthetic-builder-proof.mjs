@@ -92,6 +92,25 @@ export async function runBoundedRecovery({baseSha,initialSource,sourceOrigin,bui
  }
  return {status:'BLOCKED',reason:'corrective-call-budget-exhausted',inferenceVerified:false,inputProvenance,initialCheck,attempts};
 }
+// Report only bounded, public-synthetic retest facts; never serialize model code,
+// exception text, the raw assertion or a fabricated zero-case count.
+const FIXED_ARITHMETIC_CASES=[[2,3,5],[-4,3,-1],[0,0,0],[3,2,5],[-3,-2,-5],[9,0,9]];
+export function summarizeRetestDiagnostic(attempt){
+ const result={outcome:'UNVERIFIED',caseId:null,observedCaseCount:null};
+ if(attempt?.failedStage!=='retest')return {...result,outcome:'NOT_RETEST'};
+ const retest=attempt?.retest;
+ if(retest?.status==='SAFETY_REJECTED')return {...result,outcome:'SAFETY_REJECTED'};
+ if(retest?.status!=='ASSERTION_FAILURE')return result;
+ const summary={...result,outcome:'ASSERTION_FAILURE'};
+ // Only recognise a case from the fixed trusted six. An unfamiliar message stays unverified.
+ if(typeof retest.failure!=='string'||retest.failure.length>120)return summary;
+ const m=/^add\((-?\d{1,4}), (-?\d{1,4})\): expected (-?\d{1,6}), got (-?\d{1,30})$/.exec(retest.failure);
+ if(!m)return summary;
+ const index=FIXED_ARITHMETIC_CASES.findIndex(([a,b,want])=>
+   a===Number(m[1])&&b===Number(m[2])&&want===Number(m[3]));
+ if(index<0)return summary;
+ return {...summary,caseId:'case-'+(index+1)};
+}
 export function summarizeModelProcesses(attempts){
  return {launchedProcesses:attempts.filter(a=>a.model?.launched===true).length,completedOutputProcesses:attempts.filter(a=>a.model?.kind==='observed-local-model-process'&&typeof a.model.rawResponse==='string').length};
 }
