@@ -1,0 +1,62 @@
+name: PR11 owner approved Qwen1.5B SmolLM2 once 20261030c
+on:
+  pull_request:
+    branches: [main]
+    types: [synchronize]
+    paths:
+      - .github/workflows/pr11-approved-model-once-20261030c.yml
+permissions:
+  contents: read
+concurrency:
+  group: pr11-approved-model-once-20261030c
+  cancel-in-progress: false
+jobs:
+  models-once:
+    if: >-
+      github.repository == 'haji84/PERSONAL-AI-HQ' &&
+      github.event.pull_request.number == 11 &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'feature/autonomous-manager-bootstrap' &&
+      github.run_number == 1 && github.run_attempt == 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout frozen approved public synthetic commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 8b3a613da16458f7960ae2a896759f9810523a8a
+          persist-credentials: false
+          fetch-depth: 1
+          submodules: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+      - name: Verify exact source, run attempt and script syntax without inference
+        run: |
+          test "$(git rev-parse HEAD)" = "8b3a613da16458f7960ae2a896759f9810523a8a"
+          test "$GITHUB_RUN_ATTEMPT" = "1"
+          node --check scripts/approved-model-once-20261030c.mjs
+          python3 -I -S -c "import ast,pathlib; ast.parse(pathlib.Path('scripts/approved-model-assets-20261030c.py').read_text())"
+          test ! -f .github/workflows/pr11-approved-model-once-20261030c.yml
+      - name: Run immutable project security and synthetic tests first
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          node --test tests/*.test.mjs
+      - name: Fetch and SHA-verify Qwen1.5B, SmolLM2 and pinned public runtime
+        id: models
+        run: python3 -I -S scripts/approved-model-assets-20261030c.py --prepare
+      - name: Exactly one Qwen1.5B, conditionally one SmolLM2, fail closed
+        env:
+          HQ_APPROVED_SOURCE_SHA: 8b3a613da16458f7960ae2a896759f9810523a8a
+          HQ_PROBE_RUNTIME_DIR: ${{ steps.models.outputs.runtime_dir }}
+          HQ_PROBE_BUILDER_FILE: ${{ steps.models.outputs.builder_file }}
+          HQ_PROBE_REVIEWER_FILE: ${{ steps.models.outputs.reviewer_file }}
+        run: |
+          env -i PATH="$PATH" HOME="$RUNNER_TEMP" \
+            HQ_APPROVED_SOURCE_SHA="$HQ_APPROVED_SOURCE_SHA" \
+            HQ_PROBE_RUNTIME_DIR="$HQ_PROBE_RUNTIME_DIR" \
+            HQ_PROBE_BUILDER_FILE="$HQ_PROBE_BUILDER_FILE" \
+            HQ_PROBE_REVIEWER_FILE="$HQ_PROBE_REVIEWER_FILE" \
+            node scripts/approved-model-once-20261030c.mjs
