@@ -12,6 +12,16 @@ import {saveReviewCheckpoint,loadReviewCheckpoint} from './review-checkpoint.mjs
 const SHA40=/^[a-f0-9]{40}$/,HASH64=/^[a-f0-9]{64}$/;
 const digest=s=>createHash('sha256').update(s).digest('hex');
 const safeReviewStatus=new Set(['NOT_RUN','ADVISORY_AGREEMENT','INCONCLUSIVE','FAILED','SKIPPED']);
+// Only a fixed status and one of six trusted synthetic test IDs may enter durable
+// job metadata. No raw model output, source, assertion, count=0 or exception text.
+const safeRetestOutcomes=new Set(['ASSERTION_FAILURE','SAFETY_REJECTED','NOT_RETEST','UNVERIFIED']);
+function safeRetestDiagnostic(value){
+ const outcome=safeRetestOutcomes.has(value?.outcome)?value.outcome:'UNVERIFIED';
+ const caseId=outcome==='ASSERTION_FAILURE'&&typeof value?.caseId==='string'&&
+   /^case-[1-6]$/.test(value.caseId)?value.caseId:null;
+ return {outcome,caseId,observedCaseCount:null};
+}
+
 const allowedReasons=new Set(['builder-not-verified','builder-model-not-proven','review-source-unverified',
  'model-execution-unverified','review-inconclusive','independent-review-advisory-only','independent-model-review-unverified']);
 function scratch(path){
@@ -84,6 +94,7 @@ async function continueLocked({dir,baseSha,bridge,sourceKind}){
   builderModelSha256:HASH64.test(result?.builder?.modelSha256??'')?result.builder.modelSha256:null,
   builderResponseSha256:HASH64.test(result?.builder?.responseSha256??'')?result.builder.responseSha256:null,
   reviewerStatus:safeReviewStatus.has(result?.reviewer?.status)?result.reviewer.status:'UNKNOWN',
+  builderRetestDiagnostic:safeRetestDiagnostic(result?.builder?.retestDiagnostic),
   ...(checkpointSha256?{reviewCheckpointSha256:checkpointSha256}:{}),
   releaseAuthorized:false,nextTaskDispatched:false});
  verifiedSavedResult(dir,baseSha);
