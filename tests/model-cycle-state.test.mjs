@@ -118,3 +118,34 @@ test('model-cycle persistence rejects untrusted retest labels and fabricated zer
   assert.doesNotMatch(saved,/PRIVATE_KIND|PRIVATE_ASSERTION|case-99|failedAssertion/);
  });
 });
+
+test('persisted retest report preserves only recognized safety rejection code',async()=>{
+ await workspace(async dir=>{
+  await api.continueModelCycle({root:dir,baseSha:head,bridge:async()=>({
+   reason:'builder-not-verified',
+   builder:{modelExecuted:false,retestDiagnostic:{outcome:'SAFETY_REJECTED',caseId:null,
+    observedCaseCount:null,rejectCode:'FUNCTION_SHAPE',privateText:'PRIVATE_MODEL_OUTPUT'}},
+   reviewer:{status:'NOT_RUN',modelExecuted:false}
+  })});
+  const file=join(dir,'model-cycle-result.json');
+  const raw=readFileSync(file,'utf8');
+  assert.deepEqual(JSON.parse(raw).builderRetestDiagnostic,
+   {outcome:'SAFETY_REJECTED',caseId:null,observedCaseCount:null,rejectCode:'FUNCTION_SHAPE'});
+  assert.doesNotMatch(raw,/PRIVATE_MODEL_OUTPUT|privateText/);
+  await api.continueModelCycle({root:dir,baseSha:head,bridge:async()=>{throw Error('MUST_NOT_RETRY')}});
+  assert.deepEqual(JSON.parse(readFileSync(file,'utf8')).builderRetestDiagnostic,
+   {outcome:'SAFETY_REJECTED',caseId:null,observedCaseCount:null,rejectCode:'FUNCTION_SHAPE'});
+ });
+ await workspace(async dir=>{
+  await api.continueModelCycle({root:dir,baseSha:head,bridge:async()=>({
+   reason:'builder-not-verified',
+   builder:{retestDiagnostic:{outcome:'SAFETY_REJECTED',caseId:null,
+    observedCaseCount:0,rejectCode:'PRIVATE_UNTRUSTED_CODE'}},
+   reviewer:{status:'NOT_RUN'}
+  })});
+  const raw=readFileSync(join(dir,'model-cycle-result.json'),'utf8');
+  assert.deepEqual(JSON.parse(raw).builderRetestDiagnostic,
+   {outcome:'SAFETY_REJECTED',caseId:null,observedCaseCount:null});
+  assert.doesNotMatch(raw,/PRIVATE_UNTRUSTED_CODE/);
+ });
+});
