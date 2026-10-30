@@ -80,3 +80,19 @@ test('recovery request binds canonical arithmetic source and immutable tests, ne
  const invocation=api.buildSyntheticInvocation(r,'/synthetic/model.gguf');assert.match(invocation.prompt,/must not repeat or merely reformat/);assert.ok(!invocation.prompt.includes('return a + b'));
  for(const bad of [{...r,currentSourceSha256:'0'.repeat(64)},{...r,currentSource:'private text'},{...r,testsSha256:'bad'},{...r,currentSource:currentSource+' # private comment'}])assert.throws(()=>api.validateSyntheticRequest(bad));
 });
+
+test('bounded recovery prompt diagnoses subtraction as the actual defect without supplying repaired code',()=>{
+ const source='def add(a, b):\n    return a - b';
+ const request={taskId:'synthetic-add-v1',baseSha:'a'.repeat(40),
+  failure:'add(2, 3): expected 5, got -1',
+  currentSource:source,currentSourceSha256:hash(source),
+  testsSha256:'f0088dc4e91c70eb811ecc44725e2366ea0f65fd616db9aae3e2bfb72b51d536'};
+ const result=api.buildSyntheticInvocation(request,'/synthetic/model.gguf');
+ assert.match(result.prompt,/subtraction.*wrong|wrong.*subtraction/i);
+ assert.match(result.prompt,/change the arithmetic operation/i);
+ assert.match(result.prompt,/not a formatting/i);
+ assert.match(result.prompt,/add\(-4, 3\).*=-1/);
+ assert.doesNotMatch(result.prompt,/return a\s*\+\s*b/);
+ assert.ok(result.args.includes('--grammar'));
+ assert.equal(result.args[result.args.indexOf('--temp')+1],'0');
+});
