@@ -140,3 +140,37 @@ test('bounded rejection code retains only trusted checker enum values',()=>{
  assert.deepEqual(injected,{outcome:'SAFETY_REJECTED',caseId:null,observedCaseCount:null});
  assert.doesNotMatch(JSON.stringify(injected),/PRIVATE_/);
 });
+
+test('single bounded attempt records an AST-identical no-op instead of presenting it as progress',async()=>{
+ let builderCalls=0;
+ const r=await api.runBoundedRecovery({baseSha:'a'.repeat(40),
+  initialSource:'def add(a,b): return a-b',
+  sourceOrigin:'host-seeded',
+  maxCalls:1,
+  builder:async({request})=>{builderCalls++;return {
+   proposal:{baseSha:request.baseSha,changes:[{path:'fixture.py',content:'def add(a,b): return a - b'}]},
+   receipt:{kind:'unit-fake-not-inference'}
+  }}
+ });
+ assert.equal(r.status,'BLOCKED');
+ assert.equal(r.reason,'repeated-canonical-ast-failure');
+ assert.equal(r.semanticNoOp,true);
+ assert.equal(r.attempts.length,1);
+ assert.equal(r.attempts[0].semanticNoOp,true);
+ assert.equal(r.attempts[0].retest.status,'ASSERTION_FAILURE');
+ assert.equal(builderCalls,1);
+});
+
+test('distinct failed AST is not mislabeled no-op, and a second meaningful repair can pass',async()=>{
+ let calls=0;
+ const r=await api.runBoundedRecovery({baseSha:'a'.repeat(40),
+  initialSource:'def add(a,b): return a-b',sourceOrigin:'host-seeded',maxCalls:2,
+  builder:async({request})=>({proposal:{baseSha:request.baseSha,changes:[{
+   path:'fixture.py',content:++calls===1?'def add(a,b): return a*b':'def add(a,b): return a+b'
+  }]},receipt:{kind:'unit-fake-not-inference'}})
+ });
+ assert.equal(r.status,'PASS');
+ assert.equal(r.semanticNoOp,false);
+ assert.equal(calls,2);
+ assert.equal(r.attempts.at(-1).retest.status,'PASS');
+});
