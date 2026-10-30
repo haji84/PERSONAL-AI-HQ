@@ -73,3 +73,41 @@ test('changed recovery identity blocks before model invocation',async()=>{
  try{await api.runSyntheticProof({baseSha:'a'.repeat(40),recovery:true,initialSource:'def add(a,b): return a-b',expectedIdentity:{checkerSha256:'wrong',testsSha256:'wrong'},builder:async()=>{called=true;throw Error('must not invoke')}})}catch(e){err=e}
  assert.equal(called,false);assert.equal(err?.receipt?.failedStage,'integrity');
 });
+
+test('bounded retest diagnostic distinguishes an observed arithmetic mismatch without leaking generated code',async()=>{
+ let failure;try{
+  await api.runSyntheticProof({baseSha:'a'.repeat(40),builder:async({request})=>({
+   proposal:{baseSha:request.baseSha,changes:[{path:'fixture.py',content:'def add(a,b): return 0'}]},
+   receipt:{kind:'unit-fake-not-inference'}
+  })});
+ }catch(error){failure=error.receipt}
+ assert.equal(failure?.failedStage,'retest');
+ assert.equal(failure?.retest?.status,'ASSERTION_FAILURE');
+ assert.deepEqual(api.summarizeRetestDiagnostic(failure),{outcome:'ASSERTION_FAILURE',caseId:'case-1',observedCaseCount:null});
+});
+
+test('bounded retest diagnostic separates checker safety rejection from missing evidence',async()=>{
+ let failure;try{
+  await api.runSyntheticProof({baseSha:'a'.repeat(40),builder:async({request})=>({
+   proposal:{baseSha:request.baseSha,changes:[{path:'fixture.py',content:'import os\\ndef add(a,b): return a+b'}]},
+   receipt:{kind:'unit-fake-not-inference'}
+  })});
+ }catch(error){failure=error.receipt}
+ assert.equal(failure?.failedStage,'retest');
+ assert.equal(failure?.retest?.status,'SAFETY_REJECTED');
+ assert.deepEqual(api.summarizeRetestDiagnostic(failure),{outcome:'SAFETY_REJECTED',caseId:null,observedCaseCount:null});
+ assert.deepEqual(api.summarizeRetestDiagnostic({failedStage:'retest'}),{outcome:'UNVERIFIED',caseId:null,observedCaseCount:null});
+ assert.deepEqual(api.summarizeRetestDiagnostic({failedStage:'model',retest:{status:'ASSERTION_FAILURE',failure:'PRIVATE_SENTINEL'}}),
+  {outcome:'NOT_RETEST',caseId:null,observedCaseCount:null});
+});
+
+test('bounded retest diagnostic never copies hostile messages, code, or fake case counts',()=>{
+ const payload={failedStage:'retest',error:'PRIVATE_EXCEPTION',generatedSource:'PRIVATE_GENERATED_CODE',retest:{
+  status:'ASSERTION_FAILURE',failure:'PRIVATE_ASSERTION_TEXT',caseCount:0,pythonVersion:'PRIVATE_PYTHON'}
+ };
+ const summary=api.summarizeRetestDiagnostic(payload);
+ assert.deepEqual(summary,{outcome:'ASSERTION_FAILURE',caseId:null,observedCaseCount:null});
+ assert.doesNotMatch(JSON.stringify(summary),/PRIVATE|generatedSource|pythonVersion/);
+ assert.deepEqual(api.summarizeRetestDiagnostic({failedStage:'retest',retest:{status:'PASS',caseCount:6}}),
+  {outcome:'UNVERIFIED',caseId:null,observedCaseCount:null});
+});
