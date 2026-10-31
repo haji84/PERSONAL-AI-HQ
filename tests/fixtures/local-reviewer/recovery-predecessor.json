@@ -1,0 +1,9 @@
+{
+  "receiptSize": 14636,
+  "receiptSha256": "c801e1da3b1f51bb7237c2f0d1c8d62bca9fb26301db48a6be38d1173c5fa183",
+  "sourceSha256": "25b512bc921c14cfd4b5ec288d55796fc77a8d11e28f2e5532eded10b9994974",
+  "rawResponseSha256": "7fc71f730112437e50b86a77711775aff16864d5d9b7e5a0a854b136c4d22a00",
+  "promptSha256": "0c604e2691351ab9e4e068afb775947efa95d2138a844e55525518efd4b54be0",
+  "modelSha256": "decd2598bc2c8ed08c19adc3c8fdd461ee19ed5708679d1c54ef54a5a30d4f33",
+  "maxFreshCalls": 1
+}
