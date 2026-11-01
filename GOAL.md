@@ -22,3 +22,10 @@ Autonomous payments, unattended external publishing, production account administ
 
 ## Completion evidence
 A requirement is DONE only with linked reproducible tests, artifacts, independent review, and real-device evidence where applicable. CI green alone is insufficient.
+
+## Autonomous-development acceptance supplement
+The final autonomous-development goal extends (not replaces) the initial dashboard milestone: continuous, provider/model/device-independent development from issue selection through implementation, test-failure diagnosis and repair, separate-model review, authorized integration and next-issue continuation.
+
+Completion requires observed evidence that (1) an Issue is selected automatically, (2) a real AI writes code, (3) failing tests are detected, (4) AI repairs the code, (5) tests subsequently pass, (6) a different model independently reviews it, (7) only approved and verified changes integrate, (8) the next Issue starts automatically, (9) state survives distinct Actions runs, and (10) interrupted work resumes safely. A 24-hour E2E exercises these capabilities; green CI or synthetic fixtures alone do not establish completion.
+
+No model or host is mandatory. Existing publication, cost, permissions, security and protected-main approval gates remain binding. No unattended deployment, credential setup or main merge authority is granted by this supplement.

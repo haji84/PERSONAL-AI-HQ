@@ -1,0 +1,1 @@
+{"id":"synthetic-1","goal":"Validate policy engine without side effects","acceptance":["All policy tests pass"],"actions":["test"],"retryCount":0}
