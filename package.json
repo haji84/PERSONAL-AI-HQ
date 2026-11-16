@@ -1,0 +1,14 @@
+{
+  "name": "personal-ai-hq",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
+  },
+  "devDependencies": {
+    "miniflare": "4.20260730.0"
+  },
+  "dependencies": {
+    "jose": "6.2.13"
+  }
+}
