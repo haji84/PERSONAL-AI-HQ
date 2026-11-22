@@ -1,0 +1,29 @@
+name: Public repository security self-check
+# Informational only: candidate-controlled workflow/source is not a trust root.
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Test scanner
+        run: node --test tests/secret-guard.test.mjs
+      - name: Real Git pre-commit E2E
+        run: node --test tests/git-hook-e2e.mjs
+      - name: Immutable Git regression tests
+        run: node --test tests/immutable-git.test.mjs
+      - name: Scan committed repository snapshot (informational)
+        run: node scripts/secret-guard.mjs --commit "$GITHUB_SHA"
