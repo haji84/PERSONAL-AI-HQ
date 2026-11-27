@@ -8,6 +8,7 @@ import {checkedEvidenceIsCurrent, prepareApiWorkspace, readAdvisoryWorkspace, re
 import {STAGES, moneyMicros} from './execution-policy.mjs';
 import {readCurrentProject} from './portfolio.mjs';
 import {ensurePrivateDirectory} from './private-directory.mjs';
+import {observedWorkTime, workOutcomeLimit} from './work-outcomes.mjs';
 
 const taskKey = /^[A-Za-z0-9][A-Za-z0-9_-]{7,79}$/;
 const receiptKey = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
@@ -45,9 +46,8 @@ export function createApiDevelopment({directory, store, conversations, withProje
   const artifacts = join(directory, 'api-work');
   let closing = false;
 
-  function ownedProject(projectId) {
-    const current = readCurrentProject(directory, projectId);
-    if (!current || held.has(current.state) || closing) throw problem(409, 'EXECUTION_HELD');
+  function enrolledCheckout(current) {
+    const projectId = current.id;
     const checkout = join(directory, 'workspaces', projectId);
     try {
       const marker = join(checkout, '.hq-owned-workspace');
@@ -57,7 +57,25 @@ export function createApiDevelopment({directory, store, conversations, withProje
         throw problem(409, 'API_WORKSPACE_NOT_ENROLLED');
       }
     } catch { throw problem(409, 'API_WORKSPACE_NOT_ENROLLED'); }
-    return {current, checkout};
+    return checkout;
+  }
+
+  function ownedProject(projectId) {
+    const current = readCurrentProject(directory, projectId);
+    if (!current || held.has(current.state) || closing) throw problem(409, 'EXECUTION_HELD');
+    return {current, checkout:enrolledCheckout(current)};
+  }
+
+  function reservationAuthority(forDispatch, now = Date.now()) {
+    let authority;
+    try { authority = readAuthority(directory, now, {forDispatch}); }
+    catch (cause) { throw problem(409, cause.code ?? 'API_AUTHORITY_INVALID'); }
+    let actualBinding;
+    try { actualBinding = store.reservationBinding(); } catch { throw problem(409, 'API_AUTHORITY_UNBOUND'); }
+    if (!actualBinding || authority.reservationAuthorityId !== store.authorityId || authority.ledgerBinding !== actualBinding) {
+      throw problem(409, 'API_AUTHORITY_UNBOUND');
+    }
+    return authority;
   }
 
   function authorized(projectId, forDispatch = true) {
@@ -65,14 +83,7 @@ export function createApiDevelopment({directory, store, conversations, withProje
     const key = getKey();
     if (typeof key !== 'string' || !key.trim()) throw problem(409, 'API_AUTHORIZATION_REQUIRED');
     const owned = ownedProject(projectId);
-    let authority;
-    try { authority = readAuthority(directory, Date.now(), {forDispatch}); }
-    catch (cause) { throw problem(409, cause.code ?? 'API_AUTHORITY_INVALID'); }
-    let actualBinding;
-    try { actualBinding = store.reservationBinding(); } catch { throw problem(409, 'API_AUTHORITY_UNBOUND'); }
-    if (!actualBinding || authority.reservationAuthorityId !== store.authorityId || authority.ledgerBinding !== actualBinding) {
-      throw problem(409, 'API_AUTHORITY_UNBOUND');
-    }
+    const authority = reservationAuthority(forDispatch);
     if (!Object.hasOwn(authority.projects, projectId)) throw problem(409, 'API_WORKSPACE_NOT_ENROLLED');
     return {...owned, authority, enrollment: authority.projects[projectId]};
   }
@@ -450,6 +461,39 @@ export function createApiDevelopment({directory, store, conversations, withProje
         })};
     },
     activity(project) { return latestApiActivity(store, project.id, id => jobs.get(id)); },
+    recentOutcomes(projects, now) {
+      if (process.platform !== 'darwin' || projects.size === 0) return [];
+      let authority, settled;
+      try {
+        authority = reservationAuthority(false, now);
+        const enrolled = [...projects.values()].filter(project => {
+          if (!Object.hasOwn(authority.projects, project.id)) return false;
+          try { return Boolean(enrolledCheckout(project)); } catch { return false; }
+        });
+        settled = store.listSettledApiWork(enrolled.map(project => project.id));
+      } catch { return []; }
+      const results = [];
+      for (const {project, operation} of settled) {
+        const {taskId, executionId, status, createdAt, dispatchedAt, completedAt} = operation;
+        if (operation.executorId !== 'owner-mac-responses' || operation.organizationId !== authority.organization ||
+            !taskKey.test(taskId) || !receiptKey.test(executionId) || !observedWorkTime(completedAt, now) ||
+            !observedWorkTime(dispatchedAt, Date.parse(completedAt)) || !observedWorkTime(createdAt, Date.parse(dispatchedAt))) continue;
+        if (status === 'completed') {
+          if (!operation.providerReceipts?.some(receipt => receipt.id !== null &&
+              observedWorkTime(receipt.observedAt, Date.parse(completedAt)) && receipt.observedAt >= dispatchedAt) ||
+              !completedReport(project, operation)) continue;
+        } else {
+          const report = resultReport(operation);
+          const kind = isAdvisoryStage(operation.task?.stage) ? 'advice' : 'development';
+          if (report?.projectId !== project || report.executionId !== executionId || report.kind !== kind ||
+              typeof report.reason !== 'string' || !report.reason || report.candidate !== null ||
+              !Array.isArray(report.changes) || report.changes.length) continue;
+        }
+        results.push({projectId:project, id:taskId, kind:'api', phase:status, observedAt:completedAt});
+        if (results.length === workOutcomeLimit) break;
+      }
+      return results;
+    },
     listArtifacts(projectIds, offset) {
       const operations = store.listVerifiedApiWork(projectIds);
       const page = operations.slice(offset, offset + 16);

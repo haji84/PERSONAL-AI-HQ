@@ -20,6 +20,7 @@ import {createPortfolioExecution, unknownExecution} from './portfolio-execution.
 import {createPlanAuth, PLAN_AUTH_CALLBACK_PATH} from './chatgpt-plan-auth.mjs';
 import {createChatGPTResponses} from './chatgpt-responses.mjs';
 import {ensurePrivateDirectory, readPrivateRuntimeToken} from './private-directory.mjs';
+import {recentWorkOutcomes} from './work-outcomes.mjs';
 import {createApiDevelopment} from './api-development.mjs';
 import {createNativeArtifacts} from './native-artifacts.mjs';
 import {createGithubProjects} from './github-projects.mjs';
@@ -474,7 +475,8 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       const summaries = portfolioExecution(portfolio.projects);
       const projects = portfolio.view.projects.map(project=>portfolio.projects.has(project.id)
         ? {...project,executionSummary:summaries.get(project.id) ?? unknownExecution} : project);
-      return send(response, 200, {...portfolio.view,projects,newProjectExecutionSettings:normalizeSettings()});
+      return send(response, 200, {...portfolio.view, projects, newProjectExecutionSettings:normalizeSettings(),
+        recentWorkOutcomes:recentWorkOutcomes(directory, portfolio.projects, operations, apiWork)});
     }
     if (get && route === '/api/artifacts/file') return download(response, portfolio.artifacts.get(target.searchParams.get('id')));
     if (get && route === '/api/artifacts/work') {

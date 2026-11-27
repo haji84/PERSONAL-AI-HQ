@@ -93,6 +93,69 @@ test('owner credentials are one-use and private API calls never expose the works
   assert.equal(reads(), 1);
 });
 
+test('recent work outcomes survive sign-in and restart within the current authorized workspaces', async t => {
+  const {directory, start} = await runtimeFixture(t);
+  const native = {
+    async findSubmission() { assert.fail('The portfolio must never reconcile native submissions'); },
+    async readThread() { assert.fail('The portfolio must only read saved native outcomes'); },
+  };
+  const first = await start({codex: native});
+  const other = {id: 'other', name: 'Other', cwd: resolve(tmpdir(), 'other-scope')};
+  await writeFile(join(directory, 'portfolio.json'), JSON.stringify({...seed, projects: [...seed.projects, other]}), {mode: 0o600});
+  const epoch = Date.now() - 60000;
+  const at = value => new Date(epoch + value).toISOString();
+  const before = new DatabaseSync(join(directory, 'conversations.sqlite'));
+  const add = before.prepare(`INSERT INTO codex_operations
+    (project,id,workspace,fingerprint,phase,threadId,turnId,createdAt,updatedAt,startedAt,output)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?)`);
+  const fingerprint = 'a'.repeat(64);
+  const paths = {example:seed.projects[0].cwd, other:other.cwd};
+  const put = (project, id, phase, sequence, {workspace = paths[project], thread = 'thread-' + id,
+    turn = 'turn-' + id, started = at(1), observed = at(sequence)} = {}) =>
+    add.run(project, id, workspace, fingerprint, phase, thread, turn, at(0), observed, started, 'PRIVATE_OUTCOME_OUTPUT');
+  const expected = [];
+  for (let n = 0; n < 10; n++) {
+    const projectId = n % 3 ? 'example' : 'other';
+    const id = 'verified-' + n;
+    const phase = n % 2 ? 'completed' : 'failed';
+    put(projectId, id, phase, n + 10);
+    expected.unshift({projectId, id, kind:'codex', phase, observedAt:at(n + 10), threadId:'thread-' + id});
+  }
+  put('example', 'unsent-failure', 'failed', 30, {thread:null, turn:null, started:null});
+  expected.unshift({projectId:'example', id:'unsent-failure', kind:'codex', phase:'failed', observedAt:at(30)});
+  put('example', 'uncertain-result', 'unconfirmed', 110);
+  put('example', 'cancelled-result', 'cancelled', 111);
+  put('example', 'wrong-workspace', 'completed', 112, {workspace:other.cwd});
+  put('missing', 'foreign-project', 'completed', 113, {workspace:other.cwd});
+  put('example', 'synthetic-result', 'completed', 114, {thread:null, turn:null, started:null});
+  put('example', 'malformed-time', 'failed', 115, {observed:'z-invalid'});
+  put('example', 'future-result', 'completed', 116, {observed:at(120000)});
+  put('example', 'invalid-sequence', 'failed', 117, {started:at(118)});
+  const allRows = () => before.prepare('SELECT * FROM codex_operations ORDER BY rowid').all();
+  const baseline = allRows();
+  t.after(() => before.close());
+  const read = (app, cookie) => fetch(app.url + '/api/portfolio', {headers: cookie ? {cookie} : {}});
+  assert.equal((await read(first)).status, 401);
+  const signIn = await login(first);
+  const response = await read(first, signIn);
+  assert.equal(response.status, 200);
+  const body = await response.text();
+  assert.deepEqual(JSON.parse(body).recentWorkOutcomes, expected.slice(0, 8));
+  assert.ok(!body.includes('PRIVATE_OUTCOME_OUTPUT') && !body.includes(other.cwd));
+  assert.deepEqual(allRows(), baseline);
+
+  await first.close();
+  const restarted = await start({codex:native});
+  assert.equal((await read(restarted, signIn)).status, 401);
+  const renewed = await login(restarted);
+  assert.deepEqual((await (await read(restarted, renewed)).json()).recentWorkOutcomes, expected.slice(0, 8));
+  assert.deepEqual(allRows(), baseline);
+  const changed = {...other, cwd: resolve(tmpdir(), 'replacement-scope')};
+  await writeFile(join(directory, 'portfolio.json'), JSON.stringify({...seed, projects: [...seed.projects, changed]}), {mode: 0o600});
+  assert.deepEqual((await (await read(restarted, renewed)).json()).recentWorkOutcomes,
+    expected.filter(item => item.projectId === 'example').slice(0, 8));
+});
+
 test('owned GitHub projects register in the dashboard without overwriting manual projects or granting execution', async t => {
   const {directory, start} = await runtimeFixture(t);
   const portfolioPath = join(directory, 'portfolio.json');
@@ -1381,6 +1444,9 @@ test('Codex chat context pins only exact existing conversation handoffs and pres
   assert.deepEqual(linked.conversation,{id:'correct-chat',title:'Origin',linked:true});
   const operations = new DatabaseSync(join(directory,'conversations.sqlite'));
   try {
+    const {updatedAt} = operations.prepare("SELECT updatedAt FROM codex_operations WHERE project='example' AND id='actual-link'").get();
+    assert.deepEqual((await (await call('/api/portfolio')).json()).recentWorkOutcomes,
+      [{projectId:'example', id:'actual-link', kind:'codex', phase:'completed', observedAt:updatedAt, threadId:'thread-actual-link'}]);
     const setPhase = operations.prepare("UPDATE codex_operations SET phase=? WHERE project='example' AND id='actual-link'");
     const currentPhase = operations.prepare("SELECT phase FROM codex_operations WHERE project='example' AND id='actual-link'");
     for (const pending of ['running','unconfirmed']) {

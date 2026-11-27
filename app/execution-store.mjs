@@ -180,6 +180,26 @@ export class ExecutionStore {
     return clone(Object.values(project.operations).find(item => item.executionId === executionId) ?? null);
   }
 
+  listSettledApiWork(projectIds) {
+    const data = this.#read();
+    const settled = [];
+    for (const project of projectIds) {
+      try {
+        const operations = this.#project(data, project).operations;
+        for (const [key, operation] of Object.entries(operations)) {
+          if (operation.route === 'api' && ['completed', 'failed'].includes(operation.status) &&
+              operation.taskId === key && typeof operation.completedAt === 'string' &&
+              Number.isSafeInteger(operation.checkpointVersion) && operation.checkpointVersion > 0 &&
+              typeof operation.artifactsHash === 'string' && hashPattern.test(operation.artifactsHash)) {
+            settled.push({project, operation});
+          }
+        }
+      } catch { /* An unreadable project cannot establish its own outcomes. */ }
+    }
+    return settled.sort((a, b) => b.operation.completedAt.localeCompare(a.operation.completedAt) ||
+      a.project.localeCompare(b.project) || a.operation.taskId.localeCompare(b.operation.taskId));
+  }
+
   listVerifiedApiWork(projectIds) {
     const state = this.#read();
     return projectIds.flatMap(project => Object.values(this.#project(state, project).operations).filter(hasApiArtifact)

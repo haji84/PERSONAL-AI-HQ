@@ -1517,6 +1517,37 @@ function applyDashboardExecution(projectId, summary) {
   if (element) paintDashboardExecution(element, project);
 }
 
+function recentWorkOutcomesPanel() {
+  const projects = new Map(projectList().filter(project => project.registration !== 'github').map(project => [project.id, project]));
+  const rows = node('ul', 'rows');
+  for (const outcome of asArray(ui.portfolio?.recentWorkOutcomes).slice(0, 8)) {
+    const project = projects.get(outcome?.projectId);
+    if (!project || !['codex', 'api'].includes(outcome.kind) || !['completed', 'failed'].includes(outcome.phase) ||
+        typeof outcome.observedAt !== 'string' || !Number.isFinite(Date.parse(outcome.observedAt))) continue;
+    const route = outcome.kind === 'api' ? '通常API' : 'Codex';
+    const openThread = outcome.kind === 'codex' && typeof outcome.threadId === 'string' && codexRecordId.test(outcome.threadId);
+    const open = () => {
+      if (openThread) {
+        selectProject(project.id);
+        ui.threadIds.set(project.id, outcome.threadId);
+        storeTab();
+        location.hash = 'codex';
+      } else if (ui.project === project.id) {
+        document.getElementById('active-project')?.scrollIntoView({block: 'nearest'});
+      } else selectProject(project.id, true);
+    };
+    const target = rowButton(project.name, route + ' · ' + time(outcome.observedAt), false, open,
+      chip(outcome.phase, outcome.phase === 'completed' ? '作業完了' : '作業失敗'));
+    target.removeAttribute('aria-pressed');
+    rows.append(listItem(target));
+  }
+  if (!rows.children.length) return null;
+  const section = panel('最近の完了・障害');
+  section.body.remove();
+  section.root.append(rows);
+  return section.root;
+}
+
 function dashboard() {
   const groups = [
     ['全プロジェクト', () => true],
@@ -1584,7 +1615,10 @@ function dashboard() {
   filterProjects(search.value);
   left.append(projects.root);
   if (ui.capabilities.tailnetPairing === true || ui.capabilities.tailnetSignIn === true) left.append(tailnetPanel());
-  right.append(projectDetail(), usagePanel());
+  right.append(projectDetail());
+  const outcomes = recentWorkOutcomesPanel();
+  if (outcomes) right.append(outcomes);
+  right.append(usagePanel());
 
   const devices = panel('実行端末');
   const rows = node('ul', 'rows');

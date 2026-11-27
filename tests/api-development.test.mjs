@@ -172,6 +172,42 @@ test('owner API-only work repairs actual source in an isolated Mac and returns a
   assert.equal(requests, 2);
 });
 
+test('portfolio reads settled API work after restart without dispatch or reporting revoked workspaces', {skip: process.platform !== 'darwin'}, async t => {
+  let requests = 0;
+  const {call, directory, ledgerFile, open, portfolio, store} = await fixture(t, async () => {
+    requests++;
+    const output = requests !== 2
+      ? [{type:'message', role:'assistant', content:[{type:'output_text', text: JSON.stringify({answer:'PRIVATE_ADVICE'})}]}]
+      : [];
+    return Response.json({...(requests < 3 && {id:'resp_history' + requests}), model:modelId, service_tier:'default', status:'completed',
+      usage:{input_tokens:100, output_tokens:25}, output});
+  });
+  assert.equal((await call('/api/execution/settings', {data:{revision:0, settings:{mode:'api-only', apiBudgetUsd:1}}})).status, 200);
+  for (const [taskId, phase] of [['history-advice-success', 'completed'], ['history-advice-failure', 'failed'], ['history-unverified', 'completed']]) {
+    assert.equal((await call('/api/execution/api', {data:{id:taskId, stage:'consultation', prompt:'相談の保存'}})).status, 202);
+    await waitFor(call, phase, taskId);
+  }
+  const failure = store.getWork(id, 'history-advice-failure').operation;
+  const success = store.getWork(id, 'history-advice-success').operation;
+  const before = await readFile(ledgerFile);
+  const expected = [failure, success].map(work => ({projectId:id, id:work.taskId, kind:'api',
+    phase:work.status, observedAt:work.completedAt}));
+  await open(false);
+  assert.equal((await call('/api/portfolio', {auth:false})).status, 401);
+  const response = await (await call('/api/portfolio')).text();
+  assert.deepEqual(JSON.parse(response).recentWorkOutcomes, expected);
+  assert.ok(!response.includes('PRIVATE_ADVICE') && !response.includes('resp_history') && !response.includes(directory));
+  const resultPath = join(directory, 'api-work', failure.executionId, 'result.json');
+  await writeFile(resultPath, '{}');
+  assert.deepEqual((await (await call('/api/portfolio')).json()).recentWorkOutcomes, [expected[1]]);
+  const definition = JSON.parse(await readFile(portfolio));
+  delete definition.projects[0].cwd;
+  await writeFile(portfolio, JSON.stringify(definition), {mode:0o600});
+  assert.deepEqual((await (await call('/api/portfolio')).json()).recentWorkOutcomes, []);
+  assert.deepEqual(await readFile(ledgerFile), before);
+  assert.equal(requests, 3);
+});
+
 function providerAnswer(answer, changes = [{path: 'source.mjs', text: `export const answer = ${answer};\n`}]) {
   return Response.json({model: modelId, service_tier: 'default', status: 'completed', usage: {input_tokens: 100, output_tokens: 25},
     output: [{type: 'message', role: 'assistant', content: [{type: 'output_text', text: JSON.stringify({
@@ -730,6 +766,7 @@ test('the first received API receipt survives loss of the second response and a 
   const {conversation} = await (await call('/api/chat', {query: {id: 'api/' + work.executionId}})).json();
   assert.equal(conversation.outcome, 'unconfirmed');
   assert.deepEqual(conversation.providerReceipts, [receipt]);
+  assert.deepEqual((await (await call('/api/portfolio')).json()).recentWorkOutcomes, []);
   assert.equal(requests, 2);
 });
 
