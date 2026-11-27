@@ -550,6 +550,7 @@ function metric(list, label, value, percentage = false) {
     row.append(bar);
   } else row.textContent = text(value);
   list.append(node('dt', '', label), row);
+  return row;
 }
 function appendStrings(parent, values) {
   const clean = asArray(values).filter(value => typeof value === 'string' && value.length);
@@ -987,12 +988,59 @@ function estimateLabel(estimate) {
     duration(estimate.optimistic) + '〜' + duration(estimate.cautious) + '（標準 ' + duration(estimate.standard) + '）';
 }
 
+function updateEstimateReadout(readout, now) {
+  if (now < Number(readout.dataset.estimateExpires)) return;
+  readout.textContent = '再見積もり待ち（記録時 ' + readout.textContent + '）';
+  delete readout.dataset.estimateExpires;
+}
+
+function markEstimateExpiry(readout, deadline) {
+  if (!Number.isFinite(deadline)) return;
+  readout.dataset.estimateExpires = String(deadline);
+  updateEstimateReadout(readout, Date.now());
+}
+
+function markProjectEstimateExpiry(readout, project, finish) {
+  if (project.measurements?.formalCompletion === 100 && project.schedule?.remainingMinutes?.cautious === 0) return;
+  markEstimateExpiry(readout, Date.parse(finish));
+}
+
+function refreshEstimateReadouts() {
+  if (document.hidden || dom.shell.hidden) return;
+  const scope = ui.view === 'dashboard' ? dom.content : dom.content.querySelector('#chat-development:not([hidden])');
+  if (!scope) return;
+  const now = Date.now();
+  for (const readout of scope.querySelectorAll('[data-estimate-expires]')) updateEstimateReadout(readout, now);
+}
+
+function taskEstimateReadout(task) {
+  const estimate = task.remainingMinutes;
+  const label = estimateLabel(estimate);
+  if (!Number.isFinite(estimate?.standard) || task.status === 'verified') return node('dd', 'strong', label);
+  if (task.status === 'pending') return node('dd', 'strong', '着手後の見込み ' + label);
+  if (task.externalWait || ['waiting', 'paused', 'blocked', 'approval', 'limit'].includes(task.status)) {
+    return node('dd', 'strong', '再開後の見込み ' + label);
+  }
+  const observedAt = Date.parse(task.observedAt);
+  if (!Number.isFinite(observedAt) || observedAt > Date.now()) return node('dd', 'strong', '記録時点の見込み ' + label);
+  const readout = node('dd', 'strong', label);
+  markEstimateExpiry(readout, observedAt + estimate.standard * 60000);
+  return readout;
+}
+
 function taskStatus(task) {
   const age = Date.now() - Date.parse(task.observedAt);
   if (task.status === 'active') return age >= 0 && age <= 15 * 60 * 1000
     ? chip('developing') : chip('unknown', '前回は開発中');
   if (task.status === 'pending') return chip('waiting', '未着手');
+  if (task.status === 'verified') return chip('completed', '確認済み');
   return chip(task.status);
+}
+
+function taskProgressLabel(progress) {
+  return progress && Number.isFinite(progress.percent)
+    ? progress.percent + '%（' + progress.accepted + '/' + progress.total + '件確認・残り' +
+      (progress.total - progress.accepted) + '件）' : '算定待ち';
 }
 
 function progressRow(task) {
@@ -1003,17 +1051,16 @@ function progressRow(task) {
     title.append(node('strong', '', task.title), taskStatus(task));
     work.append(title);
   }
-  if (!appendStrings(work, task.remaining)) work.append(node('p', 'small muted', '残作業の記録なし'));
+  if (!appendStrings(work, task.remaining)) {
+    work.append(node('p', 'small muted', task.status === 'verified' ? '残作業なし' : '残作業の記録なし'));
+  }
   if (task.blocker) work.append(node('p', 'small', task.blocker));
   const metrics = node('dl', 'task-progress-facts');
-  const progress = task.progress;
-  const progressValue = progress && Number.isFinite(progress.percent)
-    ? progress.percent + '%（' + progress.accepted + '/' + progress.total + '件確認・残り' +
-      (progress.total - progress.accepted) + '件）' : '算定待ち';
-  const remainingTime = estimateLabel(task.remainingMinutes);
-  for (const [label, value] of [['進捗率', progressValue], ['残り作業時間', remainingTime]]) {
+  const progressValue = taskProgressLabel(task.progress);
+  const remaining = taskEstimateReadout(task);
+  for (const [label, value] of [['進捗率', node('dd', 'strong', progressValue)], ['残り作業時間', remaining]]) {
     const entry = node('div');
-    entry.append(node('dt', 'small muted', label), node('dd', 'strong', value));
+    entry.append(node('dt', 'small muted', label), value);
     metrics.append(entry);
   }
   const context = node('p', 'small muted');
@@ -1188,9 +1235,13 @@ function projectDetail() {
     metric(facts, '動作検証済み割合', m.verifiedCompletion, true);
     metric(facts, '実用完成率', m.usableCompletion, true);
   }
-  if (!record || m.estimateFinish || record.firstUsable) metric(facts, '完成予定', time(m.estimateFinish));
+  if (!record || m.estimateFinish || record.firstUsable) {
+    const finish = metric(facts, '完成予定', time(m.estimateFinish));
+    markProjectEstimateExpiry(finish, project, m.estimateFinish);
+  }
   if (project.schedule?.originalDueAt) metric(facts, '当初の完成予定', time(project.schedule.originalDueAt));
-  metric(facts, '案件全体の残り作業時間', estimateLabel(project.schedule?.remainingMinutes));
+  const wholeTime = metric(facts, '案件全体の残り作業時間', estimateLabel(project.schedule?.remainingMinutes));
+  markProjectEstimateExpiry(wholeTime, project, project.schedule?.estimatedFinish);
   if (!record || Number.isFinite(m.activeMinutes)) {
     metric(facts, '累計実作業時間', Number.isFinite(m.activeMinutes) ? m.activeMinutes + '分' : null);
   }
@@ -1324,13 +1375,16 @@ function paintDashboardExecution(element, project) {
 
   const formal = project.measurements?.formalCompletion;
   const remaining = project.schedule?.remainingMinutes;
-  const progress = [];
   if (Number.isFinite(formal) && formal >= 0 && formal <= 100) {
-    progress.push('正式達成率 ' + new Intl.NumberFormat('ja-JP', {maximumFractionDigits: 1}).format(formal) + '%');
+    element.append(node('span', '', '正式達成率 ' +
+      new Intl.NumberFormat('ja-JP', {maximumFractionDigits: 1}).format(formal) + '%'));
   }
   if (remaining && [remaining.optimistic, remaining.standard, remaining.cautious]
-    .every(value => Number.isFinite(value) && value >= 0)) progress.push('全体の残り ' + estimateLabel(remaining));
-  if (progress.length) element.append(node('span', '', progress.join(' · ')));
+    .every(value => Number.isFinite(value) && value >= 0)) {
+    const readout = node('span', '', '全体の残り ' + estimateLabel(remaining));
+    markProjectEstimateExpiry(readout, project, project.schedule?.estimatedFinish);
+    element.append(readout);
+  }
   element.hidden = false;
 
   if (verified) {
@@ -2031,8 +2085,10 @@ function chatDevelopmentPanel(project) {
   const metrics = node('dl', 'properties');
   metric(metrics, '案件の記録', stateLabels[project.state]);
   metric(metrics, '正式な要求達成率', project.measurements?.formalCompletion, true);
-  metric(metrics, '残り作業時間', estimateLabel(project.schedule?.remainingMinutes));
-  metric(metrics, '完成予定', time(project.measurements?.estimateFinish));
+  const remaining = metric(metrics, '残り作業時間', estimateLabel(project.schedule?.remainingMinutes));
+  markProjectEstimateExpiry(remaining, project, project.schedule?.estimatedFinish);
+  const finish = metric(metrics, '完成予定', time(project.measurements?.estimateFinish));
+  markProjectEstimateExpiry(finish, project, project.measurements?.estimateFinish);
   metric(metrics, '案件データの取得時刻', time(project.observedAt ?? ui.portfolio?.observedAt));
   area.body.append(metrics);
   if (project.schedule?.delayed === true) area.body.append(node('p', 'chip notice-chip', '当初予定に対して遅延しています'));
@@ -2040,7 +2096,10 @@ function chatDevelopmentPanel(project) {
   if (task) {
     const current = node('p', 'task-title');
     current.append(node('strong', '', task.title), taskStatus(task));
-    area.body.append(node('h3', '', '確認が残るタスク'), current);
+    const taskMetrics = node('dl', 'properties');
+    metric(taskMetrics, 'タスクの進捗率', taskProgressLabel(task.progress));
+    taskMetrics.append(node('dt', '', 'タスクの残り作業時間'), taskEstimateReadout(task));
+    area.body.append(node('h3', '', '確認が残るタスク'), current, taskMetrics);
     if (task.observedAt) area.body.append(node('p', 'small muted', 'タスクの記録 ' + time(task.observedAt)));
   }
   if (ui.capabilities.executionActivity === true) area.body.append(activityPanel());
@@ -2061,6 +2120,7 @@ function syncChatDevelopment() {
   }
   panel.hidden = !visible;
   panel.parentElement.classList.toggle('with-development', visible);
+  if (visible) refreshEstimateReadouts();
 }
 
 function chat() {
@@ -3612,6 +3672,7 @@ function canRefreshVisibleDashboard() {
   return !editing && !dom.content.querySelector('details[open]') && !(Date.parse(pairing?.dataset.pairExpiresAt) > Date.now());
 }
 async function refreshVisibleDashboard() {
+  refreshEstimateReadouts();
   if (portfolioPollRunning || !canRefreshVisibleDashboard()) return;
   const generation = requestSequence;
   const executionVersion = dashboardExecutionVersion;
