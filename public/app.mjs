@@ -57,8 +57,10 @@ const ui = {
   steerIntents: new Map(Object.entries(savedTab.steerIntents ?? {})),
   chatTurns: new Map(Object.entries(savedTab.chatTurns ?? {})),
   chatIntents: new Map(Object.entries(savedTab.chatIntents ?? {})),
+  registrationIntents: new Map(Object.entries(savedTab.registrationIntents ?? {})),
 };
 const resources = new Map();
+const registrationFlights = new Map();
 const runStates = new Map();
 const runViewCleanups = new Set();
 const chatStreams = new Map();
@@ -101,6 +103,7 @@ function storeTab() {
     steerIntents: Object.fromEntries(ui.steerIntents),
     chatTurns: Object.fromEntries(ui.chatTurns),
     chatIntents: Object.fromEntries(ui.chatIntents),
+    registrationIntents: Object.fromEntries(ui.registrationIntents),
   });
 }
 function node(tag, classes, text) {
@@ -557,6 +560,88 @@ function sourceSection(parent, proof) {
   }
   if (list.children.length) parent.append(node('h3', '', '確認した記録'), list);
 }
+function executionSettingsFields() {
+  const root = node('div', 'stack');
+  const values = {'subscription-only': 'サブスク専用', 'api-only': 'API専用', auto: '自動選択', hybrid: '工程ごとに指定'};
+  const mode = labeledSelect('実行モード', values);
+  const preference = labeledSelect('自動選択の優先順', {'subscription-first': 'サブスク優先', 'api-first': 'API優先', balanced: '実測をもとに選択'});
+  const routeFields = node('fieldset', 'stack');
+  routeFields.append(node('legend', 'small muted', '許可する実行経路'));
+  const routeChecks = Object.entries({subscription:'サブスク', api:'API'}).map(([route, text]) => {
+    const field = node('label', 'speech-control');
+    const input = node('input');
+    input.type = 'checkbox';
+    field.append(input, node('span', '', text));
+    routeFields.append(field);
+    return [route, input];
+  });
+  const fallback = node('label', 'speech-control');
+  const consent = node('input');
+  consent.type = 'checkbox';
+  fallback.append(consent, node('span', '', '自動選択時に許可済みの別経路を使う'));
+  const budget = node('label', 'picker');
+  const amount = node('input');
+  amount.type = 'number';
+  amount.min = '0';
+  amount.max = '1000000';
+  amount.step = 'any';
+  budget.append(node('span', '', 'API作業上限（USD）'), amount);
+  const stages = node('div', 'stack');
+  const choices = Object.entries(workStageLabels).map(([stage, label]) => {
+    const entry = labeledSelect(label, {'': '未指定', subscription: 'サブスク', api: 'API'});
+    stages.append(entry.field);
+    return [stage, entry.input];
+  });
+  function optionalText(title) {
+    const field = node('label', 'picker');
+    const input = node('input', 'search');
+    input.maxLength = 160;
+    input.placeholder = '自動';
+    field.append(node('span', '', title), input);
+    return {field, input};
+  }
+  const model = optionalText('モデルID');
+  const effort = optionalText('推論レベル');
+  root.append(mode.field, routeFields, preference.field, fallback, budget, stages, model.field, effort.field);
+
+  function fields() {
+    const selected = mode.input.value;
+    routeFields.hidden = selected !== 'auto' && selected !== 'hybrid';
+    preference.field.hidden = selected !== 'auto';
+    fallback.hidden = preference.field.hidden;
+    budget.hidden = mode.input.value === 'subscription-only';
+    stages.hidden = mode.input.value !== 'hybrid';
+  }
+
+  mode.input.addEventListener('change', fields);
+  return {root, problem() {
+    if (!budget.hidden && !amount.validity.valid) return 'API作業上限を確認してください。';
+    if (!routeFields.hidden && !routeChecks.some(([, input]) => input.checked)) return '実行経路を一つ以上選んでください。';
+    if (!stages.hidden && choices.some(([, input]) => input.value &&
+      !routeChecks.some(([route, check]) => route === input.value && check.checked))) return '工程の経路を許可する実行経路から選んでください。';
+    return null;
+  }, apply(settings) {
+    mode.input.value = settings.mode;
+    const routes = ['auto', 'hybrid'].includes(settings.mode) ? settings.allowedRoutes : ['subscription', 'api'];
+    for (const [route, input] of routeChecks) input.checked = routes.includes(route);
+    model.input.value = settings.model ?? '';
+    effort.input.value = settings.reasoningEffort ?? '';
+    preference.input.value = settings.preference;
+    consent.checked = settings.allowFallback === true;
+    amount.value = settings.apiBudgetUsd ?? '';
+    for (const [stage, input] of choices) input.value = settings.stageRoutes?.[stage] ?? '';
+    fields();
+  }, value() {
+    const chosen = mode.input.value;
+    return {mode: chosen, preference: preference.input.value, allowFallback: chosen === 'auto' && consent.checked,
+      apiBudgetUsd: amount.validity.valid && amount.value !== '' ? Number(amount.value) : null,
+      stageRoutes: chosen === 'hybrid' ? Object.fromEntries(choices.filter(([, input]) => input.value)
+        .map(([stage, input]) => [stage, input.value])) : {},
+      model: model.input.value.trim() || null, reasoningEffort: effort.input.value.trim() || null,
+      ...(!routeFields.hidden && {allowedRoutes:routeChecks.filter(([, input]) => input.checked).map(([route]) => route)})};
+  }};
+}
+
 function executionSettings(project) {
   const details = node('details', 'scope-info');
   const content = node('div', 'stack');
@@ -566,70 +651,153 @@ function executionSettings(project) {
   function mount() {
     fetchView(key, path, content, (initial, destination) => {
       let current = initial;
-      const values = {'subscription-only': 'サブスク専用', 'api-only': 'API専用', auto: '自動選択', hybrid: '工程ごとに指定'};
-      const routes = {subscription: 'サブスク', api: 'API'};
-      const mode = labeledSelect('実行モード', values);
-      const preference = labeledSelect('自動選択の優先順', {'subscription-first': 'サブスク優先', 'api-first': 'API優先', balanced: '実測をもとに選択'});
-      const fallback = node('label', 'picker');
-      const consent = node('input');
-      consent.type = 'checkbox';
-      fallback.append(consent, node('span', '', '自動選択時に許可済みの別経路を使う'));
-      const budget = node('label', 'picker');
-      const amount = node('input');
-      amount.type = 'number';
-      amount.min = '0';
-      amount.step = '0.01';
-      budget.append(node('span', '', 'API作業上限（USD）'), amount);
-      const stages = node('div', 'stack');
-      const choices = Object.entries(workStageLabels).map(([stage, label]) => {
-        const entry = labeledSelect(label, {'': '未指定', ...routes});
-        stages.append(entry.field);
-        return [stage, entry.input];
-      });
+      const editor = executionSettingsFields();
       const status = node('p', 'small muted');
       status.setAttribute('role', 'status');
-      function fields() {
-        preference.field.hidden = mode.input.value !== 'auto';
-        fallback.hidden = preference.field.hidden;
-        budget.hidden = mode.input.value === 'subscription-only';
-        stages.hidden = mode.input.value !== 'hybrid';
-      }
-      function apply() {
-        const s = current.settings;
-        mode.input.value = s.mode;
-        preference.input.value = s.preference;
-        consent.checked = s.allowFallback === true;
-        amount.value = s.apiBudgetUsd ?? '';
-        for (const [stage, input] of choices) input.value = s.stageRoutes?.[stage] ?? '';
-        fields();
-      }
-      mode.input.addEventListener('change', fields);
       const save = button('案件の実行設定を保存', async () => {
-        if (!amount.validity.valid) { status.textContent = 'API作業上限を確認してください。'; return; }
+        const problem = editor.problem();
+        if (problem) { status.textContent = problem; return; }
         save.disabled = true;
-        const chosen = mode.input.value;
-        const settings = {mode: chosen, preference: preference.input.value, allowFallback: chosen === 'auto' && consent.checked,
-          apiBudgetUsd: amount.value === '' ? null : Number(amount.value),
-          stageRoutes: chosen === 'hybrid' ? Object.fromEntries(choices.filter(([, input]) => input.value)
-            .map(([stage, input]) => [stage, input.value])) : {}};
         try {
           current = await api(path, {method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({revision: current.revision, settings})});
+            body: JSON.stringify({revision: current.revision, settings: editor.value()})});
           resources.set(key, {value: current});
-          apply();
+          editor.apply(current.settings);
           status.textContent = 'この案件の実行設定を保存しました。';
         } catch (error) { status.textContent = error.message; }
         finally { save.disabled = false; }
       }, false);
-      destination.append(mode.field, preference.field, fallback, budget, stages,
+      destination.append(editor.root,
         node('p', 'small muted', current.apiAvailable ? 'API実行経路を利用できます。' : 'API実行は認証と費用条件を確認できるまで待機します。'),
         save, status);
-      apply();
+      editor.apply(current.settings);
     }, () => ui.view === 'dashboard' && ui.project === project);
   }
   details.addEventListener('toggle', () => { if (details.open && !content.hasChildNodes()) mount(); });
   return details;
 }
+
+function registrationRejected(error) {
+  return [400, 403, 404, 409, 413, 422].includes(error.status);
+}
+
+function sendProjectRegistration(key, payload) {
+  if (registrationFlights.has(key)) return registrationFlights.get(key);
+  ui.registrationIntents.set(key, payload);
+  storeTab();
+  const sent = api('/api/portfolio/projects', {method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload), signal: AbortSignal.timeout(15000)}).then(result => {
+    if (typeof result?.id !== 'string' || !result.id) throw new Error('案件の受付結果を取得できませんでした。');
+    ui.registrationIntents.delete(key);
+    storeTab();
+    return result.id;
+  }).catch(error => {
+    if (registrationRejected(error)) {
+      ui.registrationIntents.delete(key);
+      storeTab();
+    }
+    throw error;
+  }).finally(() => { registrationFlights.delete(key); });
+  registrationFlights.set(key, sent);
+  return sent;
+}
+
+function projectRegistrationForm(github, pendingKey = null) {
+  const defaults = ui.portfolio?.newProjectExecutionSettings;
+  const key = pendingKey ?? github?.id ?? '';
+  let intent = ui.registrationIntents.get(key);
+  if (ui.capabilities.projectRegistration !== true || !defaults ||
+      (pendingKey && !intent) ||
+      (github && (github.registration !== 'github' || github.registrationAvailable !== true))) return null;
+
+  const selected = ui.project;
+  const details = node('details', 'scope-info');
+  const form = node('form', 'stack');
+  const fields = node('fieldset', 'stack');
+  const heading = pendingKey ? 'GitHub案件の登録受付' : github ? 'このGitHub案件を登録' : '新規案件を登録';
+  details.append(node('summary', '', heading), form);
+  const current = () => details.isConnected && ui.view === 'dashboard' && ui.project === selected;
+  const name = node('input', 'search');
+  name.maxLength = 100;
+  name.required = !key;
+  const goal = node('textarea', 'draft');
+  goal.maxLength = 1500;
+  function field(label, control) {
+    const item = node('label', 'picker');
+    item.append(node('span', '', label), control);
+    return item;
+  }
+  if (github) fields.append(node('p', 'strong', github.name));
+  else if (!pendingKey) fields.append(field('案件名', name));
+  fields.append(field('GOAL（任意）', goal));
+
+  const editor = executionSettingsFields();
+  editor.apply(intent?.settings ?? defaults);
+  fields.append(editor.root);
+  if (intent) {
+    name.value = intent.name ?? '';
+    goal.value = intent.goal ?? '';
+    details.open = true;
+  }
+
+  let busy = false;
+  let registeredId;
+  const status = node('p', 'small muted', intent ? '受付結果を照合できます。' : '');
+  status.setAttribute('role', 'status');
+  const submit = node('button', 'button', '案件を登録');
+  submit.type = 'submit';
+  function update() {
+    fields.disabled = busy || Boolean(intent || registeredId);
+    submit.disabled = busy || Boolean(pendingKey && !intent && !registeredId);
+    submit.textContent = registeredId ? '案件一覧を再取得' : intent ? '同じ受付で照合' : '案件を登録';
+  }
+
+  const actions = node('div', 'run-actions');
+  actions.append(submit);
+  form.append(fields, node('p', 'small muted', '登録時は待機中になります。作業先と実行権限はホスト側で登録します。'), actions, status);
+  form.addEventListener('submit', async event => {
+    event.preventDefault();
+    if (busy || !current() || pendingKey && !intent && !registeredId) return;
+    if (!intent && !registeredId) {
+      const title = name.value.trim();
+      if (!github && !title) { status.textContent = '案件名を入力してください。'; name.focus(); return; }
+      const problem = editor.problem();
+      if (problem) { status.textContent = problem; return; }
+      intent = {requestId: crypto.randomUUID(), ...(github ? {githubProject: github.id} : {name: title}),
+        ...(goal.value.trim() ? {goal: goal.value.trim()} : {}), settings: editor.value()};
+    }
+
+    busy = true;
+    update();
+    status.textContent = registeredId ? '案件一覧を取得中…' : '受付を確認中…';
+    try {
+      registeredId ??= await sendProjectRegistration(key, intent);
+      intent = null;
+      if (!current()) return;
+      const sequence = requestSequence;
+      const latest = await api('/api/portfolio', {signal: AbortSignal.timeout(10000)});
+      if (!current() || sequence !== requestSequence) return;
+      if (!asArray(latest?.projects).some(project => project.id === registeredId)) {
+        throw new Error('登録した案件が一覧に表示されるまで、もう一度取得してください。');
+      }
+      rememberScroll();
+      ui.portfolio = latest;
+      ui.project = registeredId;
+      updateProjectSelect();
+      setNotice('案件を登録しました。');
+      render(true, true);
+    } catch (error) {
+      if (registrationRejected(error)) intent = null;
+      if (current()) status.textContent = error.message + (intent ? ' 同じ受付で照合できます。' : '');
+    } finally {
+      busy = false;
+      if (current()) update();
+    }
+  });
+  update();
+  return details;
+}
+
 function deliveryRecordDetails(record) {
   const section = node('section', 'stack');
   section.append(node('h3', '', '進捗の観測記録'));
@@ -867,12 +1035,15 @@ function projectDetail() {
   detail.header.append(chip(project.state));
   if (project.goal) detail.body.append(node('p', 'strong', project.goal));
   if (project.summary) detail.body.append(node('p', 'muted', project.summary));
+  if (project.scopeRequired) detail.body.append(node('p', 'muted', '実行を始めるには、ホスト側で作業先と実行権限を設定してください。'));
   const facts = node('dl', 'properties');
   if (project.registration === 'github') {
     metric(facts, 'GitHubでの取得時刻', time(project.observedAt));
     detail.body.append(facts);
     const source = link('GitHubでリポジトリを開く', project.repository);
     if (source) detail.body.append(source);
+    const registration = !ui.registrationIntents.has(project.id) && projectRegistrationForm(project);
+    if (registration) detail.body.append(registration);
     return detail.root;
   }
   const m = project.measurements ?? {};
@@ -1012,6 +1183,13 @@ function dashboard() {
   }
   const search = queryInput('dashboard', 'プロジェクトを検索', 'プロジェクトを検索', filterProjects);
   searchWrap.append(search);
+  const registration = projectRegistrationForm();
+  if (registration) searchWrap.append(registration);
+  for (const [key, intent] of ui.registrationIntents) {
+    if (!key || intent.githubProject !== key) continue;
+    const pending = projectRegistrationForm(null, key);
+    if (pending) searchWrap.append(pending);
+  }
   projects.body.remove();
   projects.root.append(searchWrap);
   const github = ui.portfolio?.githubRegistration;

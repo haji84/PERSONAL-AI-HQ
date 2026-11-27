@@ -31,14 +31,19 @@ const validProviderReceipt = receipt => receipt !== null && typeof receipt === '
   [receipt.inputTokens, receipt.outputTokens, receipt.accountedMicros].every(count => Number.isSafeInteger(count) && count >= 0) &&
   typeof receipt.observedAt === 'string' && Number.isFinite(Date.parse(receipt.observedAt));
 const settingFields = Object.keys(normalizeSettings());
-const emptyProject = () => ({ revision: 0, settings: normalizeSettings(), history: [], operations: {}, spentMicros: 0, lastRoute: null, lastExecution: null, checkpoint: null });
+const emptyProject = initial => ({
+  revision: 0, settings: initial?.settings ?? normalizeSettings(), updatedAt: initial?.updatedAt,
+  history: initial ? [{revision:0, ...initial}] : [], operations: {}, spentMicros: 0,
+  lastRoute: null, lastExecution: null, checkpoint: null,
+});
 
 // One owner-controlled server is the writer for this store. Do not replicate the
 // file to create another budget authority on a second device.
 export class ExecutionStore {
-  constructor(file, { authorityId } = {}) {
+  constructor(file, { authorityId, initialProject } = {}) {
     this.file = path.resolve(file);
     this.authorityId = id(authorityId);
+    this.initialProject = initialProject;
   }
 
   #read() {
@@ -83,11 +88,12 @@ export class ExecutionStore {
     }
   }
 
-  #project(data, projectId, create = false) {
+  #project(data, projectId, {create = false, includeInitial = create} = {}) {
     id(projectId);
     if (!Object.hasOwn(data.projects, projectId)) {
-      if (!create) return emptyProject();
-      data.projects[projectId] = emptyProject();
+      const project = emptyProject(includeInitial ? this.initialProject?.(projectId) : null);
+      if (!create) return project;
+      data.projects[projectId] = project;
     }
     const project = data.projects[projectId];
     if (!Number.isSafeInteger(project.revision) || project.revision < 0 || !Array.isArray(project.history) || !project.operations || typeof project.operations !== 'object' || Array.isArray(project.operations) || !Number.isSafeInteger(project.spentMicros) || project.spentMicros < 0) error('STATE_INVALID');
@@ -105,8 +111,13 @@ export class ExecutionStore {
     return project;
   }
 
+  hasProject(projectId) {
+    const key = id(projectId).toLowerCase();
+    return Object.keys(this.#read().projects).some(project => project.toLowerCase() === key);
+  }
+
   getSettings(projectId) {
-    const project = this.#project(this.#read(), projectId);
+    const project = this.#project(this.#read(), projectId, {includeInitial:true});
     return clone({ revision: project.revision, settings: project.settings, updatedAt: project.updatedAt ?? null, history: project.history });
   }
 
@@ -161,7 +172,7 @@ export class ExecutionStore {
 
   updateSettings(projectId, expectedRevision, input) {
     return this.#change(data => {
-      const project = this.#project(data, projectId, true);
+      const project = this.#project(data, projectId, {create:true});
       if (project.revision !== expectedRevision) error('REVISION_CONFLICT');
       if (Object.values(project.operations).some(operation => active.has(operation.status))) error('PROJECT_BUSY');
       const merged = { ...project.settings, ...input };
@@ -217,7 +228,7 @@ export class ExecutionStore {
         !['consultation', 'design'].includes(request.task.stage))) error('INVALID_NATIVE_ORIGIN');
     const fingerprint = digest({ instructionDigest: request.instructionDigest, task: request.task ?? {}, nativeOrigin });
     return this.#change(data => {
-      const project = this.#project(data, request.projectId, true);
+      const project = this.#project(data, request.projectId, {create:true});
       const prior = project.operations[request.taskId];
       if (prior) {
         if (prior.fingerprint !== fingerprint) error('TASK_ID_CONFLICT');

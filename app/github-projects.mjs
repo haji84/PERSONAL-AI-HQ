@@ -189,6 +189,7 @@ export function createGithubProjects(directory, {owner: configuredOwner, read = 
         if (covered.has(repo.id) || manualIds.has(id)) return [];
         const repository = 'https://github.com/' + owner + '/' + encodeURIComponent(repo.name);
         return [{id, name:repo.name, repository, observedAt, state:'unknown',
+          registrationAvailable: live && !repo.archived,
           summary: repo.archived ? 'GitHubでアーカイブ済み' : 'GitHubで確認 · 作業先未設定'}];
       }).slice(0, Math.max(0, limit - manual.length));
       return {status:live ? 'ready' : 'stale', observedAt, count:cache.repositories.length, projects};
