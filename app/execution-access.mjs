@@ -1,14 +1,15 @@
 import {join} from 'node:path';
 import {resolveExecution} from './execution-policy.mjs';
 import {ExecutionStore} from './execution-store.mjs';
-import {readCurrentProject} from './portfolio.mjs';
+import {readCurrentProject, readProjectInitialExecution} from './portfolio.mjs';
 
 const held = new Set(['paused', 'approval', 'limit', 'blocked', 'offline', 'waiting', 'completed']);
 const problem = (status, message, code) => Object.assign(new Error(message), {status, code});
 const unavailableImageModel = () => problem(409, '選択したCodexモデルの画像入力対応を確認できません。', 'CODEX_IMAGE_MODEL_UNAVAILABLE');
 
 export function createExecutionAccess(directory, native) {
-  const store = new ExecutionStore(join(directory, 'execution-policy.json'), {authorityId: 'personal-ai-hq-local'});
+  const store = new ExecutionStore(join(directory, 'execution-policy.json'), {authorityId: 'personal-ai-hq-local',
+    initialProject: projectId => readProjectInitialExecution(directory, projectId)});
 
   function preflight(project, stage, workspace, route, handoverReceipt) {
     const latest = readCurrentProject(directory, project.id);

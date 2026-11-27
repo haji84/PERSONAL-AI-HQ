@@ -8,7 +8,8 @@ import {homedir} from 'node:os';
 import {basename, dirname, isAbsolute, join, resolve} from 'node:path';
 import {fileURLToPath, pathToFileURL} from 'node:url';
 import {pipeline} from 'node:stream/promises';
-import {readCurrentProject, readPortfolio, readProjectDeliverySource} from './portfolio.mjs';
+import {readCurrentProject, readPortfolio, readProjectDeliverySource, registerProject} from './portfolio.mjs';
+import {normalizeSettings} from './execution-policy.mjs';
 import {readOwnerRequirementCoverage} from './delivery-records.mjs';
 import {createChatStore} from './chat-store.mjs';
 import {createCodexClient, emptyNativeActivity, isCodexLoopbackUrl, validEvidenceCursor, validEvidenceTarget} from './codex.mjs';
@@ -361,7 +362,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       const enabled = native.canWrite === true && portfolio?.view.projects.some(project => project.codexWrite) === true &&
         await Promise.resolve(native.subscriptionReady?.()).catch(() => false) === true;
       return send(response, 200, {authenticated, capabilities: {chatImport: true, codexWrite: enabled,
-        executionSettings: authenticated, executionActivity: authenticated, chatgptPlan: !remote && authenticated && Boolean(plan),
+        projectRegistration: authenticated, executionSettings: authenticated, executionActivity: authenticated, chatgptPlan: !remote && authenticated && Boolean(plan),
         apiDevelopment: authenticated && apiEnabled, localSpeech: authenticated && await speechService.available(),
         tailnetPairing: !remote && authenticated && Boolean(access), tailnetSignIn: remote}});
     }
@@ -427,11 +428,21 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       }
       return send(response, 200, coverage);
     }
+    if (post && route === '/api/portfolio/projects') {
+      const input = await jsonBody(request, 8192);
+      if (!signedIn()) throw error(401, 'サインインが必要です。');
+      const {id, created} = chats.withWriteLock(() => registerProject(directory, input, {
+        github, hasSavedWork: projectId => execution.store.hasProject(projectId) ||
+          chats.hasProjectHistory(projectId) || operations.hasProjectHistory(projectId),
+      }));
+      const {revision, updatedAt, settings} = execution.settings({id});
+      return send(response, created ? 201 : 200, {id, revision, updatedAt, settings});
+    }
     const portfolioRequest = get && route === '/api/portfolio';
     const portfolio = await readPortfolio(directory, github, portfolioRequest);
     if (portfolioRequest) {
       if (!signedIn()) throw error(401, 'サインインが必要です。');
-      return send(response, 200, portfolio.view);
+      return send(response, 200, {...portfolio.view, newProjectExecutionSettings:normalizeSettings()});
     }
     if (get && route === '/api/artifacts/file') return download(response, portfolio.artifacts.get(target.searchParams.get('id')));
     if (get && route === '/api/artifacts/work') {

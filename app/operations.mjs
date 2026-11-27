@@ -82,6 +82,9 @@ export function createOperations(directory, native, execution, {prepareHandover}
       WHERE handoverReview IS NOT NULL AND threadId IS NOT NULL`);
     db.exec('COMMIT');
   } catch (error) { db.exec('ROLLBACK'); db.close(); throw error; }
+  const projectHistory = db.prepare(
+    'SELECT 1 FROM codex_operations WHERE project=?1 COLLATE NOCASE UNION ALL ' +
+    'SELECT 1 FROM codex_steering WHERE project=?1 COLLATE NOCASE LIMIT 1');
   const byId = db.prepare('SELECT * FROM codex_operations WHERE project=? AND id=?');
   const targetsThread = param => `(threadId=${param} OR (threadId IS NULL AND expectedThreadId=${param}
     AND phase IN ('reserved','sending','running','interrupting','unconfirmed','cancelled')))`;
@@ -275,6 +278,7 @@ export function createOperations(directory, native, execution, {prepareHandover}
   }
 
   return {
+    hasProjectHistory: id => Boolean(projectHistory.get(id)),
     hasActiveWork(project, exceptId = null) { return Boolean(activeRun.get(project.id, exceptId)); },
     hasNativeWork(project) {
       return Boolean(knownNativeWork.get(project.id, JSON.stringify(project.cwd)));

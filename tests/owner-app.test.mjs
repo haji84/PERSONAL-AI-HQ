@@ -1,3 +1,4 @@
+import {randomUUID} from 'node:crypto';
 import assert from 'node:assert/strict';
 import {mkdir, mkdtemp, readFile, realpath, rm, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
@@ -6,6 +7,7 @@ import {DatabaseSync} from 'node:sqlite';
 import test from 'node:test';
 import {setTimeout as delay} from 'node:timers/promises';
 import {startOwnerApp} from '../app/server.mjs';
+import {ExecutionStore} from '../app/execution-store.mjs';
 import {ensurePrivateDirectory} from '../app/private-directory.mjs';
 
 const seed = {
@@ -217,6 +219,196 @@ test('owned GitHub projects register in the dashboard without overwriting manual
   } finally {
     snapshot.close();
   }
+});
+
+test('registration saves the initial execution policy before any work and preserves it across restart', async t => {
+  const {directory, start} = await runtimeFixture(t);
+  const portfolioPath = join(directory, 'portfolio.json');
+  const oldProject = {...seed.projects[0], state:'approval', enableCodexWrite:false, retained:{value:'existing-data'}};
+  await writeFile(portfolioPath, JSON.stringify({...seed, projects:[oldProject]}), {mode:0o600});
+  let nativeStarts = 0, modelReads = 0;
+  const codex = {
+    canWrite:true, subscriptionReady:async () => true,
+    models:async () => {
+      modelReads++;
+      return {accountType:'chatgpt', data:[{id:'current', isDefault:true, defaultReasoningEffort:'low',
+        reasoningEfforts:[{reasoningEffort:'low'}]}]};
+    },
+    async submit(input) {
+      nativeStarts++;
+      assert.ok(input.onThread('registration-thread'));
+      return {turn:{id:'registration-turn', status:'inProgress'}};
+    },
+  };
+  let app = await start({codex});
+  let cookie;
+  const get = route => fetch(app.url + route, {headers:{cookie}});
+  const post = (route, body, origin = app.url) => fetch(app.url + route, {method:'POST',
+    headers:{...(cookie && {cookie}), Origin:origin, 'Content-Type':'application/json'}, body:JSON.stringify(body)});
+  const path = '/api/portfolio/projects';
+  const first = {requestId:randomUUID(), name:'API fixture', goal:'Verify routing before dispatch',
+    settings:{mode:'api-only', apiBudgetUsd:0.25, model:'current', reasoningEffort:'low'}};
+  const second = {requestId:randomUUID(), name:'Subscription fixture'};
+  assert.equal((await post(path, first)).status, 401);
+  cookie = await login(app);
+  assert.equal((await post(path, first, 'https://untrusted.invalid')).status, 403);
+  assert.equal((await post(path, {...first, cwd:'/outside', enableCodexWrite:true})).status, 400);
+  const strandedChat = {requestId:randomUUID(), name:'Unassigned history'};
+  const strandedCodex = {requestId:randomUUID(), name:'Unassigned operation'};
+  const strandedPolicy = {requestId:randomUUID(), name:'Unassigned policy'};
+  const existingStore = new ExecutionStore(join(directory,'execution-policy.json'), {authorityId:'personal-ai-hq-local'});
+  existingStore.updateSettings(('project-' + strandedPolicy.requestId).toUpperCase(), 0, {mode:'api-only', apiBudgetUsd:0.75});
+  const db = new DatabaseSync(join(directory, 'conversations.sqlite'));
+  try {
+    db.prepare('INSERT INTO conversations(project,id,title,imported_at,modified,messages) VALUES (?,?,?,?,?,?)')
+      .run(('project-' + strandedChat.requestId).toUpperCase(), 'old-chat', 'Old chat', '2026-11-27T00:00:00Z', 0, '[]');
+    db.prepare('INSERT INTO codex_operations(project,id,workspace,fingerprint,phase,createdAt,updatedAt) VALUES (?,?,?,?,?,?,?)')
+      .run('project-' + strandedCodex.requestId, 'old-operation', directory, '0'.repeat(64), 'completed',
+        '2026-11-27T00:00:00Z', '2026-11-27T00:00:00Z');
+  } finally { db.close(); }
+  assert.equal((await post(path, strandedChat)).status, 409);
+  assert.equal((await post(path, strandedCodex)).status, 409);
+  assert.equal((await post(path, strandedPolicy)).status, 409);
+  assert.equal((await post(path, {...first, name:'Unusable\u0000name'})).status, 400);
+  assert.equal((await post(path, {...first, settings:{mode:'api-only', allowedRoutes:['subscription']}})).status, 400);
+  assert.deepEqual(JSON.parse(await readFile(portfolioPath, 'utf8')).projects, [oldProject]);
+  assert.equal((await (await get('/api/session')).json()).capabilities.projectRegistration, true);
+  assert.equal((await (await get('/api/portfolio')).json()).newProjectExecutionSettings.mode, 'subscription-only');
+
+  const [apiReg, subReg] = await Promise.all([post(path, first), post(path, second)]);
+  assert.equal(apiReg.status, 201);
+  assert.equal(subReg.status, 201);
+  const api = await apiReg.json();
+  const sub = await subReg.json();
+  assert.notEqual(api.id, sub.id);
+  assert.equal(api.revision, 0);
+  assert.ok(Number.isFinite(Date.parse(api.updatedAt)));
+  assert.equal(api.settings.mode, 'api-only');
+  assert.equal(api.settings.apiBudgetUsd, 0.25);
+  assert.equal(sub.settings.mode, 'subscription-only');
+  const replay = await post(path, first);
+  assert.equal(replay.status, 200);
+  assert.deepEqual(await replay.json(), api);
+  assert.equal((await post(path, {...first, name:'Different'})).status, 409);
+
+  const auto = await post(path, {requestId:randomUUID(), name:'Automatic', settings:{mode:'auto', preference:'api-first',
+    allowedRoutes:['api','subscription'], allowFallback:true}});
+  const hybrid = await post(path, {requestId:randomUUID(), name:'Hybrid', settings:{mode:'hybrid',
+    stageRoutes:{design:'api', implementation:'subscription'}}});
+  assert.equal(auto.status, 201);
+  assert.equal(hybrid.status, 201);
+  assert.equal((await auto.json()).settings.allowFallback, true);
+  const hybridResult = await hybrid.json();
+  assert.equal(hybridResult.settings.stageRoutes.design, 'api');
+  const original = await readFile(portfolioPath, 'utf8');
+  const changed = JSON.parse(original);
+  const changedHybrid = changed.projects.find(row => row.id === hybridResult.id);
+  changedHybrid.initialExecution.settings.model = 'outside-policy-revision';
+  await writeFile(portfolioPath, JSON.stringify(changed));
+  assert.equal((await get('/api/execution/settings?project=' + hybridResult.id)).status, 409);
+  delete changedHybrid.registrationRequestId;
+  delete changedHybrid.initialExecution;
+  await writeFile(portfolioPath, JSON.stringify(changed));
+  assert.equal((await get('/api/execution/settings?project=' + hybridResult.id)).status, 409);
+  await writeFile(portfolioPath, original);
+
+  const view = await (await get('/api/portfolio')).json();
+  assert.equal(view.projects.length, 5);
+  assert.equal(view.projects.find(row => row.id === oldProject.id).state, 'approval');
+  for (const id of [api.id, sub.id]) {
+    const row = view.projects.find(project => project.id === id);
+    assert.equal(row.state, 'waiting');
+    assert.equal(row.codexScopes, 0);
+    assert.equal(row.codexWrite, false);
+    assert.equal(row.cwd, undefined);
+    assert.equal(row.initialExecution, undefined);
+    assert.equal(row.registrationRequestId, undefined);
+  }
+  assert.equal((await post('/api/codex/run?project=' + sub.id, {id:'fixture-run', prompt:'Do not start'})).status, 403);
+  assert.equal(nativeStarts, 0);
+  assert.equal(modelReads, 0);
+
+  await app.close();
+  const definition = JSON.parse(await readFile(portfolioPath, 'utf8'));
+  assert.deepEqual(definition.projects[0], oldProject);
+  for (const id of [api.id, sub.id]) {
+    const row = definition.projects.find(project => project.id === id);
+    const work = join(directory, 'workspaces', id);
+    await mkdir(work, {recursive:true, mode:0o700});
+    await writeFile(join(work, '.hq-owned-workspace'), id + '\n');
+    Object.assign(row, {cwd:work, enableCodexWrite:true, state:'unknown'});
+    if (id === api.id) Object.assign(row, {name:'Host-renamed API fixture', goal:'Host-updated goal'});
+  }
+  await writeFile(portfolioPath, JSON.stringify(definition));
+  app = await start({codex});
+  cookie = await login(app);
+  const apiSettings = '/api/execution/settings?project=' + api.id;
+  const persisted = await (await get(apiSettings)).json();
+  assert.equal(persisted.settings.mode, 'api-only');
+  assert.equal(persisted.settings.model, 'current');
+  assert.equal(persisted.settings.reasoningEffort, 'low');
+  assert.equal(persisted.updatedAt, api.updatedAt);
+  const request = {id:'fixture-run', prompt:'Controlled fixture'};
+  assert.equal((await post('/api/codex/run?project=' + api.id, request)).status, 409);
+  assert.equal((await post('/api/codex/run?project=' + api.id, {...request, route:'subscription'})).status, 409);
+  assert.equal(modelReads, 0);
+  assert.equal(nativeStarts, 0);
+  assert.equal((await post('/api/codex/run?project=' + sub.id, request)).status, 202);
+  assert.equal(nativeStarts, 1);
+  const revised = await post(apiSettings, {revision:0, settings:{apiBudgetUsd:0.15}});
+  assert.equal(revised.status, 200);
+  const revision = await revised.json();
+  assert.equal(revision.revision, 1);
+  assert.equal(revision.settings.mode, 'api-only');
+  assert.equal(revision.settings.model, 'current');
+  assert.equal((await post(apiSettings, {revision:0, settings:{mode:'subscription-only'}})).status, 409);
+  const replayAfterUpdate = await post(path, first);
+  assert.equal(replayAfterUpdate.status, 200);
+  assert.equal((await replayAfterUpdate.json()).revision, 1);
+  assert.equal((await (await get('/api/execution/settings?project=' + sub.id)).json()).settings.mode, 'subscription-only');
+});
+
+test('GitHub registration promotes only a fresh eligible candidate and preserves known projects', async t => {
+  const {directory, start} = await runtimeFixture(t);
+  const file = join(directory, 'portfolio.json');
+  const oldProject = {...seed.projects[0], state:'paused', repository:'https://github.com/fixture-owner/known'};
+  await writeFile(file, JSON.stringify({...seed, projects:[oldProject]}), {mode:0o600});
+  const owner = {login:'fixture-owner', id:41};
+  const repo = (id, name, archived = false) => ({id, name, owner, archived, fork:false, disabled:false});
+  let now = Date.parse('2026-11-27T14:00:00Z');
+  const app = await start({codex:{}, githubProjects:{owner:owner.login, now:() => now,
+    async read() { return {account:owner, repositories:[repo(11,'known'), repo(12,'discovered'), repo(13,'archived',true),repo(14,'stale')]}; }}});
+  const cookie = await login(app);
+  const post = (githubProject, requestId = randomUUID()) => fetch(app.url + '/api/portfolio/projects', {method:'POST',
+    headers:{cookie, Origin:app.url, 'Content-Type':'application/json'}, body:JSON.stringify({requestId, githubProject,
+      settings:{mode:'api-only', apiBudgetUsd:0}})});
+  assert.equal((await post('github-12')).status, 409);
+  let portfolio;
+  for (let attempt = 0; attempt < 25; attempt++) {
+    portfolio = await (await fetch(app.url + '/api/portfolio', {headers:{cookie}})).json();
+    if (portfolio.githubRegistration.status === 'ready') break;
+    await delay(15);
+  }
+  assert.equal(portfolio.githubRegistration.status, 'ready');
+  assert.equal(portfolio.projects.find(row => row.id === 'github-12').registrationAvailable, true);
+  assert.equal(portfolio.projects.find(row => row.id === 'github-13').registrationAvailable, false);
+  assert.equal((await post('github-11')).status, 409);
+  assert.equal((await post('github-13')).status, 409);
+  const requestId = randomUUID();
+  const registered = await post('github-12', requestId);
+  assert.equal(registered.status, 201);
+  assert.equal((await registered.json()).id, 'github-12');
+  assert.equal((await post('github-12')).status, 409);
+  now += 121_000;
+  assert.equal((await post('github-14')).status, 409);
+  assert.equal((await post('github-12', requestId)).status, 200);
+  const saved = JSON.parse(await readFile(file, 'utf8'));
+  assert.equal(saved.projects.length, 2);
+  assert.deepEqual(saved.projects[0], oldProject);
+  assert.equal(saved.projects[1].name, 'discovered');
+  assert.equal(saved.projects[1].repository, 'https://github.com/fixture-owner/discovered');
+  assert.equal(saved.projects[1].state, 'waiting');
+  assert.equal(saved.projects[1].enableCodexWrite, undefined);
 });
 
 test('Codex turn evidence requires an exact authenticated project and rechecks scope after native reading', async t => {

@@ -175,6 +175,11 @@ export function createChatStore(directory, {now = Date.now} = {}) {
       WHERE project=?1 AND conversation_id=?2 AND (text<>'' OR status<>'in_progress')
     ) ORDER BY sequence,part LIMIT ?3 OFFSET ?4`);
 
+  const projectHistory = db.prepare(
+    'SELECT 1 FROM conversations WHERE project=?1 COLLATE NOCASE UNION ALL ' +
+    'SELECT 1 FROM live_conversations WHERE project=?1 COLLATE NOCASE UNION ALL ' +
+    'SELECT 1 FROM live_turns WHERE project=?1 COLLATE NOCASE LIMIT 1');
+
   function inTransaction(operation) {
     db.exec('BEGIN IMMEDIATE');
     try {
@@ -352,6 +357,8 @@ export function createChatStore(directory, {now = Date.now} = {}) {
       });
       return {imported: conversations.length, skipped: rows.length - conversations.length};
     },
+    hasProjectHistory: id => Boolean(projectHistory.get(id)),
+    withWriteLock: inTransaction,
     close: () => db.close(),
   };
 }
