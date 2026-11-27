@@ -32,6 +32,79 @@ function finish(store, requestInfo, receipt, extra = {}) {
   return store.recordOutcome({ ...requestInfo, executionId: receipt.operation.executionId, outcome: 'completed', confirmedTerminal: true, effectsReconciled: true, checkpoint: checkpoint(1), ...extra });
 }
 
+const voiceRequest = (taskId = 'voice-first') => ({...request('project-a', taskId), kind: 'realtime-voice',
+  task: {route: 'api', stage: 'consultation', model: 'voice-fixture', reasoningEffort: 'none'}});
+function voiceContext() {
+  const current = context();
+  current.capabilities.api = {available: true, executorId: 'owner-realtime-voice', defaultModel: 'voice-fixture',
+    models: [{id: 'voice-fixture', reasoningEfforts: ['none']}]};
+  current.realtimeVoice = {scopeDigest: hash, config: {model: 'voice-fixture', voice: 'test-voice',
+    transcriptionModel: 'asr-test', contextTokens: 3200, maxInputSeconds: 10, maxOutputTokens: 100,
+    rates: {inputTextUsdPerMillion: 5, inputAudioUsdPerMillion: 30, cachedTextUsdPerMillion: 2,
+      cachedAudioUsdPerMillion: 3, outputTextUsdPerMillion: 10, outputAudioUsdPerMillion: 35},
+    transcription: {type: 'duration', usdPerMinute: 0.06, billingIncrementSeconds: 1}}};
+  return current;
+}
+const billedVoice = {
+  responseRequested: true,
+  response: {id: 'resp_voice_A', status: 'completed', usage: {inputTokens: 4, outputTokens: 3, totalTokens: 7,
+    input: {textTokens: 2, audioTokens: 2}, output: {textTokens: 0, audioTokens: 3}, cachedInput: {textTokens: 1, audioTokens: 0}}},
+  transcription: {itemId: 'item_voice_A', usage: {type: 'duration', seconds: 1.25}},
+};
+
+test('Realtime reserves shared credit and settles separate receipts without changing the development checkpoint', t => {
+  const {file, store} = fixture(t);
+  store.updateSettings('project-a', 0, {mode: 'api-only', apiBudgetUsd: 0.25});
+  store.updateSettings('project-b', 0, {mode: 'api-only', apiBudgetUsd: 0.25});
+  const prior = store.prepareDispatch(request(), context());
+  assert.equal(prior.dispatchable, true);
+  assert.equal(store.markDispatched('project-a', 'task-1', prior.operation.executionId, context()).dispatchable, true);
+  finish(store, request(), prior, {actualCostUsd: 0.01});
+  const voice = voiceContext();
+  assert.equal(store.previewRealtime('project-a', voiceRequest().task, voice).code, 'HANDOVER_REQUIRED');
+  voice.handoverReadback = checkpoint(1);
+  const prepared = store.prepareDispatch(voiceRequest(), voice);
+  assert.equal(prepared.operation.reservedMicros, 109500);
+  assert.equal(store.prepareDispatch(request('project-b'), context()).code, 'SHARED_CREDIT_INSUFFICIENT');
+  const {executionId} = prepared.operation;
+  assert.equal(store.markDispatched('project-a', 'voice-first', executionId, voice).dispatchable, true);
+  assert.throws(() => store.recordOutcome({...voiceRequest(), executionId, outcome: 'completed'}), /EXECUTION_KIND_MISMATCH/);
+  const settlement = {...voiceRequest(), executionId, phase: 'terminal', outcome: 'completed', receipts: billedVoice};
+  const result = store.recordRealtimeOutcome(settlement);
+  assert.equal(result.operation.costMicros, 2172);
+  assert.deepEqual([result.operation.voiceSettlement.response.accountedMicros,
+    result.operation.voiceSettlement.transcription.accountedMicros], [172, 2000]);
+  const reopened = new ExecutionStore(file, {authorityId: 'owner-main'});
+  const saved = reopened.getWork('project-a');
+  assert.equal(saved.settledApiMicros, 12172);
+  assert.equal(saved.checkpointOperation.executionId, prior.operation.executionId);
+  assert.deepEqual(saved.checkpoint, checkpoint(1));
+  assert.equal(reopened.recordRealtimeOutcome(settlement).replayed, true);
+  assert.equal(reopened.prepareDispatch(voiceRequest(), voice).dispatchable, false);
+  assert.equal(reopened.prepareDispatch(request('project-b'), context()).dispatchable, true);
+});
+
+test('Realtime preserves partial receipts and the reservation across restart', t => {
+  const {file, store} = fixture(t);
+  store.updateSettings('project-a', 0, {mode: 'api-only', apiBudgetUsd: 0.25});
+  store.updateSettings('project-b', 0, {mode: 'api-only', apiBudgetUsd: 0.25});
+  const voice = voiceContext();
+  const {operation: {executionId}} = store.prepareDispatch(voiceRequest(), voice);
+  assert.equal(store.markDispatched('project-a', 'voice-first', executionId, voice).dispatchable, true);
+  store.recordRealtimeOutcome({...voiceRequest(), executionId, phase: 'uncertain', outcome: 'failed',
+    receipts: {...billedVoice, transcription: null}});
+  const reopened = new ExecutionStore(file, {authorityId: 'owner-main'});
+  const {operation, busy, settledApiMicros, checkpoint: current} = reopened.getWork('project-a');
+  assert.equal(busy, true);
+  assert.equal(settledApiMicros, 0);
+  assert.equal(current, null);
+  assert.equal(operation.status, 'uncertain');
+  assert.equal(operation.voiceSettlement.response.accountedMicros, 172);
+  assert.equal(operation.voiceSettlement.transcription, null);
+  assert.equal(reopened.prepareDispatch(voiceRequest('voice-second'), voice).code, 'PROJECT_BUSY');
+  assert.equal(reopened.prepareDispatch(request('project-b'), context()).code, 'SHARED_CREDIT_INSUFFICIENT');
+});
+
 test('two projects keep different settings across a real new Node process', t => {
   const { file, store } = fixture(t);
   store.updateSettings('project-a', 0, { mode: 'api-only', apiBudgetUsd: 0.25 });

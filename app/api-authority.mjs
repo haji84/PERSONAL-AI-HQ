@@ -3,6 +3,7 @@ import {constants, closeSync, fstatSync, lstatSync, openSync, readFileSync} from
 import {join} from 'node:path';
 import {projectKey} from './portfolio.mjs';
 import {maximumApiJobUsd} from './api-response.mjs';
+import {normalizeRealtimeCostConfig, maximumRealtimeCostMicros} from './realtime-cost.mjs';
 
 export const apiAuthorityFile = 'api-execution-authority.json';
 const fail = code => { throw Object.assign(new Error(code), {code}); };
@@ -50,7 +51,7 @@ export function readApiAuthority(directory, now = Date.now(), {forDispatch = tru
   const value = ownerRecord(directory);
   if (!record(value) || value.version !== 1 || !identifier(value.organization) || !identifier(value.providerProject) ||
       !identifier(value.reservationAuthorityId) || !hash(value.ledgerBinding) ||
-      Object.keys(value).some(key => !['version', 'organization', 'providerProject', 'reservationAuthorityId', 'ledgerBinding', 'credit', 'models', 'defaultModel', 'projects'].includes(key))) {
+      Object.keys(value).some(key => !['version', 'organization', 'providerProject', 'reservationAuthorityId', 'ledgerBinding', 'credit', 'models', 'defaultModel', 'projects', 'realtimeVoice'].includes(key))) {
     fail('API_AUTHORITY_INVALID');
   }
   const credit = value.credit;
@@ -73,11 +74,39 @@ export function readApiAuthority(directory, now = Date.now(), {forDispatch = tru
       ['constructor', 'prototype'].includes(project) || !record(value.projects[project]) ||
       !Array.isArray(value.projects[project].files) || !value.projects[project].files.length ||
       !Array.isArray(value.projects[project].testPaths) || !value.projects[project].testPaths.length)) fail('API_PROJECT_AUTHORITY_INVALID');
+  let realtimeVoice;
+  if (Object.hasOwn(value, 'realtimeVoice')) {
+    if (!record(value.realtimeVoice)) fail('REALTIME_VOICE_AUTHORITY_INVALID');
+    const {projects: enrolled, ...rawConfig} = value.realtimeVoice;
+    const config = normalizeRealtimeCostConfig(rawConfig);
+    const ceiling = config && maximumRealtimeCostMicros(config);
+    if (!config || !Number.isSafeInteger(ceiling) || ceiling <= 0 || ceiling > 1_000_000_000_000 ||
+        !Array.isArray(enrolled) || !enrolled.length || enrolled.length > 100 || new Set(enrolled).size !== enrolled.length ||
+        enrolled.some(project => typeof project !== 'string' || !projectKey.test(project) ||
+          ['constructor', 'prototype'].includes(project))) fail('REALTIME_VOICE_AUTHORITY_INVALID');
+    realtimeVoice = {projects: enrolled, config};
+  }
   const {organization, providerProject, reservationAuthorityId, ledgerBinding, defaultModel, models, projects} = value;
   return {version: 1, organization, providerProject, reservationAuthorityId, ledgerBinding, defaultModel, credit: {
     organization: credit.organization, observedAt: credit.observedAt, safeUntil: credit.safeUntil,
     availableCreditUsd: credit.availableCreditUsd, checkoutConfirmed: true, purchasedCreditUsd: 0,
     paidBillingEnabled: false, autoRechargeEnabled: false,
   }, models: models.map(({id, contextTokens, outputTokens, inputUsdPerMillion, outputUsdPerMillion, reasoningEfforts}) =>
-    ({id, contextTokens, outputTokens, inputUsdPerMillion, outputUsdPerMillion, reasoningEfforts})), projects};
+    ({id, contextTokens, outputTokens, inputUsdPerMillion, outputUsdPerMillion, reasoningEfforts})), projects,
+    ...(realtimeVoice ? {realtimeVoice} : {})};
+}
+
+export function readBoundApiAuthority(directory, store, now, {forDispatch = true, readAuthority = readApiAuthority} = {}) {
+  const authority = readAuthority(directory, now, {forDispatch});
+  let binding;
+  try { binding = store.reservationBinding(); } catch { fail('API_AUTHORITY_UNBOUND'); }
+  if (!binding || authority.reservationAuthorityId !== store.authorityId || authority.ledgerBinding !== binding) fail('API_AUTHORITY_UNBOUND');
+  return authority;
+}
+
+export function verifiedApiCredit(authority) {
+  return {organizationId: authority.organization, creditOrganizationId: authority.credit.organization,
+    reservationAuthorityId: authority.reservationAuthorityId, ledgerBinding: authority.ledgerBinding,
+    availableCreditUsd: authority.credit.availableCreditUsd, observedAt: authority.credit.observedAt,
+    expiresAt: authority.credit.safeUntil, zeroAdditionalCostGuaranteed: true};
 }

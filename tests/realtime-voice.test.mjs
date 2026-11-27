@@ -147,12 +147,18 @@ test('response usage alone does not settle a voice turn whose transcription rece
 });
 
 test('does not start a model response if authorization is withdrawn after audio is committed', async t => {
-  const {options, wire} = await fixture(t);
+  const {options, wire} = await fixture(t, (ws, event) => {
+    if (event.type === 'input_audio_buffer.commit') send(ws, {type: 'conversation.item.input_audio_transcription.completed',
+      item_id: 'item_user1', content_index: 0, transcript: '承認取消', usage: {type: 'duration', seconds: 0.1}});
+  });
   const voice = await openRealtimeVoice({...options, authorize: stage => stage !== 'response'});
   t.after(() => voice.close());
-  await assert.rejects(voice.turn(audio), {code: 'REALTIME_VOICE_SETTLEMENT_UNKNOWN'});
+  const turn = await voice.turn(audio);
   assert.deepEqual(wire.map(event => event.type), ['session.update', 'input_audio_buffer.append', 'input_audio_buffer.commit']);
-  await assert.rejects(voice.turn(audio), {code: 'REALTIME_VOICE_NOT_READY'});
+  assert.equal(turn.responseRequested, false);
+  assert.equal(turn.status, 'cancelled');
+  assert.equal(turn.inputItemId, 'item_user1');
+  assert.equal(turn.transcriptionUsage.seconds, 0.1);
 });
 
 test('does not combine a transcript and audio belonging to different assistant items', async t => {

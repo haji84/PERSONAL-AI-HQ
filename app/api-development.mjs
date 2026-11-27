@@ -2,7 +2,7 @@ import {createHash} from 'node:crypto';
 import {constants, lstatSync, readFileSync, realpathSync, writeFileSync} from 'node:fs';
 import {mkdir, open} from 'node:fs/promises';
 import {basename, join, resolve, sep} from 'node:path';
-import {readApiAuthority} from './api-authority.mjs';
+import {readApiAuthority, readBoundApiAuthority, verifiedApiCredit} from './api-authority.mjs';
 import {apiAdviceMaxLength, apiJobRounds, createApiResponseClient, maximumApiJobUsd} from './api-response.mjs';
 import {checkedEvidenceIsCurrent, prepareApiWorkspace, readAdvisoryWorkspace, readCommittedEvidence} from './api-workspace.mjs';
 import {STAGES, moneyMicros} from './execution-policy.mjs';
@@ -31,7 +31,7 @@ function currentPhase(work, local) {
 }
 
 function latestApiActivity(store, projectId, localJob) {
-  const {operation} = store.getWork(projectId);
+  const {operation} = store.getWork(projectId, undefined, {excludeRealtime: true});
   if (operation?.route !== 'api') return null;
   const phase = currentPhase(operation, localJob(operation.executionId));
   return {id: operation.taskId, kind: 'api', phase, route: operation.route, model: operation.model, stage: operation.task?.stage,
@@ -67,15 +67,8 @@ export function createApiDevelopment({directory, store, conversations, withProje
   }
 
   function reservationAuthority(forDispatch, now = Date.now()) {
-    let authority;
-    try { authority = readAuthority(directory, now, {forDispatch}); }
+    try { return readBoundApiAuthority(directory, store, now, {forDispatch, readAuthority}); }
     catch (cause) { throw problem(409, cause.code ?? 'API_AUTHORITY_INVALID'); }
-    let actualBinding;
-    try { actualBinding = store.reservationBinding(); } catch { throw problem(409, 'API_AUTHORITY_UNBOUND'); }
-    if (!actualBinding || authority.reservationAuthorityId !== store.authorityId || authority.ledgerBinding !== actualBinding) {
-      throw problem(409, 'API_AUTHORITY_UNBOUND');
-    }
-    return authority;
   }
 
   function authorized(projectId, forDispatch = true) {
@@ -91,10 +84,7 @@ export function createApiDevelopment({directory, store, conversations, withProje
   function context(authority, model, stage) {
     return {capabilities: {api: {available: true, executorId: 'owner-mac-responses', defaultModel: authority.defaultModel,
       models: authority.models}}, safety: {authorized: true, status: 'ready', allowedRoutes: ['api'], api: {
-      organizationId: authority.organization, creditOrganizationId: authority.credit.organization,
-      reservationAuthorityId: authority.reservationAuthorityId, ledgerBinding: authority.ledgerBinding,
-      availableCreditUsd: authority.credit.availableCreditUsd, observedAt: authority.credit.observedAt,
-      expiresAt: authority.credit.safeUntil, zeroAdditionalCostGuaranteed: true,
+      ...verifiedApiCredit(authority),
       maxRequestCostUsd: maximumApiJobUsd(model, isAdvisoryStage(stage) ? 1 : apiJobRounds),
     }}};
   }
@@ -145,7 +135,7 @@ export function createApiDevelopment({directory, store, conversations, withProje
   }
 
   function view(project, work) {
-    if (!work || work.route !== 'api') return {operation: null};
+    if (!work || work.route !== 'api' || work.kind === 'realtime-voice') return {operation: null};
     const phase = currentPhase(work, jobs.get(work.executionId));
     const output = resultReport(work);
     const changes = work.status === 'completed' ? output?.changes ?? [] : [];
@@ -535,7 +525,8 @@ export function createApiDevelopment({directory, store, conversations, withProje
       } catch (cause) { return {available: false, reason: cause.code ?? 'API_AUTHORIZATION_REQUIRED', models: []}; }
     },
     portfolioActivity(project, operation) {
-      if (operation?.route !== 'api' || !project.cwd.includes(join(directory,'workspaces',project.id))) return null;
+      if (operation?.route !== 'api' || operation.kind === 'realtime-voice' ||
+          !project.cwd.includes(join(directory,'workspaces',project.id))) return null;
       const local = jobs.get(operation.executionId);
       const phase = currentPhase(operation, local);
       const receipts = operation.providerReceipts?.filter(receipt=>receipt.id !== null) ?? [];
@@ -548,7 +539,7 @@ export function createApiDevelopment({directory, store, conversations, withProje
     },
     read(project, id) {
       if (id !== undefined && !taskKey.test(id)) throw problem(400, 'API_TASK_INVALID');
-      return view(project.id, store.getWork(project.id, id).operation);
+      return view(project.id, store.getWork(project.id, id, {excludeRealtime: true}).operation);
     },
     async start(project, input) {
       if (!taskKey.test(input?.id ?? '') || typeof input.prompt !== 'string' || !input.prompt.trim() || input.prompt.length > 12000 ||
@@ -566,7 +557,7 @@ export function createApiDevelopment({directory, store, conversations, withProje
       const replay = () => {
         const duplicate = store.getWork(projectId, input.id).operation;
         if (!duplicate) return null;
-        if (duplicate.instructionDigest !== inputDigest || digest(duplicate.task) !== digest(task) ||
+        if (duplicate.kind !== undefined || duplicate.instructionDigest !== inputDigest || digest(duplicate.task) !== digest(task) ||
             ['threadId', 'operationId', 'review'].some(key => duplicate.nativeOrigin?.[key] !== nativeOrigin?.[key])) {
           throw problem(409, 'TASK_ID_CONFLICT');
         }
@@ -605,7 +596,7 @@ export function createApiDevelopment({directory, store, conversations, withProje
     interrupt(project, taskId) {
       if (typeof taskId !== 'string' || !taskKey.test(taskId)) throw problem(400, 'API_TASK_INVALID');
       const {operation} = store.getWork(project.id, taskId);
-      if (!operation || operation.route !== 'api') throw problem(404, 'API_TASK_NOT_FOUND');
+      if (!operation || operation.route !== 'api' || operation.kind === 'realtime-voice') throw problem(404, 'API_TASK_NOT_FOUND');
       const local = jobs.get(operation.executionId);
       if (local) local.controller.abort();
       if (operation.status === 'reserved') store.cancelReserved(project.id, taskId, operation.executionId);

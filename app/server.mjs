@@ -22,6 +22,7 @@ import {createChatGPTResponses} from './chatgpt-responses.mjs';
 import {ensurePrivateDirectory, readPrivateRuntimeToken} from './private-directory.mjs';
 import {recentWorkOutcomes} from './work-outcomes.mjs';
 import {createApiDevelopment} from './api-development.mjs';
+import {createRealtimeExecution, realtimeBodyLimit} from './realtime-execution.mjs';
 import {createNativeArtifacts} from './native-artifacts.mjs';
 import {createGithubProjects} from './github-projects.mjs';
 import {createCodexPeerVerifier} from './codex-peer.mjs';
@@ -73,6 +74,14 @@ const apiMessages = {
   API_ARTIFACT_NOT_FOUND: '検証済みの成果物を確認できません。',
   API_ARTIFACT_CHANGED: '成果物が検証記録と一致しません。',
   API_TASK_NOT_FOUND: '中断するAPI作業を確認できません。',
+  REALTIME_VOICE_AUTHORITY_REQUIRED: 'この案件の音声APIは本人の費用とモデルの確認が必要です。',
+  REALTIME_VOICE_AUTHORITY_INVALID: '音声APIの対象案件、モデル、費用上限を照合できません。',
+  REALTIME_VOICE_TARIFF_UNVERIFIED: '公式の音声モデル上限と料金から予約額を確認できません。',
+  REALTIME_VOICE_INVALID_AUDIO: '音声の形式または長さを確認してください。',
+  REALTIME_VOICE_TASK_INVALID: '対象の音声操作を確認してください。',
+  REALTIME_VOICE_TASK_NOT_FOUND: 'この案件の音声の受付を確認できません。',
+  REALTIME_VOICE_SIGN_IN_REQUIRED: 'サインインが必要です。',
+  REALTIME_VOICE_SETTLEMENT_UNKNOWN: '音声APIの使用量を確認中です。',
 };
 
 function send(response, status, payload, extra = {}) {
@@ -207,13 +216,18 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
   });
   const nativeArtifacts = createNativeArtifacts(directory, operations.completedArtifactSource);
   const apiEnabled = Boolean(apiDevelopment);
-  const apiWork = createApiDevelopment({...(!apiEnabled || apiDevelopment === true ? {} : apiDevelopment),
+  const apiOptions = apiEnabled && apiDevelopment !== true ? apiDevelopment : {};
+  const withProjectWorkLock = (project, act) => operations.updateExecution(project, () => {
+    if (chats.hasActiveLive(project.id)) throw error(409, 'ChatGPTの応答が終わるまで開始できません。');
+    return act();
+  });
+  const apiWork = createApiDevelopment({...apiOptions,
     directory, store: execution.store, conversations: chats, hasNativeWork: operations.hasNativeWork, hasActiveWork: operations.hasActiveWork,
     completedNativeSource: operations.completedSource, readHandoverTurn: (...args) => native.readHandoverTurn?.(...args),
-    withProjectWorkLock: (project, act) => operations.updateExecution(project, () => {
-      if (chats.hasActiveLive(project.id)) throw error(409, 'ChatGPTの応答が終わるまで開始できません。');
-      return act();
-    })});
+    withProjectWorkLock});
+  const realtime = createRealtimeExecution({directory, store: execution.store, withProjectWorkLock,
+    hasNativeWork: operations.hasNativeWork, getKey: apiOptions.getKey, readAuthority: apiOptions.readAuthority,
+    connect: apiOptions.realtimeConnect});
   const portfolioExecution = createPortfolioExecution(directory,execution.store,operations,apiWork,apiEnabled);
   if (plan === true) {
     const auth = createPlanAuth({directory});
@@ -304,6 +318,36 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
     }
   }
 
+  async function realtimeChat(project, input, response, signedIn) {
+    function emit(event) {
+      if (response.destroyed || !signedIn()) return;
+      if (response.writableLength > 1024 * 1024) throw error(409, '音声の受信が遅れています。');
+      response.write(`data: ${JSON.stringify(event)}\n\n`);
+    }
+    const stream = realtime.start(project, input, {signedIn, emit});
+    response.writeHead(200, {'Content-Type': 'text/event-stream; charset=utf-8'});
+    if (stream.replayed) {
+      emit({type: 'done', replayed: true, turn: stream.turn});
+      response.end();
+      return;
+    }
+    response.once('close', stream.disconnect);
+    if (response.destroyed) stream.disconnect();
+    try {
+      emit({type: 'started', turn: stream.turn});
+      const result = await stream.done;
+      emit({type: 'done', ...result});
+    } catch {
+      stream.disconnect();
+      if (response.writableLength <= 1024 * 1024) {
+        emit({type: 'done', turn: {...stream.turn, phase: 'unconfirmed', reason: 'REALTIME_VOICE_SETTLEMENT_UNKNOWN'}});
+      }
+    } finally {
+      response.off('close', stream.disconnect);
+      if (!response.destroyed) response.end();
+    }
+  }
+
   async function speak(input, response) {
     if (typeof input?.text !== 'string' || !input.text.trim() || input.text.length > localSpeechMaxChars || Object.keys(input).length !== 1) {
       throw error(400, '読み上げる文字を確認してください。');
@@ -375,7 +419,8 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
         await Promise.resolve(native.subscriptionReady?.()).catch(() => false) === true;
       return send(response, 200, {authenticated, capabilities: {chatImport: true, codexWrite: enabled,
         projectRegistration: authenticated, executionSettings: authenticated, executionActivity: authenticated, chatgptPlan: !remote && authenticated && Boolean(plan),
-        apiDevelopment: authenticated && apiEnabled, localSpeech: authenticated && await speechService.available(),
+        apiDevelopment: authenticated && apiEnabled, realtimeVoice: authenticated && apiEnabled,
+        localSpeech: authenticated && await speechService.available(),
         tailnetPairing: !remote && authenticated && Boolean(access), tailnetSignIn: remote}});
     }
     if (post && route === '/api/session' && !remote) {
@@ -621,6 +666,23 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       if (get) return send(response, 200, {turn: chats.readLive(project.id, target.searchParams.get('id'))});
       if (post) return liveChat(project, await jsonBody(request, 768 * 1024), response);
     }
+    if (route === '/api/chat/realtime' || route === '/api/chat/realtime/interrupt') {
+      if (!apiEnabled) throw error(409, apiMessages.API_AUTHORIZATION_REQUIRED);
+      if (target.searchParams.getAll('project').length !== 1 || target.searchParams.getAll('id').length > 1) {
+        throw error(400, '対象の音声操作を一件指定してください。');
+      }
+      if (!signedIn()) throw error(401, 'サインインが必要です。');
+      if (get && route === '/api/chat/realtime') return send(response, 200, target.searchParams.has('id')
+        ? realtime.read(project, target.searchParams.get('id')) : realtime.available(project, signedIn));
+      if (post && route === '/api/chat/realtime' && !target.searchParams.has('id')) {
+        return realtimeChat(project, await jsonBody(request, realtimeBodyLimit), response, signedIn);
+      }
+      if (post && route === '/api/chat/realtime/interrupt' && !target.searchParams.has('id')) {
+        const input = await jsonBody(request, 4096);
+        if (!signedIn()) throw error(401, 'サインインが必要です。');
+        return send(response, 202, realtime.interrupt(project, input));
+      }
+    }
     if (get && route === '/api/chat/live/image') {
       const params = target.searchParams;
       const photo = ['project', 'id', 'turn'].every(key => params.getAll(key).length === 1) &&
@@ -697,7 +759,8 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       if (response.headersSent) { response.destroy(); return; }
       const status = typeof problem?.status === 'number' ? problem.status : 500;
       send(response, status, {error: status === 500 ? '状態を読み取れませんでした。' : apiMessages[problem.code] ?? problem.message,
-        ...(['CODEX_IMAGE_MODEL_UNAVAILABLE', 'CODEX_RESUME_TARGET_UNAVAILABLE'].includes(problem.code) ? {code: problem.code} : {})});
+        ...(['CODEX_IMAGE_MODEL_UNAVAILABLE', 'CODEX_RESUME_TARGET_UNAVAILABLE'].includes(problem.code) ||
+          problem.code?.startsWith('REALTIME_VOICE_') ? {code: problem.code} : {})});
     });
   });
   const server = makeServer(false);
@@ -712,7 +775,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       for (const controller of liveRequests) controller.abort();
       speechTask?.controller.abort();
       await speechTask?.pending.catch(() => {});
-      await apiWork.close();
+      await Promise.all([apiWork.close(), realtime.close()]);
       await Promise.all(servers.map(listener => new Promise(done => listener.close(done))));
       await github?.close();
       operations.close();

@@ -25,8 +25,9 @@ export async function openRealtimeVoice({key, organization, project, model, voic
       !boundedInteger(timeoutMs, 100, 120000) || !boundedInteger(lifetimeMs, timeoutMs, 300000) ||
       typeof authorize !== 'function' || typeof connect !== 'function') throw error('REALTIME_VOICE_INVALID_CONFIGURATION');
 
+  const authorized = stage => !signal?.aborted && authorize(stage) === true;
   function admit(stage) {
-    if (signal?.aborted || authorize(stage) !== true) throw error('REALTIME_VOICE_NOT_AUTHORIZED');
+    if (!authorized(stage)) throw error('REALTIME_VOICE_NOT_AUTHORIZED');
   }
   admit('connect');
   let socket;
@@ -63,6 +64,7 @@ export async function openRealtimeVoice({key, organization, project, model, voic
     ready.reject(error(reason));
     if (active) {
       const failure = error(active.committed ? 'REALTIME_VOICE_SETTLEMENT_UNKNOWN' : reason);
+      failure.inputCommitted = active.committed;
       if (active.committed) {
         failure.receipts = {
           response: active.response?.usage ? {id: active.responseId, ...active.response} : null,
@@ -116,6 +118,7 @@ export async function openRealtimeVoice({key, organization, project, model, voic
     clearTimeout(current.timer);
     lastAudio = current.interrupted || current.playbackCompleted ? undefined : current.audio;
     current.resolve({status: current.response.status, responseId: current.responseId, usage: current.response.usage,
+      inputItemId: current.inputItemId,
       inputTranscript: current.transcription.text, transcriptionUsage: current.transcription.usage,
       outputTranscript: current.interrupted ? '' : current.outputTranscript, interrupted: current.interrupted,
       responseRequested: current.responseRequested === true});
@@ -190,12 +193,13 @@ export async function openRealtimeVoice({key, organization, project, model, voic
       case 'input_audio_buffer.committed':
         if (!active?.committed || active.inputItemId || !validId(message.item_id)) throw error('REALTIME_VOICE_SETTLEMENT_UNKNOWN');
         active.inputItemId = message.item_id;
-        if (active.interrupted) {
+        if (active.interrupted || !authorized('response')) {
+          active.interrupted = true;
+          active.heardMs = 0;
           active.response = {status: 'cancelled', usage: null};
           finishTurn();
           return;
         }
-        admit('response');
         active.responseRequested = true;
         send({type: 'response.create', response: {max_output_tokens: maxOutputTokens}});
         return;
