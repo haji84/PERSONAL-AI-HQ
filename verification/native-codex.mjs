@@ -69,11 +69,18 @@ try {
   await openApp();
   assert.equal((await call('/api/session')).capabilities.codexWrite, true);
   const id = randomUUID();
-  const instructions = 'This is a controlled Personal AI HQ integration check. In this workspace only, create proof.txt with exactly the single line HQ_NATIVE_WRITE_OK followed by a newline. Do not contact the network or delegate. Reply HQ_NATIVE_RESPONSE_OK and stop.';
+  const instructions = 'This is a controlled Personal AI HQ integration check. In this workspace only, create proof.txt with exactly the single line HQ_NATIVE_WRITE_OK followed by a newline, then wait for 12 seconds using the shell sleep command before the final response. If a separate instruction arrives during this turn, also perform that instruction in this workspace. Do not contact the network or delegate. Reply HQ_NATIVE_RESPONSE_OK and stop.';
   const data = {id, prompt: instructions};
   const [first, duplicate] = await Promise.all([call(operationPath, data), call(operationPath, data)]);
   assert.equal(first.operation.id, duplicate.operation.id);
   const running = await observe(id, ['running'], 45000);
+  const steeringId = randomUUID();
+  const newInstruction = {id: steeringId, operationId: id,
+    prompt: 'For the same integration check, also create steered.txt with exactly the single line HQ_NATIVE_STEER_OK followed by a newline. Keep proof.txt and do not access the network.'};
+  const {steering} = await call('/api/codex/steer?project=app-proof', newInstruction);
+  assert.equal(steering.phase, 'accepted');
+  assert.equal(steering.turnId, running.turnId);
+  assert.equal((await call('/api/codex/steer?project=app-proof', newInstruction)).steering.updatedAt, steering.updatedAt);
   await app.close();
   app = undefined;
   await openApp();
@@ -86,11 +93,15 @@ try {
     const reconciled = await history.findSubmission(workspace, complete.threadId, id, null);
     assert.equal(reconciled?.id, complete.turnId, 'Native history did not preserve the exact client request ID');
     assert.equal(reconciled.status, 'completed');
+    assert.equal(await history.hasTurnMessage(workspace, complete.threadId, complete.turnId, `hq:steer:${steeringId}`), true,
+      'Native item history did not preserve the steering request');
   } finally { history.close(); }
   const written = await readFile(join(workspace, 'proof.txt'));
   assert.equal(written.toString(), 'HQ_NATIVE_WRITE_OK\n');
+  assert.equal(await readFile(join(workspace, 'steered.txt'), 'utf8'), 'HQ_NATIVE_STEER_OK\n');
   console.log(JSON.stringify({stage: 'write', completed: complete.phase, duplicateSameId: true,
     gatewayRestart: true, continuedThroughRestart: true, nativeHistoryClientIdMatched: true,
+    sameTurnSteerAccepted: true, duplicateSteerSuppressed: true, steeredArtifactVerified: true,
     verifiedOutputSha256: createHash('sha256').update(written).digest('hex')}));
 
   const stopId = randomUUID();

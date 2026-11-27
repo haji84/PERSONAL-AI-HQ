@@ -1,4 +1,5 @@
-import {lstat, readFile, realpath} from 'node:fs/promises';
+import {lstatSync, readFileSync} from 'node:fs';
+import {lstat, realpath} from 'node:fs/promises';
 import {isAbsolute, join} from 'node:path';
 import {deliveryProgress} from './progress.mjs';
 
@@ -68,18 +69,29 @@ async function normalizeArtifact(row, projects, observedAt) {
   return href ? {...info, href} : null;
 }
 
-export async function readPortfolio(directory) {
+function readDefinition(directory) {
   const file = join(directory, 'portfolio.json');
   let raw;
   try {
-    const stat = await lstat(file);
+    const stat = lstatSync(file);
     if (!stat.isFile() || stat.size > 1024 ** 2) throw new Error('Invalid portfolio file');
-    raw = JSON.parse(await readFile(file, 'utf8'));
+    raw = JSON.parse(readFileSync(file, 'utf8'));
   } catch (error) {
     if (error.code !== 'ENOENT') throw error;
     raw = {projects: [], artifacts: [], limits: ['案件の確認記録がありません。']};
   }
   if (!Array.isArray(raw.projects) || raw.projects.length > 250) throw new Error('Invalid portfolio');
+  return raw;
+}
+
+export function readCurrentProject(directory, id) {
+  const raw = readDefinition(directory);
+  const rows = raw.projects.filter(row => row?.id === id);
+  return rows.length === 1 ? normalizeProject(rows[0], date(raw.observedAt)) : null;
+}
+
+export async function readPortfolio(directory) {
+  const raw = readDefinition(directory);
   const observedAt = date(raw.observedAt);
   const projects = raw.projects.map(row => normalizeProject(row, observedAt));
   const byId = new Map(projects.map(row => [row.id, row]));

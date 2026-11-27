@@ -1,6 +1,8 @@
+import {randomUUID} from 'node:crypto';
 import {chmodSync, lstatSync} from 'node:fs';
 import {join} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
+import {chatInputLimit, chatMessageLimit, chatModelPattern, chatOutputLimit} from './chatgpt-responses.mjs';
 
 const date = value => Number.isFinite(value) && value >= 0 && value < 253402300800 ? new Date(value * 1000).toISOString() : null;
 const title = value => typeof value === 'string' && value.trim() ? value.trim().slice(0, 240) : '無題の会話';
@@ -30,7 +32,24 @@ function officialConversation(value) {
   return messages.length ? {id, title: title(value.title), modified, messages: messages.reverse()} : null;
 }
 
-export function createChatStore(directory) {
+const liveIdPattern = /^live\/[a-f0-9-]{36}$/;
+const liveLease = 10 * 60 * 1000;
+const liveStatuses = new Set(['completed', 'failed', 'incomplete', 'aborted', 'interrupted']);
+const storeError = (status, code, message) => Object.assign(new Error(message), {status, code});
+
+function boundedHistory(messages, budget = chatInputLimit) {
+  const result = [];
+  for (let at = messages.length - 1; at >= 0 && result.length < chatMessageLimit - 1 && budget > 0; at--) {
+    const message = messages[at];
+    const text = message.text.slice(0, Math.min(budget, 6000));
+    if (!text.trim()) continue;
+    result.push({...message, text});
+    budget -= text.length;
+  }
+  return result.reverse();
+}
+
+export function createChatStore(directory, {now = Date.now} = {}) {
   const file = join(directory, 'conversations.sqlite');
   try {
     if (!lstatSync(file).isFile()) throw new Error('Invalid conversation store');
@@ -38,43 +57,187 @@ export function createChatStore(directory) {
   const db = new DatabaseSync(file);
   chmodSync(file, 0o600);
   db.exec(`PRAGMA busy_timeout = 3000;
+    PRAGMA foreign_keys = ON;
     CREATE TABLE IF NOT EXISTS conversations (
       project TEXT NOT NULL, id TEXT NOT NULL, title TEXT NOT NULL,
       imported_at TEXT NOT NULL, modified REAL NOT NULL, messages TEXT NOT NULL,
       PRIMARY KEY(project,id)
-    )`);
+    );
+    CREATE TABLE IF NOT EXISTS live_conversations (
+      project TEXT NOT NULL, id TEXT NOT NULL, title TEXT NOT NULL,
+      updated_at TEXT NOT NULL, source_id TEXT, history TEXT NOT NULL,
+      PRIMARY KEY(project,id)
+    );
+    CREATE TABLE IF NOT EXISTS live_turns (
+      project TEXT NOT NULL, id TEXT NOT NULL, conversation_id TEXT NOT NULL,
+      requested_conversation_id TEXT, model TEXT NOT NULL, prompt TEXT NOT NULL, text TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('in_progress','completed','failed','incomplete','aborted','interrupted')),
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL, lease_until INTEGER NOT NULL,
+      PRIMARY KEY(project,id),
+      FOREIGN KEY(project,conversation_id) REFERENCES live_conversations(project,id)
+    );
+    CREATE INDEX IF NOT EXISTS live_timeline ON live_turns(project,conversation_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS live_in_progress ON live_turns(project,conversation_id) WHERE status='in_progress'`);
   const add = db.prepare(`INSERT INTO conversations (project,id,title,imported_at,modified,messages)
     VALUES (?,?,?,?,?,?) ON CONFLICT(project,id) DO UPDATE SET title=excluded.title,
       imported_at=excluded.imported_at, modified=excluded.modified, messages=excluded.messages
     WHERE excluded.modified > conversations.modified`);
-  const list = db.prepare(`SELECT id,title,imported_at AS importedAt FROM conversations
-    WHERE project=? AND (?='' OR instr(lower(title),lower(?))>0 OR instr(lower(messages),lower(?))>0)
-    ORDER BY imported_at DESC, id LIMIT 250`);
+  const list = db.prepare(`SELECT id,title,importedAt,source FROM (
+    SELECT id,title,imported_at AS importedAt,'chatgpt-export' AS source FROM conversations
+      WHERE project=?1 AND (?2='' OR instr(lower(title),lower(?2))>0 OR instr(lower(messages),lower(?2))>0)
+    UNION ALL
+    SELECT c.id,c.title,c.updated_at,'chatgpt-live' FROM live_conversations c
+      WHERE c.project=?1 AND (?2='' OR instr(lower(c.title),lower(?2))>0 OR instr(lower(c.history),lower(?2))>0 OR
+        EXISTS(SELECT 1 FROM live_turns t WHERE t.project=c.project AND t.conversation_id=c.id AND
+          (instr(lower(t.prompt),lower(?2))>0 OR instr(lower(t.text),lower(?2))>0)))
+    ) ORDER BY importedAt DESC,id LIMIT 250`);
   const get = db.prepare(`SELECT id,title,imported_at AS importedAt,messages FROM conversations WHERE project=? AND id=?`);
+  const getLive = db.prepare(`SELECT id,title,updated_at AS importedAt,source_id AS sourceConversationId,history
+    FROM live_conversations WHERE project=? AND id=?`);
+  const insertLive = db.prepare(`INSERT INTO live_conversations(project,id,title,updated_at,source_id,history) VALUES(?,?,?,?,?,?)`);
+  const touchLive = db.prepare(`UPDATE live_conversations SET updated_at=? WHERE project=? AND id=?`);
+  const getTurn = db.prepare(`SELECT id,conversation_id AS conversationId,requested_conversation_id AS requestedConversationId,
+    model,prompt,text,status,created_at AS createdAt,updated_at AS updatedAt FROM live_turns WHERE project=? AND id=?`);
+  const addTurn = db.prepare(`INSERT INTO live_turns(project,id,conversation_id,requested_conversation_id,model,prompt,text,status,created_at,updated_at,lease_until)
+    VALUES(?,?,?,?,?,?,'','in_progress',?,?,?)`);
+  const activeTurn = db.prepare(`SELECT 1 FROM live_turns WHERE project=? AND conversation_id=? AND status='in_progress'`);
+  const activeProject = db.prepare(`SELECT 1 FROM live_turns WHERE project=? AND status='in_progress' AND lease_until>? LIMIT 1`);
+  const hasStaleTurns = db.prepare(`SELECT 1 FROM live_turns WHERE project=? AND status='in_progress' AND lease_until<=? LIMIT 1`);
+  const staleTurns = db.prepare(`UPDATE live_turns SET status='interrupted',updated_at=?
+    WHERE project=? AND status='in_progress' AND lease_until<=?`);
+  const saveTurn = db.prepare(`UPDATE live_turns SET status=?,text=?,updated_at=? WHERE project=? AND id=? AND status='in_progress'`);
+  const recentTurns = db.prepare(`SELECT prompt,text FROM live_turns WHERE project=? AND conversation_id=? AND status='completed'
+    ORDER BY rowid DESC LIMIT 8`);
+  const page = db.prepare(`SELECT role,text,createdAt,status,turnId FROM (
+    SELECT rowid AS sequence,0 AS part,'user' AS role,prompt AS text,created_at AS createdAt,status,id AS turnId FROM live_turns
+      WHERE project=?1 AND conversation_id=?2
+    UNION ALL
+    SELECT rowid,1,'assistant',text,updated_at,status,id FROM live_turns
+      WHERE project=?1 AND conversation_id=?2 AND (text<>'' OR status<>'in_progress')
+    ) ORDER BY sequence,part LIMIT ?3 OFFSET ?4`);
+
+  function inTransaction(operation) {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const result = operation();
+      db.exec('COMMIT');
+      return result;
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  function turnView(row) {
+    if (!row) return null;
+    const {requestedConversationId, ...turn} = row;
+    return turn;
+  }
+
+  function expireTurnLeases(project, time) {
+    if (hasStaleTurns.get(project, time)) staleTurns.run(new Date(time).toISOString(), project, time);
+  }
+
+  function updateTurn(project, id, status, text) {
+    if (typeof text !== 'string' || text.length > chatOutputLimit) {
+      throw storeError(400, 'INVALID_CHAT_TEXT', '回答の形式が正しくありません。');
+    }
+    return inTransaction(() => {
+      const time = now();
+      expireTurnLeases(project, time);
+      const row = getTurn.get(project, id);
+      if (!row) throw storeError(404, 'CHAT_TURN_NOT_FOUND', 'チャットの応答を見つけられませんでした。');
+      if (row.status !== 'in_progress') return turnView(row);
+      if (!text.startsWith(row.text)) throw storeError(409, 'CHAT_TEXT_CONFLICT', '保存済みの応答を上書きできません。');
+      if (row.status === status && row.text === text) return turnView(row);
+      const updatedAt = new Date(time).toISOString();
+      saveTurn.run(status, text, updatedAt, project, id);
+      touchLive.run(updatedAt, project, row.conversationId);
+      return turnView(getTurn.get(project, id));
+    });
+  }
+
   return {
-    list: (project, query) => ({conversations: list.all(project, query, query, query).map(row => ({...row,
-      source: 'chatgpt-export'}))}),
+    list: (project, query = '') => ({conversations: list.all({1: project, 2: query})}),
     read(project, id, offset) {
       const row = get.get(project, id);
-      if (!row) return null;
-      const messages = JSON.parse(row.messages);
-      return {conversation: {...row, source: 'chatgpt-export', messages: messages.slice(offset, offset + 40)},
-        nextOffset: offset + 40 < messages.length ? offset + 40 : null};
+      if (row) {
+        const messages = JSON.parse(row.messages);
+        return {conversation: {...row, source: 'chatgpt-export', messages: messages.slice(offset, offset + 40)},
+          nextOffset: offset + 40 < messages.length ? offset + 40 : null};
+      }
+      const live = getLive.get(project, id);
+      if (!live) return null;
+      expireTurnLeases(project, now());
+      const {history, ...details} = live;
+      const snapshot = JSON.parse(history);
+      const messages = snapshot.slice(offset, offset + 41);
+      messages.push(...page.all({1: project, 2: id, 3: 41 - messages.length, 4: Math.max(0, offset - snapshot.length)}));
+      return {conversation: {...details, source: 'chatgpt-live', messages: messages.slice(0, 40)},
+        nextOffset: messages.length > 40 ? offset + 40 : null};
+    },
+    hasActiveLive: project => Boolean(activeProject.get(project, now())),
+    beginLive(project, {id, conversationId = null, model, prompt}, beforeReserve) {
+      if (typeof id !== 'string' || !idPattern.test(id) || typeof model !== 'string' ||
+          !chatModelPattern.test(model) || typeof prompt !== 'string' || !prompt.trim() || prompt.length > 12000 ||
+          (conversationId !== null && (typeof conversationId !== 'string' ||
+            (!idPattern.test(conversationId) && !liveIdPattern.test(conversationId))))) {
+        throw storeError(400, 'INVALID_CHAT_REQUEST', 'チャットの入力が正しくありません。');
+      }
+      return inTransaction(() => {
+        const time = now();
+        expireTurnLeases(project, time);
+        const previous = getTurn.get(project, id);
+        if (previous) {
+          if (previous.requestedConversationId !== conversationId || previous.model !== model || previous.prompt !== prompt) {
+            throw storeError(409, 'CHAT_REQUEST_CONFLICT', 'この送信IDは別の入力に使用されています。');
+          }
+          return {turn: turnView(previous), duplicate: true};
+        }
+
+        const createdAt = new Date(time).toISOString();
+        const live = conversationId && getLive.get(project, conversationId);
+        const source = !live && conversationId && get.get(project, conversationId);
+        if (conversationId && !live && !source) throw storeError(404, 'CHAT_NOT_FOUND', '会話を見つけられませんでした。');
+        if (live && activeTurn.get(project, live.id)) {
+          throw storeError(409, 'CHAT_IN_PROGRESS', 'この会話では応答の生成中です。');
+        }
+
+        const liveId = live ? live.id : `live/${randomUUID()}`;
+        const snapshot = live ? JSON.parse(live.history) : source ? boundedHistory(JSON.parse(source.messages)) : [];
+        beforeReserve?.();
+        if (!live) {
+          insertLive.run(project, liveId, source?.title ?? title(prompt), createdAt, source?.id ?? null, JSON.stringify(snapshot));
+        }
+        const recent = recentTurns.all(project, liveId).reverse().flatMap(row => [
+          {role: 'user', text: row.prompt}, {role: 'assistant', text: row.text},
+        ]);
+        const history = boundedHistory([...snapshot, ...recent], chatInputLimit - prompt.length);
+        const messages = history.map(({role, text}) => ({role, content: text}));
+        messages.push({role: 'user', content: prompt});
+        addTurn.run(project, id, liveId, conversationId, model, prompt, createdAt, createdAt, time + liveLease);
+        touchLive.run(createdAt, project, liveId);
+        return {turn: turnView(getTurn.get(project, id)), duplicate: false, messages};
+      });
+    },
+    readLive(project, id) {
+      expireTurnLeases(project, now());
+      return turnView(getTurn.get(project, id));
+    },
+    persistLiveText: (project, id, text) => updateTurn(project, id, 'in_progress', text),
+    finishLive(project, id, {status, text}) {
+      if (!liveStatuses.has(status)) throw storeError(400, 'INVALID_CHAT_STATUS', '応答の状態が正しくありません。');
+      return updateTurn(project, id, status, text);
     },
     import(project, json) {
       const rows = Array.isArray(json) ? json : json?.conversations;
       if (!Array.isArray(rows) || rows.length === 0 || rows.length > 3000) return null;
       const conversations = rows.map(officialConversation).filter(Boolean);
       if (!conversations.length) return null;
-      db.exec('BEGIN IMMEDIATE');
-      try {
-        const now = new Date().toISOString();
-        for (const row of conversations) add.run(project, row.id, row.title, now, row.modified, JSON.stringify(row.messages));
-        db.exec('COMMIT');
-      } catch (error) {
-        db.exec('ROLLBACK');
-        throw error;
-      }
+      inTransaction(() => {
+        const importedAt = new Date(now()).toISOString();
+        for (const row of conversations) add.run(project, row.id, row.title, importedAt, row.modified, JSON.stringify(row.messages));
+      });
       return {imported: conversations.length, skipped: rows.length - conversations.length};
     },
     close: () => db.close(),

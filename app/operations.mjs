@@ -6,11 +6,12 @@ import {DatabaseSync} from 'node:sqlite';
 const active = new Set(['reserved', 'sending', 'running', 'interrupting', 'unconfirmed']);
 const terminal = new Set(['completed', 'interrupted', 'failed']);
 const allowedId = /^[a-z0-9_-]{8,80}$/i;
+const steerClientId = id => `hq:steer:${id}`;
 const timestamp = () => new Date().toISOString();
 const problem = (status, message) => Object.assign(new Error(message), {status});
 const phase = value => terminal.has(value) ? value : value === 'inProgress' ? 'running' : null;
 
-export function createOperations(directory, native) {
+export function createOperations(directory, native, execution) {
   const db = new DatabaseSync(join(directory, 'conversations.sqlite'));
   db.exec(`PRAGMA busy_timeout = 3000;
     CREATE TABLE IF NOT EXISTS codex_operations (
@@ -20,9 +21,15 @@ export function createOperations(directory, native) {
       PRIMARY KEY(project,id)
     );
     CREATE UNIQUE INDEX IF NOT EXISTS one_active_operation ON codex_operations(project)
-    WHERE phase IN ('reserved','sending','running','interrupting','unconfirmed');`);
+    WHERE phase IN ('reserved','sending','running','interrupting','unconfirmed');
+    CREATE TABLE IF NOT EXISTS codex_steering (
+      project TEXT NOT NULL, id TEXT NOT NULL, operationId TEXT NOT NULL, turnId TEXT NOT NULL,
+      fingerprint TEXT NOT NULL, phase TEXT NOT NULL, updatedAt TEXT NOT NULL, PRIMARY KEY(project,id)
+    );`);
   const byId = db.prepare('SELECT * FROM codex_operations WHERE project=? AND id=?');
   const latest = db.prepare('SELECT * FROM codex_operations WHERE project=? ORDER BY createdAt DESC LIMIT 1');
+  const activeRun = db.prepare(`SELECT 1 FROM codex_operations WHERE project=?
+    AND phase IN ('reserved','sending','running','interrupting','unconfirmed') LIMIT 1`);
   const byClientId = db.prepare(`SELECT * FROM codex_operations WHERE threadId=? AND id=? AND turnId IS NULL
     AND phase IN ('sending','unconfirmed') LIMIT 1`);
   const byTurn = db.prepare('SELECT * FROM codex_operations WHERE threadId=? AND turnId=? LIMIT 1');
@@ -38,6 +45,10 @@ export function createOperations(directory, native) {
     AND (turnId IS NULL OR ? IS NULL OR turnId=?)`);
   const append = db.prepare(`UPDATE codex_operations SET output=substr(output||?,1,48000), updatedAt=?
     WHERE project=? AND id=? AND phase NOT IN ('completed','interrupted','failed')`);
+  const steeringById = db.prepare('SELECT * FROM codex_steering WHERE project=? AND id=?');
+  const reserveSteering = db.prepare(`INSERT INTO codex_steering(project,id,operationId,turnId,fingerprint,phase,updatedAt)
+    VALUES (?,?,?,?,?,'sending',?) ON CONFLICT(project,id) DO NOTHING`);
+  const resolveSteering = db.prepare(`UPDATE codex_steering SET phase=?,updatedAt=? WHERE project=? AND id=? AND phase<>'accepted'`);
   const reconciled = new Map();
   const interruptRequests = new Set();
   let closed = false;
@@ -51,6 +62,12 @@ export function createOperations(directory, native) {
     if (!row) return null;
     const {fingerprint, workspace, ...view} = row;
     return view;
+  }
+
+  function steeringResponse(row) {
+    if (!row) return {steering: null};
+    const {fingerprint, ...steering} = row;
+    return {steering};
   }
 
   const unsubscribe = native.onEvent?.((method, value) => {
@@ -117,6 +134,15 @@ export function createOperations(directory, native) {
   }
 
   return {
+    updateExecution(project, update) {
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        if (activeRun.get(project.id)) throw problem(409, 'Codexの実行または照合が終わってから設定を変更してください。');
+        const result = update();
+        db.exec('COMMIT');
+        return result;
+      } catch (error) { db.exec('ROLLBACK'); throw error; }
+    },
     async read(project, id) {
       const row = id ? byId.get(project.id, id) : latest.get(project.id);
       if (row && !project.cwd.includes(row.workspace)) return {operation: null};
@@ -143,8 +169,11 @@ export function createOperations(directory, native) {
       };
       let row = duplicate();
       if (row) return {operation: response(row)};
+      execution?.preflight(project, 'implementation');
       if (!await native.subscriptionReady?.()) throw problem(403, 'ChatGPTプランの認証を確認できないため、実行していません。');
-      await configureModel(input.model, input.effort);
+      const selection = execution ? await execution.authorize(project, {stage: 'implementation', model: input.model, effort: input.effort})
+        : {model: input.model, effort: input.effort};
+      if (!execution) await configureModel(selection.model, selection.effort);
       try { insert.run(project.id, input.id, expected, digest, timestamp(), timestamp()); }
       catch (error) {
         row = duplicate();
@@ -153,9 +182,10 @@ export function createOperations(directory, native) {
         throw error;
       }
       row = byId.get(project.id, input.id);
+      const maySubmit = () => !closed && (!execution || execution.isCurrent(project, selection.revision, 'implementation', expected));
       void native.submit({workspace: expected, prompt: input.prompt, knownId: previous?.threadId,
-        model: input.model, effort: input.effort, requestId: input.id,
-        onThread: id => !closed && setThread.run(id, timestamp(), project.id, input.id).changes === 1,
+        model: selection.model, effort: selection.effort, requestId: input.id,
+        beforeThread: maySubmit, onThread: id => maySubmit() && setThread.run(id, timestamp(), project.id, input.id).changes === 1,
       }).then(result => {
         advance(row, phase(result.turn.status) ?? 'running', result.turn.id, timestamp());
       }).catch(() => {
@@ -180,6 +210,55 @@ export function createOperations(directory, native) {
       catch { advance(current, 'unconfirmed', row.turnId); }
       finally { interruptRequests.delete(row.turnId); }
       return {operation: response(closed ? current : byId.get(project.id, id))};
+    },
+    async readSteering(project, id) {
+      if (typeof id !== 'string' || !allowedId.test(id)) throw problem(400, '追加指示の受付番号を指定してください。');
+      const steering = steeringById.get(project.id, id);
+      const run = steering && byId.get(project.id, steering.operationId);
+      if (!run || !project.cwd.includes(run.workspace)) return steeringResponse(null);
+      if (steering.phase === 'accepted' || Date.now() - Date.parse(steering.updatedAt) < 15000) return steeringResponse(steering);
+      try {
+        const exact = await native.hasTurnMessage(run.workspace, run.threadId, steering.turnId, steerClientId(id));
+        if (!closed && exact) resolveSteering.run('accepted', timestamp(), project.id, id);
+        else if (!closed) resolveSteering.run('unconfirmed', timestamp(), project.id, id);
+      } catch { return steeringResponse(steering); }
+      return steeringResponse(closed ? steering : steeringById.get(project.id, id));
+    },
+    async steer(project, input) {
+      if (typeof input?.id !== 'string' || !allowedId.test(input.id) ||
+          typeof input.operationId !== 'string' || !allowedId.test(input.operationId) ||
+          typeof input.prompt !== 'string' || !input.prompt.trim() || input.prompt.length > 16000) {
+        throw problem(400, '追加指示と対象の作業を指定してください。');
+      }
+      const workspace = await confirmedWorkspace(project);
+      const digest = createHash('sha256').update(JSON.stringify([input.operationId, input.prompt])).digest('hex');
+      const previous = () => {
+        const row = steeringById.get(project.id, input.id);
+        if (row && row.fingerprint !== digest) throw problem(409, '受付番号が別の追加指示に使われています。');
+        return row;
+      };
+      const existing = previous();
+      if (existing) return steeringResponse(existing);
+      execution?.preflight(project, 'implementation', workspace);
+      if (!await native.subscriptionReady?.()) throw problem(403, 'ChatGPTプランの認証を確認できないため、実行していません。');
+      const concurrent = previous();
+      if (concurrent) return steeringResponse(concurrent);
+      const run = byId.get(project.id, input.operationId);
+      if (!run?.threadId || !run.turnId || run.phase !== 'running' || run.workspace !== workspace) {
+        throw problem(409, '追加指示の対象のターンは実行中と確認できません。');
+      }
+      execution?.preflight(project, 'implementation', workspace);
+      if (!reserveSteering.run(project.id, input.id, run.id, run.turnId, digest, timestamp()).changes) {
+        return steeringResponse(previous());
+      }
+      let accepted = false;
+      try {
+        accepted = (await native.steer({workspace, threadId: run.threadId, turnId: run.turnId, requestId: steerClientId(input.id),
+          prompt: input.prompt, ...(execution ? {beforeSend: () => execution.preflight(project, 'implementation', workspace)} : {})})) === run.turnId;
+      } catch {}
+      if (closed) return steeringResponse(null);
+      resolveSteering.run(accepted ? 'accepted' : 'unconfirmed', timestamp(), project.id, input.id);
+      return steeringResponse(steeringById.get(project.id, input.id));
     },
     close() { closed = true; unsubscribe?.(); db.close(); },
   };

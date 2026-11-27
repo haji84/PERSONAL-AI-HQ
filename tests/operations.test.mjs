@@ -100,3 +100,29 @@ test('an interrupt held during gateway shutdown can be requested again for the s
   assert.equal((await reopened.interrupt(project, request.id)).operation.phase, 'interrupting');
   assert.equal(retries, 1);
 });
+
+test('steering is tied to the current turn and a retry never sends the instructions again', async t => {
+  const {project, workspace, open} = await fixture(t);
+  let additions = 0;
+  const operations = open({async submit(input) {
+    assert.equal(input.onThread('current-thread'), true);
+    return {turn: {id: 'current-turn', status: 'inProgress'}};
+  }, async steer(input) {
+    additions++;
+    assert.deepEqual(input, {workspace, threadId: 'current-thread', turnId: 'current-turn',
+      requestId: 'hq:steer:request-steer', prompt: 'An addition'});
+    return 'current-turn';
+  }});
+  const original = {id: 'request-run', prompt: 'A fixture'};
+  await operations.start(project, original);
+  assert.equal((await operations.read(project, original.id)).operation.phase, 'running');
+  const extra = {id: 'request-steer', operationId: original.id, prompt: 'An addition'};
+  await assert.rejects(operations.steer(project, {...extra, operationId: 'different-operation'}), {status: 409});
+  const first = await operations.steer(project, extra);
+  assert.equal(first.steering.phase, 'accepted');
+  assert.equal(first.steering.turnId, 'current-turn');
+  assert.deepEqual(await operations.steer(project, extra), first);
+  assert.deepEqual(await operations.readSteering(project, extra.id), first);
+  await assert.rejects(operations.steer(project, {...extra, prompt: 'Changed'}), {status: 409});
+  assert.equal(additions, 1);
+});

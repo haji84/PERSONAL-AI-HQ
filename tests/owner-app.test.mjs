@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import {mkdtemp, readFile, rm, writeFile} from 'node:fs/promises';
+import {mkdir, mkdtemp, readFile, realpath, rm, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import test from 'node:test';
@@ -83,4 +83,94 @@ test('an imported conversation survives restart and rejected cross-origin reques
   const detail = await fetch(`${reopened.url}/api/chat?project=example&id=conversation-1`, {headers: {cookie: reopenedCookie}});
   const {conversation} = await detail.json();
   assert.deepEqual(conversation.messages.map(message => message.text), ['選択した会話', '保存した回答']);
+});
+
+test('project execution settings block native dispatch in API-only mode and stay fixed while running', async t => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), 'hq-policy-test-')));
+  const work = join(directory, 'workspaces', 'example');
+  await mkdir(work, {recursive: true, mode: 0o700});
+  await writeFile(join(work, '.hq-owned-workspace'), 'example\n');
+  const project = {id: 'example', name: 'Fixture', cwd: work, enableCodexWrite: true};
+  const writeProject = () => writeFile(join(directory, 'portfolio.json'), JSON.stringify({projects: [project]}), {mode: 0o600});
+  await writeProject();
+  let submits = 0;
+  let steers = 0;
+  const native = {
+    canWrite: true, subscriptionReady: async () => true,
+    models: async () => ({accountType: 'chatgpt', data: [{id: 'current', isDefault: true,
+      defaultReasoningEffort: 'low', reasoningEfforts: [{reasoningEffort: 'low'}]}]}),
+    async submit(input) {
+      submits++;
+      assert.equal(input.model, 'current');
+      assert.equal(input.effort, 'low');
+      assert.equal(input.onThread('fixture-thread'), true);
+      return {turn: {id: 'fixture-turn', status: 'inProgress'}};
+    },
+    async steer() { steers++; return 'fixture-turn'; },
+  };
+  const app = await startOwnerApp({directory, port: 0, codex: native});
+  t.after(async () => { await app.close(); await rm(directory, {recursive: true, force: true}); });
+  const cookie = await login(app);
+  const call = (path, body) => fetch(app.url + path + '?project=example', {method: body ? 'POST' : 'GET',
+    headers: {cookie, ...(body ? {Origin: app.url, 'Content-Type': 'application/json'} : {})},
+    ...(body ? {body: JSON.stringify(body)} : {})});
+  const settings = '/api/execution/settings';
+  assert.equal((await (await call(settings)).json()).settings.mode, 'subscription-only');
+  const apiOnly = await call(settings, {revision: 0, settings: {mode: 'api-only'}});
+  assert.equal(apiOnly.status, 200);
+  const task = {id: 'task-policy-check', prompt: 'A fixture'};
+  assert.equal((await call('/api/codex/run', task)).status, 409);
+  assert.equal(submits, 0);
+  assert.equal((await call(settings, {revision: 1, settings: {mode: 'subscription-only'}})).status, 200);
+  assert.equal((await call('/api/codex/run', task)).status, 202);
+  assert.equal(submits, 1);
+  assert.equal((await call(settings, {revision: 2, settings: {mode: 'api-only'}})).status, 409);
+  project.state = 'paused';
+  await writeProject();
+  assert.equal((await call('/api/codex/steer', {id: 'fixture-steering', operationId: task.id, prompt: 'A change'})).status, 409);
+  assert.equal(steers, 0);
+});
+
+test('a scoped ChatGPT plan stream preserves text and never repeats the provider call on replay', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'hq-chat-route-'));
+  await writeFile(join(directory, 'portfolio.json'), JSON.stringify(seed), {mode: 0o600});
+  let runs = 0;
+  let pauseDuringCatalog = false;
+  const plan = {auth: {async status() { return {configured: true, status: 'connected'}; }}, responses: {
+    async models() {
+      if (pauseDuringCatalog) await writeFile(join(directory, 'portfolio.json'), JSON.stringify({...seed,
+        projects: [{...seed.projects[0], state: 'paused'}]}), {mode: 0o600});
+      return [{slug: 'fixture-model', displayName: 'Fixture model'}];
+    },
+    async *stream({model, messages}) {
+      runs++;
+      assert.equal(model, 'fixture-model');
+      assert.deepEqual(messages, [{role: 'user', content: '質問'}]);
+      yield '回答';
+      yield 'です。';
+    },
+  }};
+  const app = await startOwnerApp({directory, port: 0, codex: {}, plan});
+  t.after(async () => { await app.close(); await rm(directory, {recursive: true, force: true}); });
+  const cookie = await login(app);
+  const data = {id: 'turn-integration', prompt: '質問', model: 'fixture-model'};
+  const send = (origin, payload = data) => fetch(`${app.url}/api/chat/live?project=example`, {method: 'POST',
+    headers: {cookie, Origin: origin, 'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
+  assert.equal((await send('https://another.example')).status, 403);
+  const first = await send(app.url);
+  assert.match(first.headers.get('content-type'), /text\/event-stream/);
+  const events = (await first.text()).split('\n\n').filter(Boolean).map(line => JSON.parse(line.slice(6)));
+  assert.deepEqual(events.filter(event => event.type === 'delta').map(event => event.text), ['回答', 'です。']);
+  assert.equal(events.at(-1).turn.status, 'completed');
+  const id = events.at(-1).turn.conversationId;
+  const replay = await send(app.url);
+  assert.match(await replay.text(), /"status":"completed"/);
+  assert.equal(runs, 1);
+  const history = await fetch(`${app.url}/api/chat?project=example&id=${encodeURIComponent(id)}`, {headers: {cookie}});
+  const {conversation} = await history.json();
+  assert.equal(conversation.source, 'chatgpt-live');
+  assert.deepEqual(conversation.messages.map(item => item.text), ['質問', '回答です。']);
+  pauseDuringCatalog = true;
+  assert.equal((await send(app.url, {...data, id: 'turn-after-pause'})).status, 409);
+  assert.equal(runs, 1);
 });

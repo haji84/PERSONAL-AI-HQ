@@ -49,9 +49,13 @@ const ui = {
   drafts: new Map(Object.entries(savedTab.drafts ?? {})),
   searches: new Map(Object.entries(savedTab.searches ?? {})),
   runIntents: new Map(Object.entries(savedTab.runIntents ?? {})),
+  steerIntents: new Map(Object.entries(savedTab.steerIntents ?? {})),
+  chatTurns: new Map(Object.entries(savedTab.chatTurns ?? {})),
+  chatIntents: new Map(Object.entries(savedTab.chatIntents ?? {})),
 };
 const resources = new Map();
 const runStates = new Map();
+const chatStreams = new Map();
 let requestSequence = 0;
 let mounted = 0;
 let pendingScroll;
@@ -68,6 +72,9 @@ function storeTab() {
     scroll: Object.fromEntries(ui.scroll), drafts: Object.fromEntries(ui.drafts),
     searches: Object.fromEntries(ui.searches),
     runIntents: Object.fromEntries(ui.runIntents),
+    steerIntents: Object.fromEntries(ui.steerIntents),
+    chatTurns: Object.fromEntries(ui.chatTurns),
+    chatIntents: Object.fromEntries(ui.chatIntents),
   });
 }
 function node(tag, classes, text) {
@@ -319,6 +326,92 @@ function sourceSection(parent, proof) {
   }
   if (list.children.length) parent.append(node('h3', '', '確認した記録'), list);
 }
+function executionSettings(project) {
+  const details = node('details', 'scope-info');
+  const content = node('div', 'stack');
+  details.append(node('summary', '', '案件の実行経路'), content);
+  const path = apiPath('/api/execution/settings', {project});
+  const key = memoryKey('execution-settings', project);
+  function mount() {
+    fetchView(key, path, content, (initial, destination) => {
+      let current = initial;
+      const values = {'subscription-only': 'サブスク専用', 'api-only': 'API専用', auto: '自動選択', hybrid: '工程ごとに指定'};
+      const routes = {subscription: 'サブスク', api: 'API'};
+      function select(label, options) {
+        const field = node('label', 'picker');
+        const input = node('select');
+        input.setAttribute('aria-label', label);
+        for (const [value, label] of Object.entries(options)) {
+          const option = node('option', '', label);
+          option.value = value;
+          input.append(option);
+        }
+        field.append(node('span', '', label), input);
+        return {field, input};
+      }
+      const mode = select('実行モード', values);
+      const preference = select('自動選択の優先順', {'subscription-first': 'サブスク優先', 'api-first': 'API優先', balanced: '実測をもとに選択'});
+      const fallback = node('label', 'picker');
+      const consent = node('input');
+      consent.type = 'checkbox';
+      fallback.append(consent, node('span', '', '自動選択時に許可済みの別経路を使う'));
+      const budget = node('label', 'picker');
+      const amount = node('input');
+      amount.type = 'number';
+      amount.min = '0';
+      amount.step = '0.01';
+      budget.append(node('span', '', 'API作業上限（USD）'), amount);
+      const stages = node('div', 'stack');
+      const choices = Object.entries({consultation: '相談', design: '設計', implementation: '実装', test: 'テスト',
+        verification: '実機検証', review: 'レビュー', delivery: '納品'}).map(([stage, label]) => {
+        const entry = select(label, {'': '未指定', ...routes});
+        stages.append(entry.field);
+        return [stage, entry.input];
+      });
+      const status = node('p', 'small muted');
+      status.setAttribute('role', 'status');
+      function fields() {
+        preference.field.hidden = mode.input.value !== 'auto';
+        fallback.hidden = preference.field.hidden;
+        budget.hidden = mode.input.value === 'subscription-only';
+        stages.hidden = mode.input.value !== 'hybrid';
+      }
+      function apply() {
+        const s = current.settings;
+        mode.input.value = s.mode;
+        preference.input.value = s.preference;
+        consent.checked = s.allowFallback === true;
+        amount.value = s.apiBudgetUsd ?? '';
+        for (const [stage, input] of choices) input.value = s.stageRoutes?.[stage] ?? '';
+        fields();
+      }
+      mode.input.addEventListener('change', fields);
+      const save = button('案件の実行設定を保存', async () => {
+        if (!amount.validity.valid) { status.textContent = 'API作業上限を確認してください。'; return; }
+        save.disabled = true;
+        const chosen = mode.input.value;
+        const settings = {mode: chosen, preference: preference.input.value, allowFallback: chosen === 'auto' && consent.checked,
+          apiBudgetUsd: amount.value === '' ? null : Number(amount.value),
+          stageRoutes: chosen === 'hybrid' ? Object.fromEntries(choices.filter(([, input]) => input.value)
+            .map(([stage, input]) => [stage, input.value])) : {}};
+        try {
+          current = await api(path, {method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({revision: current.revision, settings})});
+          resources.set(key, {value: current});
+          apply();
+          status.textContent = 'この案件の実行設定を保存しました。';
+        } catch (error) { status.textContent = error.message; }
+        finally { save.disabled = false; }
+      }, false);
+      destination.append(mode.field, preference.field, fallback, budget, stages,
+        node('p', 'small muted', current.apiAvailable ? 'API実行経路を利用できます。' : 'API実行は認証と費用条件を確認できるまで待機します。'),
+        save, status);
+      apply();
+    }, () => ui.view === 'dashboard' && ui.project === project);
+  }
+  details.addEventListener('toggle', () => { if (details.open && !content.hasChildNodes()) mount(); });
+  return details;
+}
 function projectDetail() {
   const project = selectedProject();
   const detail = panel(project ? text(project.name) : 'プロジェクト詳細');
@@ -349,6 +442,7 @@ function projectDetail() {
   if (source) {
     detail.body.append(node('h3', '', '関連リポジトリ'), source);
   }
+  if (ui.capabilities.executionSettings === true) detail.body.append(executionSettings(project.id));
   return detail.root;
 }
 function dashboard() {
@@ -455,6 +549,12 @@ function fetchView(key, path, container, paint, isCurrent = () => true) {
 function memoryKey(...parts) {
   return JSON.stringify(parts);
 }
+function evictChats(project) {
+  for (const key of resources.keys()) {
+    const [kind, id] = JSON.parse(key);
+    if (id === project && kind.startsWith('chat-')) resources.delete(key);
+  }
+}
 function messageBubble(item) {
   const user = item.role === 'user';
   const box = node('div', 'message' + (user ? ' user' : ''));
@@ -468,6 +568,211 @@ function messagesInto(parent, items, onTop) {
   if (onTop) parent.prepend(...nodes);
   else parent.append(...nodes);
   return nodes.length;
+}
+function moveToDraft(project, kind, item, description) {
+  if (ui.project !== project || !item?.text) return;
+  const key = memoryKey(kind === 'codex' ? 'codex-draft' : 'chat-draft', project);
+  const existing = ui.drafts.get(key) ?? '';
+  const addition = existing ? `${existing}\n\n${description}\n${item.text}` : `${description}\n${item.text}`;
+  if (addition.length > (kind === 'chat' ? 12000 : 16000)) {
+    setNotice('下書きに追加できる長さを超えています。必要な部分を選んでください。', true);
+    return;
+  }
+  ui.drafts.set(key, addition);
+  storeTab();
+  location.hash = kind;
+}
+
+async function chatEvents(response, visit) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  try {
+    for (;;) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, {stream: true});
+      if (buffer.length > 1024 * 1024) throw new Error('応答が大きすぎます。');
+      let boundary;
+      while ((boundary = buffer.indexOf('\n\n')) >= 0) {
+        const frame = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        if (frame.startsWith('data: ')) visit(JSON.parse(frame.slice(6)));
+      }
+    }
+  } finally { reader.releaseLock(); }
+}
+
+function planComposer(project, onConversation) {
+  const area = panel('ChatGPTに相談');
+  const status = node('p', 'muted small', 'ChatGPTプランの状態を確認中…');
+  status.setAttribute('role', 'status');
+  const picks = node('div', 'stack');
+  const modelLabel = node('label', 'picker');
+  const model = node('select');
+  model.setAttribute('aria-label', 'ChatGPTのモデル');
+  modelLabel.append(node('span', '', 'モデル'), model);
+  const draftLabel = node('label', 'picker');
+  const draft = node('textarea', 'draft');
+  const draftKey = memoryKey('chat-draft', project);
+  draft.placeholder = '相談内容や開発したいことを書く';
+  draft.maxLength = 12000;
+  draft.value = ui.drafts.get(draftKey) ?? '';
+  draft.addEventListener('input', () => { ui.drafts.set(draftKey, draft.value); storeTab(); });
+  draftLabel.append(node('span', '', 'メッセージ'), draft);
+  const referenceLabel = node('label', 'picker');
+  const reference = node('input');
+  reference.type = 'checkbox';
+  referenceLabel.append(reference, node('span', '', '選択中の会話から最近の発言を引き継ぐ'));
+  const output = node('pre', 'run-output');
+  output.setAttribute('aria-label', 'ChatGPTの応答');
+  output.tabIndex = 0;
+  const actions = node('div', 'run-actions');
+  const send = button('ChatGPTに送る', () => sendMessage(), false);
+  const stop = button('応答を中断', () => chatStreams.get(project)?.controller?.abort());
+  const check = button('前の応答を確認', () => readPrevious());
+  const retry = button('同じ受付番号を使う', () => submitIntent());
+  const discard = button('保留中の受付を閉じる', () => {
+    ui.chatIntents.delete(project);
+    storeTab();
+    status.textContent = '画面の保留を閉じました。保存された応答は履歴に残ります。';
+    controls();
+  });
+  const signIn = button('ChatGPTでサインイン', async () => {
+    signIn.disabled = true;
+    try {
+      const result = await api('/api/chat/plan/authorize', {method: 'POST'});
+      const url = new URL(result.authorizationUrl);
+      if (url.origin !== 'https://auth.openai.com') throw new Error('公式の認証先を確認できません。');
+      location.assign(url.href);
+    } catch (error) { status.textContent = error.message; signIn.disabled = false; }
+  });
+  actions.append(send, stop, check, retry, discard);
+  picks.append(modelLabel, referenceLabel, draftLabel, actions, output);
+  area.body.append(status, signIn, picks);
+  signIn.hidden = true;
+  picks.hidden = true;
+  output.hidden = true;
+  let canSend = false;
+
+  const phaseText = {
+    in_progress: 'ChatGPTが応答中です。', completed: '応答をこの案件の履歴に保存しました。',
+    aborted: '応答を中断し、取得済みの部分を保存しました。', interrupted: '応答が途切れ、取得済みの部分を保存しました。',
+    incomplete: '応答が完了せず、取得済みの部分を保存しました。', failed: '応答を確認できませんでした。接続と利用枠を確認してください。',
+  };
+  function controls() {
+    const active = chatStreams.get(project)?.controller;
+    const pending = ui.chatIntents.get(project);
+    send.disabled = !canSend || Boolean(active) || Boolean(pending);
+    stop.hidden = !active;
+    check.hidden = !ui.chatTurns.has(project) || Boolean(active);
+    retry.hidden = !pending || Boolean(active);
+    discard.hidden = retry.hidden;
+    output.hidden = !output.textContent;
+  }
+  function showTurn(turn, selectConversation = true) {
+    if (!turn) { status.textContent = 'この受付番号の応答はまだ確認できません。'; return; }
+    status.textContent = phaseText[turn.status] ?? '応答の状態を確認できません。';
+    output.textContent = typeof turn.text === 'string' ? turn.text : '';
+    const terminal = turn.status !== 'in_progress' && Object.hasOwn(phaseText, turn.status);
+    if (terminal && ui.chatIntents.get(project)?.id === turn.id) {
+      ui.chatIntents.delete(project);
+      storeTab();
+    }
+    if (selectConversation && turn.conversationId && terminal) {
+      reference.checked = true;
+      onConversation(turn.conversationId);
+    }
+  }
+  async function readPrevious() {
+    const id = ui.chatTurns.get(project);
+    if (!id) return;
+    try { showTurn((await api(apiPath('/api/chat/live', {project, id}))).turn); }
+    catch (error) { status.textContent = error.message; }
+    controls();
+  }
+  function sendMessage() {
+    const prompt = draft.value.trim();
+    if (send.disabled || !prompt || !model.value) {
+      if (!prompt) status.textContent = '相談する内容を入力してください。';
+      return;
+    }
+    const id = crypto.randomUUID();
+    const conversationId = reference.checked ? ui.chatIds.get(project) : undefined;
+    ui.chatIntents.set(project, {id, conversationId, model: model.value, prompt});
+    ui.chatTurns.set(project, id);
+    storeTab();
+    void submitIntent();
+  }
+  async function submitIntent() {
+    const intent = ui.chatIntents.get(project);
+    if (!intent || !canSend || chatStreams.has(project)) return;
+    const controller = new AbortController();
+    const selected = ui.chatIds.get(project);
+    chatStreams.set(project, {controller});
+    output.textContent = '';
+    status.textContent = 'ChatGPTに送っています…';
+    controls();
+    try {
+      const response = await fetch(apiPath('/api/chat/live', {project}), {method: 'POST', credentials: 'same-origin',
+        headers: {'Content-Type': 'application/json'}, body: JSON.stringify(intent),
+        signal: controller.signal});
+      if (response.status === 401) endSession();
+      if (!response.ok) {
+        const message = (await response.json().catch(() => null))?.error;
+        throw new Error(text(message, httpMessages[response.status] ?? '応答を開始できませんでした。'));
+      }
+      let done = false;
+      await chatEvents(response, event => {
+        if (event.type === 'started') {
+          status.textContent = phaseText.in_progress;
+          if (ui.drafts.get(draftKey)?.trim() === intent.prompt || draft.value.trim() === intent.prompt) {
+            ui.drafts.delete(draftKey);
+            draft.value = '';
+            storeTab();
+          }
+        } else if (event.type === 'delta' && typeof event.text === 'string') {
+          output.textContent += event.text;
+          controls();
+        } else if (event.type === 'done') {
+          done = true;
+          showTurn(event.turn, ui.chatIds.get(project) === selected);
+        }
+      });
+      if (!done) status.textContent = '応答が途切れました。前の応答を確認してください。';
+    } catch (error) {
+      status.textContent = controller.signal.aborted ? '中断を要求しました。前の応答を確認できます。' : error.message;
+    } finally {
+      chatStreams.delete(project);
+      controls();
+    }
+  }
+  void (async () => {
+    try {
+      const account = await api('/api/chat/plan');
+      if (!['connected', 'refresh_required'].includes(account.status)) {
+        status.textContent = account.status === 'storage_unavailable' ? 'この端末でChatGPTプランの認証を保存できません。' :
+          'ChatGPTプランで相談するには、このアプリの利用を承認してください。';
+        signIn.hidden = account.status === 'storage_unavailable';
+        return;
+      }
+      const {models} = await api('/api/chat/plan/models');
+      for (const entry of asArray(models)) {
+        const option = node('option', '', entry.displayName);
+        option.value = entry.slug;
+        model.append(option);
+      }
+      canSend = model.options.length > 0;
+      status.textContent = canSend ? ui.chatIntents.has(project) ? '前の応答の受付を確認できます。' : 'ChatGPTプランに接続しています。' :
+        'このアカウントの利用可能なモデルを確認できません。';
+      picks.hidden = !canSend;
+      controls();
+    } catch (error) {
+      status.textContent = error.status === 403 ? 'このアプリで使うChatGPTプランを再認証してください。' : error.message;
+      if (error.status === 403) { signIn.textContent = 'ChatGPTで再認証'; signIn.hidden = false; }
+    }
+  })();
+  return area.root;
 }
 function importSection(project) {
   const box = node('div', 'import-box');
@@ -501,10 +806,7 @@ function importSection(project) {
       await api(apiPath('/api/chat/import', {project}), {
         method: 'POST', headers: {'Content-Type': 'application/json'}, body,
       });
-      for (const key of resources.keys()) {
-        const [kind, id] = JSON.parse(key);
-        if (id === project && kind.startsWith('chat-')) resources.delete(key);
-      }
+      evictChats(project);
       if (ui.view === 'chat' && ui.project === project) {
         const anchor = scrollY;
         render(false);
@@ -543,14 +845,22 @@ function chat() {
         return;
       }
       thread.header.replaceChildren(node('h2', '', text(conversation.title, '会話')));
-      const source = conversation.source === 'chatgpt-export' ? 'ChatGPTの書き出し' : text(conversation.source);
-      destination.append(node('p', 'small muted', source + ' · 取り込み ' + time(conversation.importedAt)));
+      const live = conversation.source === 'chatgpt-live';
+      const source = live ? 'ChatGPTプラン · 開始 ' : 'ChatGPTの書き出し · 取り込み ';
+      destination.append(node('p', 'small muted', source + time(conversation.importedAt)));
       const messages = node('div', 'messages messages-embedded');
       destination.append(messages);
       if (!messagesInto(messages, conversation.messages)) {
         messages.append(node('p', 'muted', '表示できる発言がありません。'));
       }
       let offset = result.nextOffset;
+      const transfer = button('表示中のAI回答をCodexの下書きに追加', () => {
+        const recent = asArray(conversation.messages).findLast(message => message.role === 'assistant');
+        moveToDraft(project, 'codex', recent, 'この案件でのChatGPTの回答');
+      });
+      function updateTransfer() {
+        transfer.hidden = !asArray(conversation.messages).some(message => message.role === 'assistant' && message.text);
+      }
       const load = button('続きの発言を表示', async () => {
         load.disabled = true;
         try {
@@ -559,6 +869,7 @@ function chat() {
           const added = asArray(page.conversation?.messages);
           messagesInto(messages, added);
           conversation.messages = [...asArray(conversation.messages), ...added];
+          updateTransfer();
           result.nextOffset = page.nextOffset;
           offset = page.nextOffset;
           load.hidden = !Number.isSafeInteger(offset);
@@ -568,6 +879,8 @@ function chat() {
       });
       load.hidden = !Number.isSafeInteger(offset);
       messages.append(load);
+      updateTransfer();
+      destination.append(transfer);
     }, () => ui.chatIds.get(project) === id);
   }
   function searchChats(query) {
@@ -588,7 +901,8 @@ function chat() {
       const rows = node('ul', 'rows');
       for (const conversation of conversations) {
         rows.append(listItem(rowButton(text(conversation.title, '無題の会話'),
-          '取り込み ' + time(conversation.importedAt), ui.chatIds.get(project) === conversation.id, event => {
+          (conversation.source === 'chatgpt-live' ? 'ChatGPTプラン · ' : '取り込み ') + time(conversation.importedAt),
+          ui.chatIds.get(project) === conversation.id, event => {
             ui.chatIds.set(project, conversation.id);
             storeTab();
             for (const row of rows.querySelectorAll('button')) row.setAttribute('aria-pressed', String(row === event.currentTarget));
@@ -606,7 +920,17 @@ function chat() {
   collection.body.remove();
   collection.root.append(searchWrap, items);
   if (ui.capabilities.chatImport === true) collection.root.append(importSection(project));
-  layout.append(collection.root, thread.root);
+  const current = node('div', 'stack');
+  current.append(thread.root);
+  if (ui.capabilities.chatgptPlan === true) current.append(planComposer(project, id => {
+    if (ui.view !== 'chat' || ui.project !== project || !layout.isConnected) return;
+    ui.chatIds.set(project, id);
+    storeTab();
+    evictChats(project);
+    showChatDetails();
+    searchChats(search.value);
+  }));
+  layout.append(collection.root, current);
   dom.content.append(layout);
   showChatDetails();
   searchChats(search.value);
@@ -636,6 +960,8 @@ function mountCodexRun(area, project, draft, draftKey, choices) {
   status.setAttribute('role', 'status');
   const details = node('p', 'muted small');
   const warning = node('p', 'run-warning small');
+  const steeringStatus = node('p', 'muted small');
+  steeringStatus.setAttribute('role', 'status');
   const output = node('pre', 'run-output');
   output.setAttribute('aria-label', 'Codexの実行中の出力');
   output.tabIndex = 0;
@@ -647,13 +973,21 @@ function mountCodexRun(area, project, draft, draftKey, choices) {
     const id = run.operation.id;
     await mutate('/api/codex/interrupt', {id});
   }, true);
+  const steer = button('実行中のターンに追加指示', () => sendSteering(), true);
+  const checkSteer = button('追加指示の状態を照合', () => requestSteering(false), true);
+  const closeSteer = button('この確認を閉じる', () => {
+    ui.steerIntents.delete(project);
+    storeTab();
+    run.steerMessage = '';
+    paint();
+  });
   const recover = button('同じ受付番号で再送', async () => {
     const intent = ui.runIntents.get(project);
     if (!run.busy && !run.checking && intent) await mutate('/api/codex/run', intent);
   }, true);
   const check = button('作業状態を確認', () => lookup(), true);
-  actions.append(send, resume, interrupt, recover, check);
-  section.append(node('h3', '', 'Codex操作'), caption, status, details, warning, actions, output);
+  actions.append(send, resume, steer, interrupt, recover, check, checkSteer, closeSteer);
+  section.append(node('h3', '', 'Codex操作'), caption, status, details, warning, steeringStatus, actions, output);
   area.body.append(section);
 
   let timer;
@@ -683,13 +1017,21 @@ function mountCodexRun(area, project, draft, draftKey, choices) {
     details.hidden = !timestamps.length;
     warning.textContent = run.message;
     warning.hidden = !run.message;
+    const pendingSteering = ui.steerIntents.get(project);
+    steeringStatus.textContent = run.steerMessage || (pendingSteering ? '追加指示の受付を照合できます。' : '');
+    steeringStatus.hidden = !steeringStatus.textContent;
     send.hidden = !hasRoom();
     resume.hidden = !hasRoom() || !run.operation?.threadId || !run.operation?.turnId;
     resume.textContent = phase === 'interrupted' ? '中断した作業を再開' : '同じスレッドへ追加指示';
     interrupt.hidden = !canInterrupt();
     interrupt.textContent = phase === 'interrupting' ? '同じターンの中断を再要求' : '中断を要求';
+    steer.hidden = !run.known || phase !== 'running' || !run.operation?.turnId || Boolean(pendingSteering);
+    checkSteer.hidden = !pendingSteering;
+    closeSteer.hidden = !pendingSteering || !run.known || !finishedPhases.has(phase);
     recover.hidden = !intention;
-    for (const action of [send, resume, interrupt, recover, check]) action.disabled = run.busy || run.checking;
+    for (const action of [send, resume, steer, interrupt, recover, check, checkSteer, closeSteer]) {
+      action.disabled = run.busy || run.checking;
+    }
     const body = text(relevantOperation?.output, '');
     if (output.textContent !== body) {
       const atEnd = output.scrollHeight - output.scrollTop - output.clientHeight < 20;
@@ -769,6 +1111,52 @@ function mountCodexRun(area, project, draft, draftKey, choices) {
       run.busy = false;
       run.onChange?.();
     }
+  }
+
+  async function requestSteering(submit) {
+    const intent = ui.steerIntents.get(project);
+    if (!intent || run.busy || run.checking || disposed) return;
+    run.busy = true;
+    run.steerMessage = '追加指示の受付を照合中…';
+    paint();
+    try {
+      const path = apiPath('/api/codex/steer', {project, id: submit ? undefined : intent.id});
+      const options = submit ? {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(intent)} : {};
+      const {steering} = await api(path, {...options, signal: AbortSignal.timeout(14000)});
+      if (steering?.id === intent.id && steering.project === project && steering.operationId === intent.operationId &&
+          steering.phase === 'accepted') {
+        ui.steerIntents.delete(project);
+        if (draft.value.trim() === intent.prompt) {
+          ui.drafts.delete(draftKey);
+          draft.value = '';
+        }
+        storeTab();
+        run.steerMessage = '実行中の同じターンで追加指示が受理されました。';
+      } else run.steerMessage = '追加指示の受理をまだ確認できません。作業状態を照合できます。';
+    } catch (error) {
+      if (submit && [400, 403, 409, 413].includes(error.status)) {
+        ui.steerIntents.delete(project);
+        storeTab();
+      }
+      run.steerMessage = error.message;
+    } finally {
+      run.busy = false;
+      run.onChange?.();
+    }
+  }
+
+  function sendSteering() {
+    if (steer.hidden || run.busy || run.checking) return;
+    const prompt = draft.value.trim();
+    if (!prompt) {
+      run.steerMessage = '追加する指示を下書きに入力してください。';
+      paint();
+      draft.focus();
+      return;
+    }
+    ui.steerIntents.set(project, {id: crypto.randomUUID(), operationId: run.operation.id, prompt});
+    storeTab();
+    void requestSteering(true);
   }
 
   function submitNew(previous) {
@@ -950,6 +1338,12 @@ function codex() {
       });
       more.hidden = typeof cursor !== 'string' || !cursor;
       messages.prepend(more);
+      if (ui.capabilities.chatgptPlan === true) {
+        const recent = asArray(value?.turns).flatMap(turn => asArray(turn.messages)).findLast(message => message.role === 'assistant');
+        if (recent?.text) destination.append(button('Codexの回答をチャットの下書きに追加', () => {
+          moveToDraft(project, 'chat', recent, 'この案件でのCodexの回答');
+        }));
+      }
     }, () => ui.threadIds.get(project) === id);
   }
   function showThreads(result, destination) {

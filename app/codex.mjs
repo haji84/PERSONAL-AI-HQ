@@ -170,11 +170,12 @@ export function createCodexClient({command = binary(), socket} = {}) {
     canWrite: Boolean(socket),
     onEvent(listener) { listeners.add(listener); return () => listeners.delete(listener); },
     async subscriptionReady() { return Boolean(socket) && await subscriptionReady(await current()); },
-    async submit({workspace, prompt, knownId, model, effort, requestId, onThread}) {
+    async submit({workspace, prompt, knownId, model, effort, requestId, beforeThread, onThread}) {
       if (!socket) throw unavailable('独立して稼働するCodex接続が必要です。');
       const rpc = await current();
       if (!await subscriptionReady(rpc)) throw unavailable('ChatGPTプランの認証を確認できません。');
       if (knownId) await scopedThread([workspace], knownId);
+      if (beforeThread && !beforeThread()) throw unavailable('送信権限を確認できませんでした。');
       const params = {cwd: workspace, modelProvider: 'openai', sandbox: 'workspace-write', approvalPolicy: 'never',
         ...(model ? {model} : {})};
       const result = knownId
@@ -196,6 +197,16 @@ export function createCodexClient({command = binary(), socket} = {}) {
     async interrupt(workspace, id, turnId) {
       const {rpc} = await scopedThread([workspace], id);
       await rpc.call('turn/interrupt', {threadId: id, turnId});
+    },
+    async steer({workspace, threadId: id, turnId, requestId, prompt, beforeSend}) {
+      const {rpc, thread} = await scopedThread([workspace], id);
+      if (thread.modelProvider !== 'openai' || !await subscriptionReady(rpc)) {
+        throw unavailable('ChatGPTプランの実行中ターンを確認できません。');
+      }
+      beforeSend?.();
+      const result = await rpc.call('turn/steer', {threadId: id, expectedTurnId: turnId, clientUserMessageId: requestId,
+        input: [{type: 'text', text: prompt, text_elements: []}]});
+      return result?.turnId;
     },
     async listThreads(scope, cursor) {
       const rpc = await current();
@@ -222,6 +233,18 @@ export function createCodexClient({command = binary(), socket} = {}) {
         if (!cursor) break;
       }
       return null;
+    },
+    async hasTurnMessage(workspace, id, turnId, clientId) {
+      const {rpc} = await scopedThread([workspace], id);
+      let cursor = null;
+      for (let page = 0; page < 4; page++) {
+        const result = await rpc.call('thread/items/list', {threadId: id, turnId, cursor, limit: 12, sortDirection: 'desc'});
+        if (items(result.data).some(entry => entry.turnId === turnId && entry.item?.type === 'userMessage' &&
+            entry.item.clientId === clientId)) return true;
+        cursor = cursorText(result.nextCursor);
+        if (!cursor) break;
+      }
+      return false;
     },
     async models() {
       const rpc = await current();

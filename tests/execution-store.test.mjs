@@ -177,8 +177,8 @@ test('checkpoint metadata cannot introduce arbitrary secret fields into the stat
   const { file, store } = fixture(t);
   store.updateSettings('project-a', 0, { mode: 'subscription-only' });
   const first = store.prepareDispatch(request(), context());
-  assert.throws(() => finish(store, request(), first, { checkpoint: { ...checkpoint(1), apiKey: 'synthetic-sensitive-value' } }), /INVALID_CHECKPOINT/);
-  assert.equal(fs.readFileSync(file, 'utf8').includes('synthetic-sensitive-value'), false);
+  assert.throws(() => finish(store, request(), first, { checkpoint: { ...checkpoint(1), apiKey: 'EXAMPLE_sensitive-value' } }), /INVALID_CHECKPOINT/);
+  assert.equal(fs.readFileSync(file, 'utf8').includes('EXAMPLE_sensitive-value'), false);
 });
 
 test('dispatch cannot change the API organization after reserving its funds', t => {

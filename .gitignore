@@ -7,7 +7,14 @@
 *.pfx
 *.sqlite
 *.sqlite3
+*.sqlite-*
 *.db
+chatgpt-plan-auth.json
+.chatgpt-plan-auth*
+portfolio.json
+execution-policy.json*
+sign-in-*.html
+.runtime-acl-backup.json
 secrets/
 private/
 userdata/
