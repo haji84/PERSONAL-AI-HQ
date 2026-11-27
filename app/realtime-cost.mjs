@@ -104,7 +104,7 @@ function validModalities(usage, total) {
     (total === undefined || usage.textTokens + usage.audioTokens === total);
 }
 
-export function maximumRealtimeCostMicros(input) {
+export function maximumRealtimeCostMicros(input, {includeTranscription = true} = {}) {
   const config = normalizeRealtimeCostConfig(input);
   if (!config) return null;
   const {contextTokens, maxOutputTokens, rates, transcription} = config;
@@ -113,6 +113,7 @@ export function maximumRealtimeCostMicros(input) {
       rates.cachedTextUsdPerMillion, rates.cachedAudioUsdPerMillion)],
     [maxOutputTokens, Math.max(rates.outputTextUsdPerMillion, rates.outputAudioUsdPerMillion)],
   ]);
+  if (!includeTranscription) return response;
   const speech = transcription.type === 'duration' ? pricedDuration(config.maxInputSeconds, transcription) : pricedTokens([
     [transcription.maxInputTokens, Math.max(transcription.inputTextUsdPerMillion, transcription.inputAudioUsdPerMillion)],
     [transcription.maxOutputTokens, transcription.outputTextUsdPerMillion],

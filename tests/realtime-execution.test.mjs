@@ -27,6 +27,9 @@ const request = {id: task, pcm, revision: 1};
 const responseId = 'resp_voice_fixture';
 const inputItem = 'item_voice_input';
 const assistantItem = 'item_voice_answer';
+const textUsage = {total_tokens: 7, input_tokens: 4, output_tokens: 3,
+  input_token_details: {text_tokens: 4, cached_tokens: 1, cached_tokens_details: {text_tokens: 1}},
+  output_token_details: {text_tokens: 3}};
 const rawUsage = {total_tokens: 7, input_tokens: 4, output_tokens: 3,
   input_token_details: {text_tokens: 2, audio_tokens: 2, cached_tokens: 1,
     cached_tokens_details: {text_tokens: 1, audio_tokens: 0}}, output_token_details: {text_tokens: 0, audio_tokens: 3}};
@@ -169,6 +172,141 @@ test('signed Realtime readiness and mutations respect project mode, revision, pa
   f.writePortfolio('paused');
   assert.equal((await (await f.call()).json()).reason, 'EXECUTION_HELD');
   assert.equal(f.connections.length, 0);
+});
+
+test('text and audio alternate in one signed Realtime archive and share only their verified usage', mac, async t => {
+  const text = '  同じ会話を文字で続ける 😺\n';
+  const answer = '前の相談と同じ条件で確認しました。';
+  const settings = new WeakMap();
+  const f = await fixture(t, (socket, event) => {
+    if (event.type === 'session.update') settings.set(socket, event.session);
+    if (event.type === 'conversation.item.create') confirmContext(socket, event);
+    if (event.type !== 'response.create') return;
+    if (settings.get(socket).output_modalities[0] === 'text') {
+      const keys = {response_id: responseId, item_id: assistantItem, output_index: 0, content_index: 0};
+      publish(socket, {type: 'response.created', response: {id: responseId}});
+      publish(socket, {type: 'response.output_text.delta', ...keys, delta: answer});
+      publish(socket, {type: 'response.output_text.done', ...keys, text: answer});
+      publish(socket, {type: 'response.done', response: {id: responseId, status: 'completed', usage: textUsage}});
+    } else {
+      transcript(socket);
+      audioResponse(socket);
+      done(socket);
+    }
+  });
+  const first = (await events(await f.call(route, {data: request}))).at(-1).turn;
+  const session = first.conversationId;
+  assert(first.continuationAvailable);
+  assert.equal((await f.call(route, {query: {input: 'text'}, auth: false})).status, 401);
+  assert.equal((await f.call(route, {query: {input: 'unknown'}})).status, 400);
+  const selection = {conversation: session, input: 'text'};
+  const ready = await (await f.call(route, {query: selection})).json();
+  assert.equal(ready.inputMode, 'text');
+  assert.equal(ready.maxInputCharacters, 12000);
+  assert.equal(ready.reservedMicros, 1030400);
+  assert.equal(ready.contextCount, 2);
+  const textRequest = {id: 'typed-turn-fixture', revision: 1, text, continuation: ready.continuation};
+  assert.equal((await f.call(route, {data: {...textRequest, pcm}})).status, 400);
+  assert.equal((await f.call(route, {data: {...textRequest, text: ' '.repeat(24)}})).status, 400);
+  assert.equal((await f.call(route, {data: {...textRequest, text: String.fromCharCode(0xd800)}})).status, 400);
+  assert.equal((await f.call(route, {data: {...textRequest, text: 'a'.repeat(12001)}})).status, 400);
+  assert.equal((await f.call(route, {data: textRequest, forProject: second})).status, 404);
+  assert.equal(f.connections.length, 1);
+  const from = f.wire.length;
+  const stream = await events(await f.call(route, {data: textRequest}));
+  assert.deepEqual(eventTypes(stream), ['started', 'transcript', 'done']);
+  const typed = stream.at(-1);
+  assert.equal(typed.inputTranscript, text);
+  assert.equal(typed.outputTranscript, answer);
+  assert.equal(typed.turn.conversationId, session);
+  assert.equal(typed.turn.transcription, null);
+  assert.equal(typed.turn.accountedMicros, 61);
+  assert.deepEqual(eventTypes(f.wire.slice(from)), ['session.update', 'conversation.item.create', 'conversation.item.create',
+    'conversation.item.create', 'response.create']);
+  const [sessionEvent, ...textWire] = f.wire.slice(from);
+  assert.deepEqual(sessionEvent.session.output_modalities, ['text']);
+  assert.deepEqual(sessionEvent.session.audio.input, {transcription: null, turn_detection: null});
+  assert.deepEqual(textWire[2].item.content, [{type: 'input_text', text}]);
+  assert.equal(textWire[2].previous_item_id, textWire[1].item.id);
+  await f.open();
+  assert.equal((await events(await f.call(route, {data: textRequest}))).at(-1).replayed, true);
+  assert.equal((await f.call(route, {data: {...textRequest, text: text.trim()}})).status, 409);
+  assert.equal(f.connections.length, 2);
+  const audioReady = await (await f.call(route, {query: {conversation: session}})).json();
+  assert.equal(audioReady.contextCount, 4);
+  assert.equal(audioReady.maxInputSeconds, 10);
+  const after = f.wire.length;
+  const last = (await events(await f.call(route, {data: {...request, id: 'after-text-voice', continuation: audioReady.continuation}}))).at(-1);
+  assert.equal(last.turn.conversationId, session);
+  assert.deepEqual(f.wire.slice(after).filter(event => event.type === 'conversation.item.create').slice(-2)
+    .map(event => event.item.content[0].text), [text, answer]);
+  assert.equal(last.turn.transcription.usage.seconds, 0.1);
+  assert.equal((await (await f.call(route, {query: {conversation: session}})).json()).contextCount, 6);
+});
+
+test('text rechecks approval after input and retains shared reservations when provider usage is unknown', mac, async t => {
+  let revoke = true;
+  const f = await fixture(t, (socket, event, {writeAuthority, authority}) => {
+    if (event.type === 'conversation.item.create') {
+      if (revoke) writeAuthority({...authority, realtimeVoice: {...authority.realtimeVoice, projects: [second]}});
+      confirmContext(socket, event);
+    }
+    if (event.type === 'response.create') {
+      publish(socket, {type: 'response.created', response: {id: responseId}});
+      socket.close();
+    }
+  });
+  const typed = {id: 'text-approval-fixture', revision: 1, text: '利用可否を確認'};
+  const interrupted = (await events(await f.call(route, {data: typed}))).at(-1).turn;
+  assert.deepEqual([interrupted.phase, interrupted.reason, interrupted.response, interrupted.transcription, interrupted.accountedMicros],
+    ['interrupted', 'REALTIME_VOICE_AUTHORITY_REQUIRED', null, null, 0]);
+  assert.deepEqual(eventTypes(f.wire), ['session.update', 'conversation.item.create']);
+  assert.equal(f.store.getWork(project).busy, false);
+  revoke = false;
+  f.writeAuthority();
+  const secondTyped = {...typed, id: 'unknown-text-usage'};
+  const uncertain = (await events(await f.call(route, {data: secondTyped}))).at(-1).turn;
+  assert.equal(uncertain.phase, 'unconfirmed');
+  assert.equal(uncertain.accountedMicros, null);
+  assert.equal(uncertain.conversationId, null);
+  await f.open();
+  const restored = (await (await f.call(route, {id: secondTyped.id})).json()).turn;
+  assert.deepEqual(restored, uncertain);
+  assert.equal(f.store.getWork(project).busy, true);
+  assert.equal((await (await f.call(route, {forProject: second, query: {input: 'text'}})).json()).reason,
+    'SHARED_CREDIT_INSUFFICIENT');
+  assert.equal((await events(await f.call(route, {data: secondTyped}))).at(-1).replayed, true);
+  assert.equal(f.connections.length, 2);
+});
+
+test('a text turn holds the organization reservation if the provider emits any matching audio', mac, async t => {
+  for (const sendsAudio of [true, false]) await t.test(sendsAudio ? 'PCM with text usage' : 'audio tokens without PCM', async t => {
+    const f = await fixture(t, (socket, event) => {
+      if (event.type === 'conversation.item.create') confirmContext(socket, event);
+      if (event.type !== 'response.create') return;
+      publish(socket, {type: 'response.created', response: {id: responseId}});
+      if (sendsAudio) publish(socket, {type: 'response.output_audio.delta', response_id: responseId, item_id: assistantItem,
+        output_index: 0, content_index: 0, delta: pcm});
+      publish(socket, {type: 'response.done', response: {id: responseId, status: 'completed', usage: sendsAudio ? textUsage : rawUsage}});
+    });
+    f.writeAuthority({...f.authority, credit: {...f.authority.credit, availableCreditUsd: 4}});
+    const data = {id: 'unexpected-audio', revision: 1, text: '文字で確認'};
+    const stream = await events(await f.call(route, {data}));
+    assert.deepEqual(eventTypes(stream), ['started', 'done']);
+    const {turn} = stream.at(-1);
+    assert.equal(turn.phase, 'unconfirmed');
+    assert.equal(turn.reason, 'REALTIME_TEXT_MODE_UNVERIFIED');
+    assert.equal(turn.accountedMicros, null);
+    assert.equal(turn.conversationId, null);
+    assert.equal(turn.transcription, null);
+    assert.equal(turn.response.usage.totalTokens, 7);
+    assert.equal(f.store.getWork(project).settledApiMicros, 0);
+    await f.open();
+    assert.equal((await (await f.call(route, {id: data.id})).json()).turn.reason, turn.reason);
+    const other = await (await f.call(route, {forProject: second, query: {input: 'text'}})).json();
+    assert.equal(other.reason, 'BUDGET_RECONCILIATION_REQUIRED');
+    assert.equal(f.connections.length, 1);
+  });
 });
 
 test('an unsupported or underpriced model profile cannot send audio or reserve an understated amount', mac, async t => {

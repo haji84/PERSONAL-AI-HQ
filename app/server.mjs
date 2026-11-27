@@ -80,6 +80,8 @@ const apiMessages = {
   REALTIME_VOICE_AUTHORITY_INVALID: '音声APIの対象案件、モデル、費用上限を照合できません。',
   REALTIME_VOICE_TARIFF_UNVERIFIED: '公式の音声モデル上限と料金から予約額を確認できません。',
   REALTIME_VOICE_INVALID_AUDIO: '音声の形式または長さを確認してください。',
+  REALTIME_VOICE_INVALID_TEXT: '入力した文字の形式または長さを確認してください。',
+  REALTIME_TEXT_MODE_UNVERIFIED: '文字応答で想定外の音声処理を検出したため、使用量を照合するまで組織のAPI実行を保留します。',
   REALTIME_VOICE_TASK_INVALID: '対象の音声操作を確認してください。',
   REALTIME_VOICE_TASK_NOT_FOUND: 'この案件の音声の受付を確認できません。',
   REALTIME_VOICE_HISTORY_NOT_FOUND: 'この案件の音声会話を確認できません。',
@@ -685,8 +687,11 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       const conversations = target.searchParams.getAll('conversation');
       const threads = target.searchParams.getAll('thread');
       const turns = target.searchParams.getAll('turn');
+      const inputModes = target.searchParams.getAll('input');
       const contexts = conversations.length + threads.length;
       if (target.searchParams.getAll('project').length !== 1 || target.searchParams.getAll('id').length > 1 || contexts > 1 || turns.length !== threads.length ||
+          (inputModes.length && (inputModes.length !== 1 || inputModes[0] !== 'text' || route !== '/api/chat/realtime' ||
+            !get || target.searchParams.has('id'))) ||
           (contexts && (route !== '/api/chat/realtime' || !get || target.searchParams.has('id')))) {
         throw error(400, '対象の音声操作を一件指定してください。');
       }
@@ -696,7 +701,8 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       }
       if (!apiEnabled) throw error(409, apiMessages.API_AUTHORIZATION_REQUIRED);
       if (get && route === '/api/chat/realtime') {
-        const ready = await realtime.available(project, signedIn, {conversation: conversations[0], thread: threads[0], turn: turns[0]});
+        const ready = await realtime.available(project, signedIn, {conversation: conversations[0], thread: threads[0], turn: turns[0],
+          inputMode: inputModes[0]});
         if (!signedIn()) throw error(401, 'サインインが必要です。');
         return send(response, 200, ready);
       }

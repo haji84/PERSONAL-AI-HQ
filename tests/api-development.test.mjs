@@ -237,6 +237,13 @@ test('the checked Codex result anchors a Realtime conversation without changing 
   const plainReceipt = await (await call('/api/execution/handover', {query:{thread:threadId}})).json();
   const body = {id:'native-result-voice-turn',revision:found.revision,pcm,nativeOrigin:found.nativeOrigin};
   const post = data => call(route, {data});
+  const typedPreview = await (await call(route, {query:{thread:threadId,turn:turnId,input:'text'}})).json();
+  assert.equal(typedPreview.inputMode, 'text');
+  assert.equal(typedPreview.nativeTurnId, turnId);
+  assert.equal(typedPreview.nativeContextCount, found.nativeContextCount);
+  assert.notEqual(typedPreview.nativeOrigin.review, found.nativeOrigin.review);
+  assert.equal((await post({...body,nativeOrigin:typedPreview.nativeOrigin})).status, 409);
+  assert.equal((await post({id:body.id,revision:body.revision,text:'文字で続ける',nativeOrigin:found.nativeOrigin})).status, 409);
   assert.equal((await post({...body,nativeOrigin:{...found.nativeOrigin,review:plainReceipt.review}})).status, 409);
   const authorityPath = join(f.directory, apiAuthorityFile);
   const authority = JSON.parse(await readFile(authorityPath));

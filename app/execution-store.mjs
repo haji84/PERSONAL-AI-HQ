@@ -61,8 +61,10 @@ function realtimeArchiveProof(project, archiveId) {
 function realtimeAdmission(project, task, context) {
   const scope = context.realtimeVoice;
   const config = normalizeRealtimeCostConfig(scope?.config);
-  const cost = config && maximumRealtimeCostMicros(config);
+  const inputMode = scope?.inputMode;
+  const cost = config && maximumRealtimeCostMicros(config, {includeTranscription: inputMode !== 'text'});
   if (!config || !Number.isSafeInteger(cost) || cost <= 0 || cost > 1_000_000_000_000 ||
+      (inputMode !== undefined && inputMode !== 'text') ||
       !hashPattern.test(scope?.scopeDigest ?? '') || task?.route !== 'api' || task.stage !== 'consultation' ||
       task.model !== config.model || task.reasoningEffort !== 'none') return denial('REALTIME_VOICE_AUTHORITY_REQUIRED');
   if (project.settings.mode === 'hybrid' && project.settings.stageRoutes.consultation !== 'api') return denial('ROUTE_NOT_ALLOWED');
@@ -73,6 +75,7 @@ function realtimeAdmission(project, task, context) {
   }
   if (!validVoiceNativeContext(scope)) return denial('HANDOVER_REQUIRED');
   return {allowed: true, realtimeVoice: {config, scopeDigest: scope.scopeDigest,
+    ...(inputMode ? {inputMode} : {}),
     ...(continuation ? {continuation, archiveLedgerReview} : {}), ...(nativeOrigin ? {nativeOrigin} : {}),
     ...(nativeAnchor ? {nativeAnchor} : {})}, context: {...context,
     safety: {...context.safety, api: {...context.safety?.api, maxRequestCostUsd: cost / 1_000_000}}}};
@@ -112,7 +115,7 @@ function realtimeUsage(usage, kind) {
   return {...totals, output: modalities(usage.output, outputTokens), cachedInput};
 }
 
-function realtimeSettlement(config, {phase, outcome, receipts, reason, transcriptDigest}) {
+function realtimeSettlement({config, inputMode}, {phase, outcome, receipts, reason, transcriptDigest}) {
   if (!realtimePhases.has(phase) || !realtimeOutcomes.has(outcome) || typeof receipts?.responseRequested !== 'boolean' ||
       (phase !== 'terminal' && outcome === 'completed') || (reason !== undefined &&
       (typeof reason !== 'string' || !/^[A-Z0-9_]{1,64}$/.test(reason))) || (transcriptDigest !== undefined &&
@@ -120,7 +123,8 @@ function realtimeSettlement(config, {phase, outcome, receipts, reason, transcrip
     error('INVALID_REALTIME_SETTLEMENT');
   }
   const {responseRequested} = receipts;
-  if (phase === 'not_committed' && (responseRequested || receipts.response || receipts.transcription) ||
+  if (inputMode === 'text' && receipts.transcription ||
+      phase === 'not_committed' && (responseRequested || receipts.response || receipts.transcription) ||
       !responseRequested && receipts.response || (!responseRequested && phase === 'terminal' && outcome !== 'interrupted')) {
     error('INVALID_REALTIME_SETTLEMENT');
   }
@@ -216,6 +220,8 @@ export class ExecutionStore {
           operation.task?.stage !== 'consultation' || !hashPattern.test(operation.realtimeVoice?.scopeDigest ?? '') ||
           operation.realtimeVoice?.config?.model !== operation.model || operation.nativeOrigin !== undefined ||
           operation.providerReceipts !== undefined || operation.checkpointVersion !== undefined)) error('STATE_INVALID');
+      if (operation.realtimeVoice?.inputMode !== undefined && (operation.realtimeVoice.inputMode !== 'text' ||
+          operation.voiceSettlement?.transcription)) error('STATE_INVALID');
       if (operation.realtimeVoice?.continuation !== undefined && (!validRealtimeContinuation(operation.realtimeVoice.continuation) ||
           !hashPattern.test(operation.realtimeVoice.archiveLedgerReview ?? ''))) error('STATE_INVALID');
       if (operation.kind === realtimeKind && !validVoiceNativeContext(operation.realtimeVoice)) error('STATE_INVALID');
@@ -416,9 +422,11 @@ export class ExecutionStore {
         !['consultation', 'design'].includes(request.task.stage))) error('INVALID_NATIVE_ORIGIN');
     const continuation = kind === realtimeKind ? context.realtimeVoice?.continuation : undefined;
     const voiceOrigin = kind === realtimeKind ? context.realtimeVoice?.nativeOrigin : undefined;
+    const inputMode = kind === realtimeKind ? context.realtimeVoice?.inputMode : undefined;
     if (continuation !== undefined && !validRealtimeContinuation(continuation)) error('INVALID_EXECUTION_KIND');
     const fingerprint = digest({ instructionDigest: request.instructionDigest, task: request.task ?? {}, nativeOrigin,
-      ...(kind ? {kind} : {}), ...(continuation ? {continuation} : {}), ...(voiceOrigin ? {voiceOrigin} : {}) });
+      ...(kind ? {kind} : {}), ...(inputMode ? {inputMode} : {}), ...(continuation ? {continuation} : {}),
+      ...(voiceOrigin ? {voiceOrigin} : {}) });
     return this.#change(data => {
       const project = this.#project(data, request.projectId, {create:true});
       const prior = project.operations[request.taskId];
@@ -568,7 +576,7 @@ export class ExecutionStore {
       const operation = project.operations[id(result.taskId)];
       if (!operation || operation.executionId !== result.executionId) error('EXECUTION_ID_MISMATCH');
       if (operation.kind !== realtimeKind) error('EXECUTION_KIND_MISMATCH');
-      const settlement = realtimeSettlement(operation.realtimeVoice.config, result);
+      const settlement = realtimeSettlement(operation.realtimeVoice, result);
       if (operation.voiceSettlement) {
         if (digest(operation.voiceSettlement) !== digest(settlement)) error('OUTCOME_CONFLICT');
         return {replayed: true, operation};
@@ -578,10 +586,12 @@ export class ExecutionStore {
       const total = (response?.accountedMicros ?? 0) + (transcription?.accountedMicros ?? 0);
       const priceUnknown = (response && response.accountedMicros === null) || (transcription && transcription.accountedMicros === null) ||
         !Number.isSafeInteger(total) || !Number.isSafeInteger(project.spentMicros + total);
-      const hold = priceUnknown ? 'REALTIME_TARIFF_UNVERIFIED' : total > operation.reservedMicros ? 'RESERVATION_EXCEEDED' : null;
+      const modeUnknown = operation.realtimeVoice.inputMode === 'text' && reason === 'REALTIME_TEXT_MODE_UNVERIFIED';
+      const hold = modeUnknown ? reason : priceUnknown ? 'REALTIME_TARIFF_UNVERIFIED' :
+        total > operation.reservedMicros ? 'RESERVATION_EXCEEDED' : null;
       if (hold) data.organizations[operation.organizationId] = {hold: true, reason: hold};
-      const confirmed = phase === 'not_committed' || (phase === 'terminal' && transcription &&
-        (!responseRequested || response) && !priceUnknown);
+      const confirmed = !modeUnknown && (phase === 'not_committed' || (phase === 'terminal' &&
+        (transcription || operation.realtimeVoice.inputMode === 'text') && (!responseRequested || response) && !priceUnknown));
       operation.voiceSettlement = settlement;
       if (reason) operation.reason = reason;
       if (confirmed) {

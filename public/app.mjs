@@ -2137,6 +2137,7 @@ const realtimeConversationId = /^realtime\/[a-f0-9-]{36}$/;
 const realtimeContinueLabel = 'この音声会話を続ける';
 const realtimeCodexLabel = 'このCodex結果を音声で相談';
 const realtimeProof = /^[a-f0-9]{64}$/;
+const realtimeTextLimit = 12000;
 let realtimeCodexIntent;
 
 function realtimeComposer(project, onConversation, openFromCodex = false) {
@@ -2162,6 +2163,31 @@ function realtimeComposer(project, onConversation, openFromCodex = false) {
     if (active() && phase === 'idle' && !checking && context) changeContext(undefined);
   });
   const contextStatus = node('p', 'small muted');
+  const inputMethod = labeledSelect('入力方法', {audio: '音声で入力', text: '文字で入力'});
+  const textDraft = node('textarea', 'draft');
+  textDraft.maxLength = realtimeTextLimit;
+  const textEntry = node('label', 'picker');
+  textEntry.append(node('span', '', '相談する内容'), textDraft);
+  textDraft.addEventListener('input', () => {
+    if (!active() || readOnly || !draftKey || phase !== 'idle') return;
+    if (textDraft.value) ui.drafts.set(draftKey, textDraft.value);
+    else ui.drafts.delete(draftKey);
+    storeTab();
+    paint();
+  });
+  inputMethod.input.addEventListener('change', () => {
+    const selected = inputMethod.input.value;
+    if (!active() || readOnly || phase !== 'idle' || checking || !['audio', 'text'].includes(selected)) {
+      inputMethod.input.value = inputMode;
+      return;
+    }
+    if (selected === inputMode) return;
+    inputMode = selected;
+    permission = undefined;
+    status.textContent = contextNeedsSelection ? '続ける会話を選んでください。' : '音声APIの利用条件を確認しています。';
+    paint();
+    void sync();
+  });
   const outputMode = node('select');
   for (const [value, label] of [['audio', '音声と文字'], ['text', '文字のみ']]) {
     const option = node('option', '', label);
@@ -2175,13 +2201,14 @@ function realtimeComposer(project, onConversation, openFromCodex = false) {
   const answer = node('pre', 'run-output');
   answer.setAttribute('aria-label', '音声応答の文字起こし');
   actions.append(record, submit, stop, discard, check, openHistory, continueHistory, newConversation, refresh);
-  area.body.append(status, contextStatus, mode, actions, inputText, answer);
+  area.body.append(status, contextStatus, inputMethod.field, textEntry, mode, actions, inputText, answer);
 
   const base = '/api/chat/realtime';
   const lifetime = new AbortController();
   const usd = new Intl.NumberFormat('ja-JP', {style: 'currency', currency: 'USD', maximumFractionDigits: 6});
   const active = () => !lifetime.signal.aborted && area.root.isConnected && ui.project === project && ui.view === 'chat';
   let permission;
+  let inputMode = 'audio';
   let phase = 'idle';
   let audio;
   let mic;
@@ -2192,6 +2219,7 @@ function realtimeComposer(project, onConversation, openFromCodex = false) {
   let archiveCanContinue = false;
   let context;
   let contextNeedsSelection = false;
+  let draftKey;
   let permissionCheck;
   let checking = false;
   let interrupting = false;
@@ -2212,6 +2240,8 @@ function realtimeComposer(project, onConversation, openFromCodex = false) {
     ...contextReasons,
     REALTIME_VOICE_AUTHORITY_REQUIRED: 'この案件の音声APIの利用条件を確認してください。',
     REALTIME_VOICE_TARIFF_UNVERIFIED: '公式モデルと料金の上限を確認できません。',
+    REALTIME_VOICE_INPUT_MODE_UNVERIFIED: '選んだ入力方法を確認できません。利用条件を確認し直してください。',
+    REALTIME_TEXT_MODE_UNVERIFIED: '文字応答で想定外の音声処理を検出しました。使用量の照合までAPI実行を保留しています。',
     API_CREDIT_UNVERIFIED: '追加費用ゼロの条件と有効な組織残高を確認できません。',
     ROUTE_NOT_ALLOWED: 'この案件の実行設定では、音声APIを利用できません。',
     PROJECT_BUSY: '進行中の作業または確認待ちの使用量があります。',
@@ -2223,17 +2253,27 @@ function realtimeComposer(project, onConversation, openFromCodex = false) {
   };
 
   function paint() {
+    const typing = inputMode === 'text';
     const preparing = ['opening', 'recording', 'finishing', 'prepared'].includes(phase);
     const receiving = ['sending', 'playing'].includes(phase);
+    const checkingConditions = checking || Boolean(permissionCheck);
+    inputMethod.field.hidden = readOnly;
+    inputMethod.input.value = inputMode;
+    inputMethod.input.disabled = phase !== 'idle' || checking;
+    textEntry.hidden = readOnly || !typing;
+    textDraft.disabled = phase !== 'idle' || contextNeedsSelection;
     record.textContent = phase === 'recording' ? '録音を止める' : '録音を開始';
-    record.hidden = !permission?.available || (!['idle', 'recording'].includes(phase));
-    record.disabled = checking || Boolean(permissionCheck);
+    record.hidden = typing || !permission?.available || (!['idle', 'recording'].includes(phase));
+    record.disabled = checkingConditions;
     discard.hidden = !preparing;
-    submit.hidden = phase !== 'prepared';
-    submit.disabled = !pcm?.byteLength || !permission?.available;
+    submit.textContent = typing ? '文字をAPIに送る' : '音声をAPIに送る';
+    submit.hidden = readOnly || (typing ? phase !== 'idle' : phase !== 'prepared');
+    submit.disabled = checkingConditions || !permission?.available ||
+      (typing ? !textDraft.value.trim() || textDraft.value.length > realtimeTextLimit : !pcm?.byteLength);
+    stop.textContent = typing ? '文字応答を中断' : '音声応答を中断';
     stop.hidden = !receiving;
     stop.disabled = interrupting;
-    mode.hidden = !permission?.available;
+    mode.hidden = typing || !permission?.available;
     outputMode.disabled = receiving;
     refresh.hidden = readOnly || phase !== 'idle' || contextNeedsSelection;
     refresh.disabled = checking || Boolean(permissionCheck);
@@ -2247,7 +2287,7 @@ function realtimeComposer(project, onConversation, openFromCodex = false) {
     newConversation.disabled = checking;
     contextStatus.hidden = !context;
     const source = context?.thread ? `選んだCodex結果「${context.title}」を使います。` : '選んだ音声会話を続けます。';
-    let contextDetail = '録音の前に利用条件を確認してください。';
+    let contextDetail = typing ? '文字を送信する前に利用条件を確認してください。' : '録音の前に利用条件を確認してください。';
     if (permission?.continuation) {
       const native = permission.nativeContextCount ? `（Codexの発言${permission.nativeContextCount}件を含む）` : '';
       contextDetail = `送信すると過去の発言${permission.contextCount}件${native}も音声APIに渡ります。`;
@@ -2270,10 +2310,24 @@ function realtimeComposer(project, onConversation, openFromCodex = false) {
 
   function allowedText() {
     if (!permission?.available) return reasons[permission?.reason] ?? apiWorkMessages[permission?.reason] ?? '音声APIを利用できません。';
-    return `${permission.model} · 最大${permission.maxInputSeconds}秒 · 1回の予約上限 ${usd.format(permission.reservedMicros / 1e6)}`;
+    const limit = inputMode === 'text' ? `最大${permission.maxInputCharacters}文字` : `最大${permission.maxInputSeconds}秒`;
+    return `${permission.model} · ${limit} · 1回の予約上限 ${usd.format(permission.reservedMicros / 1e6)}`;
+  }
+
+  function keyForDraft(selection) {
+    if (selection?.conversation) return memoryKey('realtime-draft', project, 'archive', selection.conversation);
+    if (selection?.thread) return memoryKey('realtime-draft', project, 'codex', selection.thread, selection.turn);
+    return memoryKey('realtime-draft', project, 'new');
+  }
+
+  function showDraft(key) {
+    if (key === draftKey) return;
+    draftKey = key;
+    textDraft.value = key ? ui.drafts.get(key) ?? '' : '';
   }
 
   function changeContext(next) {
+    showDraft(keyForDraft(next));
     context = next;
     contextNeedsSelection = false;
     permission = undefined;
@@ -2284,7 +2338,7 @@ function realtimeComposer(project, onConversation, openFromCodex = false) {
   function selectContext(id, next) {
     if (!active() || readOnly) return;
     if (phase !== 'idle' || checking) {
-      setNotice('現在の音声操作を終えてから、続ける会話を選んでください。', true);
+      setNotice('現在の応答や録音を終えてから、続ける会話を選んでください。', true);
       return;
     }
     if (ui.chatIds.get(project) !== id) onConversation(id);
@@ -2303,7 +2357,8 @@ function realtimeComposer(project, onConversation, openFromCodex = false) {
   }
 
   function conversationChanged(id) {
-    if (!context || id === (context.conversation ?? `codex/${context.thread}`)) return;
+    if (!context || id === (context.conversation ?? `codex/${context.thread}`)) { paint(); return; }
+    showDraft(undefined);
     contextNeedsSelection = true;
     permission = undefined;
     permissionCheck?.abort();
@@ -2324,9 +2379,10 @@ function realtimeComposer(project, onConversation, openFromCodex = false) {
     const controller = new AbortController();
     permissionCheck = controller;
     const {conversation, thread, turn} = context ?? {};
+    const mode = inputMode;
     paint();
     try {
-      const next = await api(apiPath(base, {project, conversation, thread, turn}),
+      const next = await api(apiPath(base, {project, conversation, thread, turn, input: mode === 'text' ? 'text' : undefined}),
         {signal: AbortSignal.any([controller.signal, lifetime.signal])});
       if (!active() || permissionCheck !== controller) return;
       const validContext = Number.isSafeInteger(next.contextCount) && next.contextCount >= 0;
@@ -2340,7 +2396,10 @@ function realtimeComposer(project, onConversation, openFromCodex = false) {
           (nativeCount === undefined || validNativeCount) : !next.continuation);
       const invalidReason = !thread ? 'REALTIME_VOICE_HISTORY_UNVERIFIED' :
         next.nativeTurnId === turn ? 'HANDOVER_CONVERSATION_UNVERIFIED' : 'HANDOVER_RECEIPT_STALE';
-      permission = next.available && !validReview ? {available: false, reason: invalidReason} : next;
+      const validInput = mode === 'text' ? next.inputMode === 'text' && next.maxInputCharacters === realtimeTextLimit :
+        next.inputMode === undefined || next.inputMode === 'audio';
+      permission = next.available && (!validReview || !validInput) ? {available: false,
+        reason: validInput ? invalidReason : 'REALTIME_VOICE_INPUT_MODE_UNVERIFIED'} : next;
       if (report || (context && !permission.available)) status.textContent = allowedText();
     } catch (error) {
       if (permissionCheck !== controller) return;
@@ -2355,10 +2414,12 @@ function realtimeComposer(project, onConversation, openFromCodex = false) {
   }
 
   async function start() {
-    if (!active() || phase !== 'idle' || checking || permissionCheck || !permission?.available || document.hidden) return;
+    if (!active() || inputMode !== 'audio' || phase !== 'idle' || checking || permissionCheck || !permission?.available || document.hidden) return;
     const controller = new AbortController();
     mic = controller;
     phase = 'opening';
+    inputText.setAttribute('aria-label', '入力の文字起こし');
+    answer.setAttribute('aria-label', '音声応答の文字起こし');
     status.textContent = 'マイクの利用を確認しています。';
     inputText.textContent = '';
     answer.textContent = '';
@@ -2403,14 +2464,16 @@ function realtimeComposer(project, onConversation, openFromCodex = false) {
     paint();
   }
 
-  function showTurn(turn) {
+  function showTurn(turn, wasText = turn?.inputMode === 'text') {
     archive = realtimeConversationId.test(turn?.conversationId ?? '') ? turn.conversationId : undefined;
     archiveCanContinue = Boolean(archive && turn?.continuationAvailable === true);
     const reason = reasons[turn?.reason] ?? apiWorkMessages[turn?.reason];
-    const notes = {completed: archive ? '文字起こしをこの案件の履歴に保存しました。' : '音声応答が完了しました。文字履歴の保存は確認できません。',
-      cancelled: '開始前に中止しました。', interrupted: '音声応答を中断しました。', failed: '音声応答を確認できませんでした。',
-      unconfirmed: '使用量の確認待ちです。同じ音声の再送は行いません。', running: '音声APIが応答中です。',
-      interrupting: '音声APIに中断を要求しました。'};
+    const notes = {completed: archive ? (wasText ? '文字の相談をこの案件の履歴に保存しました。' : '文字起こしをこの案件の履歴に保存しました。') :
+      (wasText ? '文字の応答が完了しました。履歴の保存は確認できません。' : '音声応答が完了しました。文字履歴の保存は確認できません。'),
+      cancelled: '開始前に中止しました。', interrupted: wasText ? '文字応答を中断しました。' : '音声応答を中断しました。',
+      failed: wasText ? '文字応答を確認できませんでした。' : '音声応答を確認できませんでした。',
+      unconfirmed: wasText ? '使用量の確認待ちです。同じ文章の再送は行いません。' : '使用量の確認待ちです。同じ音声の再送は行いません。',
+      running: wasText ? '文字の応答を作成中です。' : '音声APIが応答中です。', interrupting: '音声APIに中断を要求しました。'};
     status.textContent = (notes[turn?.phase] ?? '音声の状態を確認できません。') + (reason ? ' ' + reason : '');
     if (Number.isSafeInteger(turn?.accountedMicros)) status.textContent += ` 予算への計上 ${usd.format(turn.accountedMicros / 1e6)}`;
   }
@@ -2428,7 +2491,12 @@ function realtimeComposer(project, onConversation, openFromCodex = false) {
   }
 
   async function send() {
-    if (!active() || phase !== 'prepared' || !pcm || !permission?.available || document.hidden) return;
+    const typing = inputMode === 'text';
+    const message = typing ? textDraft.value : '';
+    const submittedDraft = draftKey;
+    if (!active() || checking || permissionCheck || !permission?.available || document.hidden ||
+        (typing ? phase !== 'idle' || !submittedDraft || !message.trim() || message.length > permission.maxInputCharacters :
+          phase !== 'prepared' || !pcm)) return;
     const selectedContext = context;
     const {continuation, nativeOrigin} = permission;
     if (selectedContext?.conversation !== continuation?.id || selectedContext?.thread !== nativeOrigin?.threadId ||
@@ -2436,15 +2504,24 @@ function realtimeComposer(project, onConversation, openFromCodex = false) {
     const controller = new AbortController();
     upload = controller;
     const playback = audio;
-    const withAudio = outputMode.value === 'audio';
+    const withAudio = !typing && outputMode.value === 'audio';
     phase = 'sending';
-    turnId = crypto.randomUUID();
-    ui.realtimeTurns.set(project, turnId);
+    const submittedTurn = crypto.randomUUID();
+    turnId = submittedTurn;
+    ui.realtimeTurns.set(project, submittedTurn);
     storeTab();
-    const payload = JSON.stringify({id: turnId, revision: permission.revision, pcm: bytesBase64(pcm),
+    const payload = JSON.stringify({id: submittedTurn, revision: permission.revision, ...(typing ? {text: message} : {pcm: bytesBase64(pcm)}),
       ...(continuation && {continuation: {id: continuation.id, review: continuation.review}}),
       ...(nativeOrigin && {nativeOrigin: {threadId: nativeOrigin.threadId, operationId: nativeOrigin.operationId, review: nativeOrigin.review}})});
     let contextRecheckRequired = false;
+    if (typing) {
+      inputText.setAttribute('aria-label', '入力した文字');
+      answer.setAttribute('aria-label', '文字の応答');
+      inputText.textContent = message;
+      answer.textContent = '';
+      archive = undefined;
+      archiveCanContinue = false;
+    }
     pcm = undefined;
     status.textContent = '音声APIの受付を確認しています。';
     paint();
@@ -2456,37 +2533,48 @@ function realtimeComposer(project, onConversation, openFromCodex = false) {
         const problem = await response.json().catch(() => null);
         const reason = problem?.code ?? problem?.error;
         contextRecheckRequired = Object.hasOwn(contextReasons, reason);
-        throw new Error(reasons[reason] ?? problem?.error ?? '音声応答を開始できませんでした。');
+        throw new Error(reasons[reason] ?? problem?.error ?? (typing ? '文字の応答を開始できませんでした。' : '音声応答を開始できませんでした。'));
       }
       let done = false;
       await chatEvents(response, event => {
+        if (typing && event.turn?.id === submittedTurn &&
+            (event.type === 'started' || (event.type === 'done' && event.replayed === true)) &&
+            ui.drafts.get(submittedDraft) === message) {
+          ui.drafts.delete(submittedDraft);
+          if (active() && draftKey === submittedDraft && textDraft.value === message) textDraft.value = '';
+          storeTab();
+        }
         if (!active() || upload !== controller) return;
-        if (event.type === 'started') status.textContent = '音声APIが応答中です。';
+        if (event.type === 'started') status.textContent = typing ? '文字の応答を作成中です。' : '音声APIが応答中です。';
         if (event.type === 'audio' && withAudio && !interrupting) playback.play(event.pcm);
         if (event.type === 'transcript' && !interrupting && typeof event.text === 'string') answer.textContent += event.text;
         if (event.type === 'done') {
           done = true;
           contextRecheckRequired = Object.hasOwn(contextReasons, event.turn?.reason);
-          if (typeof event.inputTranscript === 'string') inputText.textContent = event.inputTranscript;
+          if (!typing && typeof event.inputTranscript === 'string') inputText.textContent = event.inputTranscript;
           if (typeof event.outputTranscript === 'string') answer.textContent = event.outputTranscript;
-          showTurn(event.turn);
+          showTurn(event.turn, typing);
           if (archive && archive === selectedContext?.conversation && ui.chatIds.get(project) === archive) onConversation(archive);
           if (event.turn?.phase === 'completed' && selectedContext?.thread && selectedContext === context) {
             permission = undefined;
             contextNeedsSelection = true;
           }
-          if (event.turn?.phase !== 'completed') playback.stopPlayback();
+          if (event.turn?.phase !== 'completed') playback?.stopPlayback();
         }
         paint();
       });
       if (!active() || upload !== controller) return;
-      if (!done) throw new Error('音声の接続が途切れました。前の受付から使用量を確認できます。');
-      phase = 'playing';
-      paint();
-      if (withAudio) await playback.waitForPlayback();
+      if (!done) throw new Error(typing ? '文字応答の接続が途切れました。前の受付から使用量を確認できます。' :
+        '音声の接続が途切れました。前の受付から使用量を確認できます。');
+      if (withAudio) {
+        phase = 'playing';
+        paint();
+        await playback.waitForPlayback();
+      }
     } catch (error) {
       if (active() && upload === controller) status.textContent = controller.signal.aborted ?
-        '音声の受信を終了しました。前の受付から状態を確認できます。' : error.message;
+        (typing ? '文字応答の受信を終了しました。前の受付から状態を確認できます。' :
+          '音声の受信を終了しました。前の受付から状態を確認できます。') : error.message;
     } finally {
       controller.abort();
       if (upload === controller) {
@@ -2515,7 +2603,7 @@ function realtimeComposer(project, onConversation, openFromCodex = false) {
     try {
       const {turn} = await api(apiPath(base + '/interrupt', {project}), {method: 'POST', signal: lifetime.signal,
         headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id: turnId, heardMs})});
-      if (active() && upload === controller) showTurn(turn);
+      if (active() && upload === controller) showTurn(turn, inputMode === 'text');
     } catch {
       controller?.abort();
     }
@@ -2546,6 +2634,7 @@ function realtimeComposer(project, onConversation, openFromCodex = false) {
   document.addEventListener('visibilitychange', visibility);
   window.addEventListener('pagehide', leaveAudio);
   runViewCleanups.add(cleanup);
+  if (!readOnly) showDraft(keyForDraft());
   paint();
   if (!openFromCodex) void sync();
   return {root: area.root, continueConversation, consultCodex, conversationChanged};

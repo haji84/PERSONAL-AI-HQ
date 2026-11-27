@@ -3,10 +3,12 @@ const count = value => Number.isSafeInteger(value) && value >= 0;
 const modalities = new Set(['text_tokens', 'audio_tokens']);
 const inputFields = new Set([...modalities, 'cached_tokens', 'cached_tokens_details']);
 
-function countedModalities(details, fields = modalities) {
-  if (!object(details) || !count(details.text_tokens) || !count(details.audio_tokens) ||
+function countedModalities(details, fields = modalities, textOnly = false) {
+  if (!object(details)) return null;
+  const audio = textOnly && !Object.hasOwn(details, 'audio_tokens') ? 0 : details.audio_tokens;
+  if (!count(details.text_tokens) || !count(audio) ||
       Object.entries(details).some(([key, value]) => !fields.has(key) && value !== 0)) return null;
-  return {textTokens: details.text_tokens, audioTokens: details.audio_tokens};
+  return {textTokens: details.text_tokens, audioTokens: audio};
 }
 
 function totals(usage) {
@@ -15,18 +17,18 @@ function totals(usage) {
   return {totalTokens: usage.total_tokens, inputTokens: usage.input_tokens, outputTokens: usage.output_tokens};
 }
 
-export function normalizeRealtimeUsage(usage) {
+export function normalizeRealtimeUsage(usage, {textOnly = false} = {}) {
   const reported = totals(usage);
   if (!reported) return null;
-  const input = countedModalities(usage.input_token_details, inputFields);
-  const output = countedModalities(usage.output_token_details);
+  const input = countedModalities(usage.input_token_details, inputFields, textOnly);
+  const output = countedModalities(usage.output_token_details, modalities, textOnly);
   if (!input || !output || input.textTokens + input.audioTokens !== reported.inputTokens ||
       output.textTokens + output.audioTokens !== reported.outputTokens) return null;
   const cached = usage.input_token_details.cached_tokens;
   const details = usage.input_token_details.cached_tokens_details;
   if (!count(cached)) return null;
   const cachedInput = cached === 0 && details === undefined
-    ? {textTokens: 0, audioTokens: 0} : countedModalities(details);
+    ? {textTokens: 0, audioTokens: 0} : countedModalities(details, modalities, textOnly);
   if (!cachedInput || cachedInput.textTokens + cachedInput.audioTokens !== cached ||
       cachedInput.textTokens > input.textTokens || cachedInput.audioTokens > input.audioTokens) return null;
   return {...reported, input, output, cachedInput};
