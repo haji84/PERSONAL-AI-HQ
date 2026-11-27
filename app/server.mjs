@@ -27,7 +27,8 @@ import {createCodexPeerVerifier} from './codex-peer.mjs';
 import {localSpeechAvailable, localSpeechMaxChars, synthesizeLocalSpeech} from './local-speech.mjs';
 import {createTailnetAccess, tailnetCookieName} from './tailnet-access.mjs';
 import {validatedDocument} from './text-attachment.mjs';
-import {readChatHandoff} from './chat-handoff.mjs';
+import {chatConversationForHandoff, readChatHandoff} from './chat-handoff.mjs';
+import {readCodexChatContext} from './codex-chat-context.mjs';
 
 const root = fileURLToPath(new URL('../public/', import.meta.url));
 const assets = new Map([['/', ['index.html', 'text/html']], ['/app.mjs', ['app.mjs', 'text/javascript']],
@@ -200,6 +201,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
   const chats = createChatStore(directory);
   const execution = createExecutionAccess(directory, native);
   const operations = createOperations(directory, native, execution, {
+    chatConversationForHandoff: (project, reference) => chatConversationForHandoff(chats, project, reference),
     prepareHandover: (...args) => apiWork.prepareNativeHandover(...args),
   });
   const nativeArtifacts = createNativeArtifacts(directory, operations.completedArtifactSource);
@@ -647,6 +649,19 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       const {desktopThreadId, ...view} = await native.readThread(project.cwd, id, target.searchParams.get('cursor'));
       const managed = operations.managesThread(project, id);
       return send(response, 200, {...view, managed, ...(!remote && !managed && desktopThreadId === id ? {desktopThreadId} : {})});
+    }
+    if (get && route === '/api/codex/chat-context') {
+      let result;
+      try {
+        result = await readCodexChatContext({chats, operations, native, nativeArtifacts, project, params: target.searchParams});
+      } finally {
+        if (!signedIn()) throw error(401, 'サインインが必要です。');
+        const current = readCurrentProject(directory, project.id);
+        if (!current || current.cwd.length !== project.cwd.length || current.cwd.some(cwd => !project.cwd.includes(cwd))) {
+          throw error(404, 'この案件のCodex接続情報がありません。');
+        }
+      }
+      return send(response, 200, result);
     }
     if (get && route === '/api/codex/evidence') {
       const params = target.searchParams;

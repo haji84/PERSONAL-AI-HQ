@@ -22,7 +22,7 @@ const resumeUnavailable = () => problem(409, 'このスレッドの最新の作�
 const phase = value => nativeTerminal.has(value) ? value : value === 'inProgress' ? 'running' : null;
 const visiblePhase = row => row.cancellationRequestedAt && active.has(row.phase) ? 'cancelling' : row.phase;
 
-export function createOperations(directory, native, execution, {prepareHandover} = {}) {
+export function createOperations(directory, native, execution, {prepareHandover, chatConversationForHandoff} = {}) {
   const db = new DatabaseSync(join(directory, 'conversations.sqlite'));
   db.exec(`PRAGMA busy_timeout = 3000;
     CREATE TABLE IF NOT EXISTS codex_operations (
@@ -45,6 +45,7 @@ export function createOperations(directory, native, execution, {prepareHandover}
     if (!columns.includes('explicitRoute')) db.exec('ALTER TABLE codex_operations ADD COLUMN explicitRoute TEXT');
     if (!columns.includes('handoverReceipt')) db.exec('ALTER TABLE codex_operations ADD COLUMN handoverReceipt TEXT');
     if (!columns.includes('handoverReview')) db.exec('ALTER TABLE codex_operations ADD COLUMN handoverReview TEXT');
+    if (!columns.includes('chatConversationId')) db.exec('ALTER TABLE codex_operations ADD COLUMN chatConversationId TEXT');
     if (!columns.includes('cancellationRequestedAt')) db.exec('ALTER TABLE codex_operations ADD COLUMN cancellationRequestedAt TEXT');
     if (!columns.includes('cancellationDispatchedAt')) db.exec('ALTER TABLE codex_operations ADD COLUMN cancellationDispatchedAt TEXT');
     if (!columns.includes('expectedThreadId')) db.exec('ALTER TABLE codex_operations ADD COLUMN expectedThreadId TEXT');
@@ -92,8 +93,11 @@ export function createOperations(directory, native, execution, {prepareHandover}
   const byClientId = db.prepare(`SELECT * FROM codex_operations WHERE threadId=? AND id=? AND turnId IS NULL AND expectedThreadId IS NULL
     AND phase IN ('sending','unconfirmed') LIMIT 1`);
   const byTurn = db.prepare('SELECT * FROM codex_operations WHERE threadId=? AND turnId=? LIMIT 1');
-  const insert = db.prepare(`INSERT INTO codex_operations(project,id,workspace,fingerprint,phase,createdAt,updatedAt,stage,explicitRoute,handoverReceipt,handoverReview,expectedThreadId)
-    SELECT ?1,?2,?3,?4,'reserved',?5,?6,?7,?8,?9,?10,?12 WHERE ?11 IS NULL OR EXISTS (
+  const chatForTurn = db.prepare(`SELECT phase, chatConversationId FROM codex_operations
+    WHERE project=? AND threadId=? AND turnId=? AND chatConversationId IS NOT NULL
+    AND workspace IN (SELECT value FROM json_each(?)) LIMIT 2`);
+  const insert = db.prepare(`INSERT INTO codex_operations(project,id,workspace,fingerprint,phase,createdAt,updatedAt,stage,explicitRoute,handoverReceipt,handoverReview,expectedThreadId,chatConversationId)
+    SELECT ?1,?2,?3,?4,'reserved',?5,?6,?7,?8,?9,?10,?12,?13 WHERE ?11 IS NULL OR EXISTS (
       SELECT 1 FROM codex_operations WHERE project=?1 AND id=?11 AND workspace=?3 AND threadId IS NOT NULL AND turnId IS NOT NULL
         AND phase IN ('completed','interrupted','failed'))`);
   const setThread = db.prepare(`UPDATE codex_operations SET threadId=?,phase='sending',updatedAt=? WHERE project=? AND id=? AND phase='reserved'`);
@@ -154,7 +158,7 @@ export function createOperations(directory, native, execution, {prepareHandover}
   function response(row) {
     if (!row) return null;
     const {fingerprint, workspace, handoverReview, handoverReceipt, interruptionDispatchedAt, cancellationDispatchedAt,
-      cancellationRequestedAt, expectedThreadId, ...view} = row;
+      cancellationRequestedAt, expectedThreadId, chatConversationId, ...view} = row;
     return {...view, phase: visiblePhase(row), ...(handoverReceipt ? {handoverReceipt} : {}),
       ...(cancellationRequestedAt ? {cancellationRequestedAt} : {}), ...(expectedThreadId ? {expectedThreadId} : {})};
   }
@@ -279,6 +283,14 @@ export function createOperations(directory, native, execution, {prepareHandover}
       if (activeRun.get(project.id, null) || !project.cwd.includes(checkout)) return null;
       const row = latestAccepted.get(project.id, checkout);
       return row?.phase === 'completed' && row.threadId === threadId ? row : null;
+    },
+    chatConversationForTurn(project, threadId, turnId) {
+      const rows = chatForTurn.all(project.id, threadId, turnId, JSON.stringify(project.cwd));
+      if (rows.length > 1) return undefined;
+      const row = rows[0];
+      if (!row) return null;
+      if (row.phase === 'completed' || (active.has(row.phase) && row.phase !== 'reserved')) return row.chatConversationId;
+      return undefined;
     },
     completedArtifactSource(project, checkout, {operationId, threadId, turnId}) {
       if (typeof operationId !== 'string' || !allowedId.test(operationId) || typeof threadId !== 'string' ||
@@ -419,8 +431,9 @@ export function createOperations(directory, native, execution, {prepareHandover}
       }
       try {
         if (!resumeIsCurrent()) throw resumeUnavailable();
+        const chatConversationId = reference ? chatConversationForHandoff?.(project, reference) ?? null : null;
         if (!insert.run(project.id, input.id, expected, digest, timestamp(), timestamp(), stage, route, handoverReceipt,
-          handover?.review ?? null, input.resume ?? null, previous?.threadId ?? null).changes) {
+          handover?.review ?? null, input.resume ?? null, previous?.threadId ?? null, chatConversationId).changes) {
           throw resumeUnavailable();
         }
       }

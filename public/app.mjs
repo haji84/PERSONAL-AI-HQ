@@ -2013,7 +2013,7 @@ function planComposer(project, onConversation) {
   let disposed = false;
   const attached = () => ui.attachmentDrafts.get(draftKey);
   const draftConversationId = () => reference.checked ? ui.chatIds.get(project) ?? null : null;
-  const matchesImageConversation = (attachment, conversationId) =>
+  const matchesAttachmentConversation = (attachment, conversationId) =>
     !attachment || !Object.hasOwn(attachment, 'sourceConversationId') || attachment.sourceConversationId === (conversationId ?? null);
   const savedSource = attached()?.sourceConversationId;
   if (savedSource && ui.chatIds.get(project) === savedSource) reference.checked = true;
@@ -2187,7 +2187,7 @@ function planComposer(project, onConversation) {
     const allowsImage = imageAllowed(model.value);
     const imageBlocked = Boolean((attachment?.file || pending?.imageSha256) &&
       (!allowsImage || (pending?.imageSha256 && !imageAllowed(pending.model))));
-    const wrongConversation = !matchesImageConversation(attachment, draftConversationId());
+    const wrongConversation = !matchesAttachmentConversation(attachment, draftConversationId());
     const needsFile = !matchesAttachment(pending, attachment);
     camera?.setAvailable(canSend && allowsImage && !active && !pending && !readingAttachment);
     send.disabled = !canSend || Boolean(active || pending || camera?.active) || readingAttachment ||
@@ -2262,8 +2262,8 @@ function planComposer(project, onConversation) {
       status.textContent = imageSha256 ? '最初と同じ画像を選んでから再送してください。' : '最初と同じ資料を選んでから再送してください。';
       return;
     }
-    if (!matchesImageConversation(attachment, intent.conversationId) ||
-        !matchesImageConversation(attachment, draftConversationId())) return;
+    if (!matchesAttachmentConversation(attachment, intent.conversationId) ||
+        !matchesAttachmentConversation(attachment, draftConversationId())) return;
     if (imageSha256 && (!imageAllowed(model.value) || !imageAllowed(intent.model))) {
       status.textContent = '画像入力に対応する相談経路とモデルを確認してください。';
       return;
@@ -2280,7 +2280,7 @@ function planComposer(project, onConversation) {
         const bytes = new Uint8Array(await attachment.file.arrayBuffer());
         if (!currentAttachmentField()) return;
         if (document.hidden || controller.signal.aborted || ui.chatIntents.get(project) !== intent ||
-            ui.chatIds.get(project) !== selected || !matchesImageConversation(attachment, draftConversationId()) ||
+            ui.chatIds.get(project) !== selected || !matchesAttachmentConversation(attachment, draftConversationId()) ||
             !imageAllowed(model.value) || !imageAllowed(intent.model)) {
           status.textContent = '画像の送信を保留しました。相談先を確認して同じ受付番号を使えます。';
           return;
@@ -3540,6 +3540,99 @@ function modelSettings(target, back) {
 }
 const evidenceStatus = {inProgress: '実行中', completed: '完了', interrupted: '中断', failed: '失敗', declined: '却下'};
 const evidenceKind = {add: '追加', update: '変更', delete: '削除'};
+const turnHistoryCursors = new WeakMap();
+
+function codexResultChatHandoff(project, threadId, selector, isCurrent) {
+  const root = node('div', 'stack');
+  const actions = node('div', 'run-actions');
+  const status = node('p', 'small muted');
+  status.setAttribute('role', 'status');
+  const preview = node('pre', 'run-output');
+  preview.tabIndex = 0;
+  preview.setAttribute('data-chat-context', '');
+  preview.setAttribute('aria-label', 'チャットに渡す実行結果');
+  const prepareButton = button('チャットへ渡す内容を確認', () => void prepare());
+  const attach = button('結果をチャットの下書きに添付', stage);
+  const draftKey = memoryKey('chat-draft', project);
+  let prepared, generation = 0;
+  const selectedTurn = () => selector.selectedOptions[0];
+  const eligible = () => selectedTurn()?.dataset.status === 'completed';
+  actions.append(prepareButton, attach);
+  root.append(actions, status, preview);
+
+  function reset() {
+    generation++;
+    prepared = undefined;
+    root.hidden = !eligible();
+    preview.hidden = true;
+    preview.textContent = status.textContent = '';
+    attach.disabled = true;
+    prepareButton.disabled = false;
+  }
+
+  async function prepare() {
+    if (!isCurrent() || !eligible() || prepareButton.disabled) return;
+    reset();
+    prepareButton.disabled = true;
+    const visit = generation;
+    const turn = selector.value;
+    const historyCursor = selectedTurn()?.dataset.historyCursor;
+    const selected = ui.chatIds.get(project);
+    const candidate = selected && !/^(?:api|codex)\//.test(selected) ? selected : undefined;
+    const current = () => visit === generation && isCurrent() && eligible() && selector.value === turn;
+    status.textContent = 'このターンの結果と共有先を照合しています…';
+    try {
+      const result = await api(apiPath('/api/codex/chat-context', {project, id: threadId, turn, conversation: candidate, historyCursor}),
+        {signal: AbortSignal.timeout(12000)});
+      if (!current()) return;
+      const {document, conversation, sha256, summary} = result ?? {};
+      const counts = [summary?.commands, summary?.files, summary?.artifacts];
+      if (result?.threadId !== threadId || result.turnId !== turn || document?.name !== 'codex-result.json' ||
+          typeof document.text !== 'string' || counts.some(count => !Number.isSafeInteger(count) || count < 0) ||
+          (conversation !== null && (typeof conversation?.id !== 'string' || !conversation.id ||
+            typeof conversation.linked !== 'boolean' || (!conversation.linked && conversation.id !== candidate)))) {
+        throw new Error('選択したターンまたは共有先を確認できませんでした。');
+      }
+      const bytes = new TextEncoder().encode(document.text);
+      if (bytes.length > textDocumentLimit || await attachmentDigest(bytes) !== sha256) {
+        throw new Error('添付資料が照合結果と一致しません。');
+      }
+      const packet = JSON.parse(document.text);
+      if (packet.project?.id !== project || packet.threadId !== threadId || packet.turnId !== turn || packet.status !== 'completed' ||
+          ['commands', 'files', 'artifacts'].some((key, index) => asArray(packet[key]).length !== counts[index])) {
+        throw new Error('収録した結果を確認できませんでした。');
+      }
+      const digest = await attachmentDigest(bytes, document.name);
+      if (!current()) return;
+      const target = conversation ? text(conversation.title, '保存済みの会話') : 'この案件の新しい相談';
+      status.textContent = [`共有先 ${target}`, `実行記録${counts[0]}件・変更ファイル${counts[1]}件・成果物${counts[2]}件`].join(' · ');
+      preview.textContent = document.text;
+      preview.hidden = false;
+      prepared = {turn, document, digest, sourceConversationId: conversation?.id ?? null};
+      attach.disabled = false;
+    } catch (error) {
+      if (current()) status.textContent = error.message;
+    } finally {
+      if (visit === generation) prepareButton.disabled = false;
+    }
+  }
+
+  function stage() {
+    if (!prepared || !isCurrent() || !eligible() || prepared.turn !== selector.value || ui.capabilities.chatgptPlan !== true) return;
+    if (ui.chatIntents.has(project) || chatStreams.has(project) || ui.attachmentDrafts.has(draftKey)) {
+      status.textContent = 'チャットの保留中の応答と現在の添付を確認してから追加してください。';
+      return;
+    }
+    const {document, digest, sourceConversationId} = prepared;
+    ui.attachmentDrafts.set(draftKey, {document, digest, sourceConversationId});
+    if (sourceConversationId) ui.chatIds.set(project, sourceConversationId);
+    storeTab();
+    location.hash = 'chat';
+  }
+
+  reset();
+  return {root, reset};
+}
 
 function codexTurnEvidence(project, threadId, isCurrent) {
   const section = node('details', 'scope-info');
@@ -3553,6 +3646,9 @@ function codexTurnEvidence(project, threadId, isCurrent) {
   actions.append(refresh, more);
   more.hidden = true;
   section.append(node('summary', '', 'コマンド結果・変更ファイル'), selector.field, status, records, actions);
+  const chatHandoff = ui.capabilities.chatgptPlan === true
+    ? codexResultChatHandoff(project, threadId, selector.input, () => section.open && section.isConnected && isCurrent()) : null;
+  if (chatHandoff) section.append(chatHandoff.root);
   section.hidden = true;
   const displayed = new Set();
   const previousCursors = new Set();
@@ -3570,6 +3666,7 @@ function codexTurnEvidence(project, threadId, isCurrent) {
     previousCursors.clear();
     records.replaceChildren();
     more.hidden = true;
+    chatHandoff?.reset();
   }
   function renderCommandOutput(output, entry, turn, visit) {
     const messages = {empty: '出力なし', unavailable: '出力未取得', hidden: '出力は非表示です。'};
@@ -3680,7 +3777,10 @@ function codexTurnEvidence(project, threadId, isCurrent) {
     }
   }
   selector.input.addEventListener('change', () => { reset(); void load(); });
-  section.addEventListener('toggle', () => { if (section.open && !attempted) void load(); });
+  section.addEventListener('toggle', () => {
+    if (section.open && !attempted) void load();
+    if (!section.open) chatHandoff?.reset();
+  });
   return {section, useTurns(turns) {
     const previous = selector.input.value;
     selector.input.replaceChildren(...[...asArray(turns)].reverse().filter(turn =>
@@ -3690,6 +3790,9 @@ function codexTurnEvidence(project, threadId, isCurrent) {
       const parts = [turn.startedAt ? time(turn.startedAt) : '', title, evidenceStatus[turn.status] ?? '状態未確認'].filter(Boolean);
       const option = node('option', '', parts.join(' · '));
       option.value = turn.id;
+      option.dataset.status = turn.status;
+      const historyCursor = turnHistoryCursors.get(turn);
+      if (historyCursor) option.dataset.historyCursor = historyCursor;
       return option;
     }));
     if ([...selector.input.options].some(option => option.value === previous)) selector.input.value = previous;
@@ -3697,7 +3800,7 @@ function codexTurnEvidence(project, threadId, isCurrent) {
     if (previous !== selector.input.value) {
       reset();
       if (section.open) void load();
-    }
+    } else chatHandoff?.reset();
   }};
 }
 
@@ -3789,6 +3892,7 @@ function codex() {
           if (!destination.isConnected || ui.threadIds.get(project) !== id) return;
           const initialTop = messages.getBoundingClientRect().height;
           const added = asArray(page?.turns);
+          for (const turn of added) if (turn && typeof turn === 'object') turnHistoryCursors.set(turn, cursor);
           appendTurns(added, true);
           value.turns = [...added, ...asArray(value.turns)];
           evidence.useTurns(value.turns);

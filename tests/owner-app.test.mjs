@@ -1,3 +1,4 @@
+import {execFileSync} from 'node:child_process';
 import {createHash, randomUUID} from 'node:crypto';
 import assert from 'node:assert/strict';
 import {mkdir, mkdtemp, readFile, realpath, rm, writeFile} from 'node:fs/promises';
@@ -1251,4 +1252,247 @@ test('one canonical forecast survives every execution mode and a new owner-app p
   runtime=await start({codex:{}});
   cookie=await login(runtime);
   assert.deepEqual(await read(),before);
+});
+
+test('Codex chat context reads confirmed same-scope turns and exports only result metadata', async t => {
+  const {directory, start} = await runtimeFixture(t);
+  const scope = seed.projects[0].cwd;
+  const definition = {...seed, projects: [...seed.projects, {id:'other', name:'Other', cwd:scope+'-other'}]};
+  const portfolioPath = join(directory,'portfolio.json');
+  await writeFile(portfolioPath,JSON.stringify(definition),{mode:0o600});
+  let readThreadCalls = 0;
+  let evidenceReads = 0;
+  const app = await start({codex:{
+    async readThread(paths, id, cursor) {
+      readThreadCalls++;
+      if (!paths.includes(scope)) throw Object.assign(new Error('Not found'),{status:404});
+      return {thread:{id,title:'PRIVATE_THREAD_TITLE'},nextCursor:cursor===null?'older':null,
+        turns:[{id:cursor===null?'active':'done',status:cursor===null?'inProgress':'completed',
+          messages:[{text:'PRIVATE_CODEX_MESSAGE'}]}]};
+    },
+    async readTurnEvidence(paths,id,turn,{cursor}) {
+      evidenceReads++;
+      assert.deepEqual(paths,[scope]);
+      if (id==='bounded') {
+        const page = Number(cursor ?? 0);
+        return {threadId:id,turnId:turn,nextCursor:String(page+1),entries:[
+          {type:'files',id:'files-'+page,status:'completed',changes:Array.from({length:20},(_,index)=>({
+            path:'src/'+page+'/'+index+'-'+'a'.repeat(1024)+'.txt',kind:'update',
+          }))},
+        ]};
+      }
+      if (id==='revoked') {
+        const revoked = {...definition, projects:[{...definition.projects[0], cwd:scope+'-new'},definition.projects[1]]};
+        await writeFile(portfolioPath,JSON.stringify(revoked),{mode:0o600});
+      }
+      const entries = cursor===null ? [
+        {type:'command',id:'cmd',status:'completed',exitCode:0,command:'PRIVATE_COMMAND',output:'PRIVATE_RAW_OUTPUT'},
+        {type:'files',id:'chg',status:'completed',changes:[{path:'src/check.txt',kind:'update',diff:'PRIVATE_DIFF'},
+          {path:'/outside/PRIVATE_PATH',kind:'update'},{path:'../PRIVATE_PATH',kind:'add'}]},
+      ] : [];
+      return {threadId:id,turnId:turn,entries,nextCursor:cursor===null?'next':null};
+    },
+  }});
+  const cookie = await login(app);
+  const chatExport = {id:'chat-candidate', title:'選択した同じ案件の会話', update_time:1,current_node:'message',
+    mapping:{message:{parent:null,message:{author:{role:'user'},content:{parts:['PRIVATE_CHAT_MESSAGE']}}}}};
+  const imported = await fetch(app.url+'/api/chat/import?project=example',{method:'POST',
+    headers:{cookie,Origin:app.url,'Content-Type':'application/json'},body:JSON.stringify([chatExport])});
+  assert.equal(imported.status,200);
+  const path = app.url+'/api/codex/chat-context?';
+  const query = {project:'example',id:'thread',turn:'done',conversation:'chat-candidate'};
+  const get = (params={}, authentication=cookie) => fetch(path+new URLSearchParams({...query,...params}),
+    {headers:{cookie:authentication}});
+  assert.equal((await get({},'')).status,401);
+  assert.equal((await get({project:'unregistered'})).status,404);
+  assert.equal((await fetch(path+new URLSearchParams(query)+'&id=other',{headers:{cookie}})).status,400);
+  assert.equal(readThreadCalls,0);
+  assert.equal((await get({project:'other'})).status,404);
+  assert.equal((await get({turn:'active'})).status,409);
+  assert.equal(evidenceReads,0);
+  const accepted = await get();
+  assert.equal(accepted.status,200);
+  assert.equal(accepted.headers.get('cache-control'),'no-store');
+  const result = await accepted.json();
+  assert.equal(result.threadId,'thread');
+  assert.equal(result.turnId,'done');
+  assert.deepEqual(result.conversation,{id:'chat-candidate',title:'選択した同じ案件の会話',linked:false});
+  assert.deepEqual(result.summary,{commands:1,files:1,artifacts:0});
+  assert.equal(result.document.name,'codex-result.json');
+  assert.equal(result.sha256,createHash('sha256').update(result.document.text).digest('hex'));
+  const context = JSON.parse(result.document.text);
+  assert.deepEqual(context.commands,[{status:'completed',exitCode:0}]);
+  assert.deepEqual(context.files,[{path:'src/check.txt',kind:'update',status:'completed'}]);
+  assert.equal(JSON.stringify(result).includes('PRIVATE_'),false);
+  assert.equal((await (await get({conversation:'unknown'})).json()).conversation,null);
+  const bounded = await (await get({id:'bounded'})).json();
+  const limited = JSON.parse(bounded.document.text);
+  assert.ok(Buffer.byteLength(bounded.document.text,'utf8')<=16*1024);
+  assert.equal(limited.coverage.evidencePages,4);
+  assert.equal(limited.coverage.moreEvidence,true);
+  assert.ok(limited.coverage.omitted.files>0);
+  assert.equal(bounded.summary.files+limited.coverage.omitted.files,80);
+  assert.equal((await get({id:'revoked'})).status,404);
+});
+
+test('Codex chat context pins only exact existing conversation handoffs and preserves legacy receipts', async t => {
+  const {directory, start} = await runtimeFixture(t);
+  const checkout = join(directory,'workspaces','example');
+  await mkdir(checkout,{recursive:true,mode:0o700});
+  await writeFile(join(checkout,'.hq-owned-workspace'),'example\n');
+  await writeFile(join(directory,'portfolio.json'),JSON.stringify({...seed,
+    projects:[{...seed.projects[0],cwd:checkout,enableCodexWrite:true}]}),{mode:0o600});
+  let submits = 0;
+  const app = await start({codex:{
+    canWrite:true, subscriptionReady:async()=>true,
+    models:async()=>({accountType:'chatgpt',data:[{id:'current',isDefault:true,
+      defaultReasoningEffort:'low',reasoningEfforts:[{reasoningEffort:'low'}]}]}),
+    async submit(input) {
+      submits++;
+      assert.equal(input.onThread('thread-'+input.requestId),true);
+      return {turn:{id:'turn-'+input.requestId,status:'completed'}};
+    },
+    async readThread(_scope,id) {
+      return {thread:{id},turns:[{id:id.replace('thread-','turn-'),status:'completed'}],nextCursor:null};
+    },
+    async readTurnEvidence(_scope,id,turn) { return {threadId:id,turnId:turn,entries:[],nextCursor:null}; },
+  }});
+  const cookie = await login(app);
+  const call = (route, params={}, body) => fetch(app.url+route+'?'+new URLSearchParams({project:'example',...params}), {
+    method:body?'POST':'GET',headers:{cookie,...(body&&{Origin:app.url,'Content-Type':'application/json'})},
+    ...(body&&{body:JSON.stringify(body)}),
+  });
+  const archive = (id, title) => ({id,title,update_time:1,current_node:'m',mapping:{m:{parent:null,
+    message:{author:{role:'user'},content:{parts:['会話内の作業要件']}}}}});
+  assert.equal((await call('/api/chat/import',{},[archive('correct-chat','Origin'),archive('other-chat','Candidate')])).status,200);
+  const {conversation} = await (await call('/api/chat',{id:'correct-chat'})).json();
+  const linkRequest = {id:conversation.id,through:'1',observedAt:conversation.importedAt,
+    viewSha256:createHash('sha256').update(JSON.stringify(conversation.messages)).digest('hex')};
+  const {document} = await (await call('/api/chat/handoff',linkRequest)).json();
+  async function submit(id, attachment) {
+    const payload = {id,prompt:'引継ぎ資料の確認',...(attachment&&{document:attachment})};
+    assert.equal((await call('/api/codex/run',{},payload)).status,202);
+    assert.equal((await call('/api/codex/run',{},payload)).status,202);
+  }
+  const getContext = id => call('/api/codex/chat-context',
+    {id:'thread-'+id,turn:'turn-'+id,conversation:'other-chat'});
+  await submit('actual-link',document);
+  const linked = await (await getContext('actual-link')).json();
+  assert.deepEqual(linked.conversation,{id:'correct-chat',title:'Origin',linked:true});
+  const operations = new DatabaseSync(join(directory,'conversations.sqlite'));
+  try {
+    const setPhase = operations.prepare("UPDATE codex_operations SET phase=? WHERE project='example' AND id='actual-link'");
+    const currentPhase = operations.prepare("SELECT phase FROM codex_operations WHERE project='example' AND id='actual-link'");
+    for (const pending of ['running','unconfirmed']) {
+      setPhase.run(pending);
+      const preview = await getContext('actual-link');
+      assert.equal(preview.status,200);
+      assert.deepEqual((await preview.json()).conversation,linked.conversation);
+      assert.equal(currentPhase.get().phase,pending);
+    }
+    for (const conflict of ['cancelled','failed','interrupted']) {
+      setPhase.run(conflict);
+      assert.equal((await getContext('actual-link')).status,409);
+      assert.equal(currentPhase.get().phase,conflict);
+    }
+    setPhase.run('completed');
+  } finally { operations.close(); }
+  const changed = {...document,text:document.text+' '};
+  await submit('modified-link',changed);
+  const unlinked = await (await getContext('modified-link')).json();
+  assert.deepEqual(unlinked.conversation,{id:'other-chat',title:'Candidate',linked:false});
+  await submit('historic-turn');
+  assert.deepEqual((await (await getContext('historic-turn')).json()).conversation,
+    {id:'other-chat',title:'Candidate',linked:false});
+  assert.equal(submits,3);
+});
+
+test('Codex chat context includes only committed artifacts attested for the exact turn', {skip:!process.getuid}, async t => {
+  const {directory, start} = await runtimeFixture(t);
+  const checkout = join(directory,'workspaces','example');
+  await mkdir(checkout,{recursive:true,mode:0o700});
+  const fixture = {'.hq-owned-workspace':'example\n','requirements.txt':'PRIVATE_REQUIREMENTS\n',
+    'verification.txt':'PRIVATE_PROOF\n','artifact.txt':'PRIVATE_RESULT\n'};
+  await Promise.all(Object.entries(fixture).map(([name,value])=>writeFile(join(checkout,name),value,{mode:0o600})));
+  const git = args => execFileSync('git',['-C',checkout,...args],{encoding:'utf8',stdio:['ignore','pipe','ignore']}).trim();
+  git(['init','-q']);
+  git(['add','--','requirements.txt','verification.txt','artifact.txt']);
+  git(['-c','user.name=Test','-c','user.email=test@example.test','-c','commit.gpgsign=false',
+    '-c','core.hooksPath=/dev/null','commit','-qm','isolated fixture']);
+  const digest = text => createHash('sha256').update(text).digest('hex');
+  const operationId = 'recorded-operation';
+  const now = '2026-11-28T00:00:00.000Z';
+  const project = {...seed.projects[0],cwd:checkout,handoverRequirements:'requirements.txt',nativeHandover:{
+    version:1,shareArtifacts:true,effectsReconciled:true,operationId,threadId:'thread',turnId:'verified-turn',
+    checkoutHead:git(['rev-parse','HEAD']),requirementsSha256:digest(fixture['requirements.txt']),
+    verification:{path:'verification.txt',sha256:digest(fixture['verification.txt'])},
+    artifacts:[{path:'artifact.txt',sha256:digest(fixture['artifact.txt'])}],
+  }};
+  await writeFile(join(directory,'portfolio.json'),JSON.stringify({...seed,projects:[project]}),{mode:0o600});
+  const app = await start({codex:{
+    async readThread(_scope,id) { return {thread:{id},nextCursor:null,turns:[
+      {id:'verified-turn',status:'completed'}, {id:'other-turn',status:'completed'},
+    ]}; },
+    async readTurnEvidence(_scope,id,turn) { return {threadId:id,turnId:turn,entries:[],nextCursor:null}; },
+  }});
+  const db = new DatabaseSync(join(directory,'conversations.sqlite'));
+  try {
+    db.prepare(`INSERT INTO codex_operations(project,id,workspace,fingerprint,phase,threadId,turnId,createdAt,updatedAt)
+      VALUES (?,?,?,?,'completed','thread','verified-turn',?,?)`).run('example',operationId,checkout,'fixture',now,now);
+  } finally {db.close();}
+  const cookie = await login(app);
+  const read = async turn => {
+    const reply = await fetch(app.url+'/api/codex/chat-context?project=example&id=thread&turn='+turn,{headers:{cookie}});
+    assert.equal(reply.status,200);
+    const result = await reply.json();
+    assert.equal(JSON.stringify(result).includes('PRIVATE_'),false);
+    return JSON.parse(result.document.text);
+  };
+  const correct = await read('verified-turn');
+  assert.equal(correct.coverage.artifactEvidence,'verified');
+  assert.deepEqual(correct.artifacts,[{path:'artifact.txt',sha256:digest(fixture['artifact.txt']),observedAt:now}]);
+  const other = await read('other-turn');
+  assert.equal(other.coverage.artifactEvidence,'unpublished');
+  assert.deepEqual(other.artifacts,[]);
+  await writeFile(join(checkout,'artifact.txt'),'Changed without attestation');
+  const changed = await read('verified-turn');
+  assert.equal(changed.coverage.artifactEvidence,'unverified');
+  assert.deepEqual(changed.artifacts,[]);
+});
+
+test('Codex chat context locates a previously displayed turn from its scoped native history cursor', async t => {
+  const {directory, start} = await runtimeFixture(t);
+  const checkout = seed.projects[0].cwd;
+  await writeFile(join(directory,'portfolio.json'),JSON.stringify({...seed,
+    projects:[...seed.projects,{id:'other', name:'Other',cwd:checkout+'-other'}]}),{mode:0o600});
+  const cursors = [];
+  const app = await start({codex:{
+    async readThread(scope,id,cursor) {
+      if (!scope.includes(checkout)) throw Object.assign(new Error('Out of scope'),{status:404});
+      cursors.push(cursor);
+      if (cursor === 'tail-page') return {thread:{id},turns:[{id:'oldest',status:'completed'}],nextCursor:null};
+      if (cursor === 'cycle') return {thread:{id},turns:[],nextCursor:'cycle'};
+      const page = Number(cursor?.slice(5) ?? 0);
+      return {thread:{id},turns:[{id:'turn-'+page,status:'completed'}],nextCursor:'page-'+(page+1)};
+    },
+    async readTurnEvidence(_scope,id,turn) { return {threadId:id,turnId:turn,entries:[],nextCursor:null}; },
+  }});
+  const cookie = await login(app);
+  const url=app.url+'/api/codex/chat-context?';
+  const base={project:'example',id:'thread',turn:'oldest'};
+  const call=(query={})=>fetch(url+new URLSearchParams({...base,...query}),{headers:{cookie}});
+  assert.equal((await call()).status,404);
+  assert.deepEqual(cursors.splice(0),[null,'page-1','page-2','page-3']);
+  assert.equal((await call({historyCursor:'tail-page',project:'other'})).status,404);
+  assert.equal((await call({historyCursor:'tail-page',turn:'foreign'})).status,404);
+  const read=await call({historyCursor:'tail-page'});
+  assert.equal(read.status,200);
+  const result=await read.json();
+  assert.equal(result.turnId,'oldest');
+  assert.equal(JSON.parse(result.document.text).coverage.turnPages,1);
+  assert.deepEqual(cursors.splice(0),['tail-page','tail-page']);
+  assert.equal((await call({historyCursor:'cycle'})).status,503);
+  assert.equal((await fetch(url+new URLSearchParams(base)+'&historyCursor=one&historyCursor=two',{headers:{cookie}})).status,400);
+  assert.equal((await call({historyCursor:'\n'})).status,400);
+  assert.deepEqual(cursors,['cycle']);
 });

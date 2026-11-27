@@ -70,3 +70,16 @@ export function readChatHandoff(chats, project, params) {
   }
   return handoff;
 }
+
+export function chatConversationForHandoff(chats, project, reference) {
+  if (reference?.document.name !== documentName) return null;
+  try {
+    const packet = JSON.parse(reference.document.text);
+    if (packet?.schemaVersion !== 1 || packet.project?.id !== project.id || typeof packet.source?.id !== 'string') return null;
+    const params = new URLSearchParams({project: project.id, id: packet.source.id, through: packet.range?.end,
+      observedAt: packet.source.observedAt, viewSha256: packet.source.viewSha256});
+    return readChatHandoff(chats, project, params).sha256 === reference.digest ? packet.source.id : null;
+  } catch {
+    return null;
+  }
+}
