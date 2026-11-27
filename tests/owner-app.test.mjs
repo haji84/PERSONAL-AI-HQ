@@ -411,6 +411,106 @@ test('GitHub registration promotes only a fresh eligible candidate and preserves
   assert.equal(saved.projects[1].enableCodexWrite, undefined);
 });
 
+test('route estimates use the matching saved settings while preserving the original timeline and unknown costs', async t => {
+  const {directory, start} = await runtimeFixture(t);
+  const time = new Date(Date.now() - 60_000).toISOString();
+  const beforeTime = new Date(Date.parse(time) - 60_000).toISOString();
+  const dueAt = new Date(Date.parse(time) + 3600_000).toISOString();
+  const horizon = (optimistic, standard, cautious) => ({optimistic, standard, cautious});
+  const tasks = [{id:'inspect',remainingMinutes:horizon(2,3,5)},
+    {id:'implement',dependencies:['inspect'],remainingMinutes:horizon(5,9,15)},
+    {id:'review',dependencies:['inspect'],remainingMinutes:horizon(4,8,14)}];
+  const common = {recordedAt:time, target:'project', scope:'Verified fixture project requirements',
+    firstUsableMinutes:horizon(4,8,13),basis:'Based on fixture evidence',
+    assumptions:['Uses the current repository scope'],
+    links:[{label:'Evidence',url:'https://github.com/fixture-owner/source/blob/revision/evidence.md'}]};
+  const subscription = {...common, execution:{mode:'subscription-only'}, tasks, apiCostUsd:0, subscriptionTurns:3};
+  const api = {...common, execution:{mode:'api-only',apiBudgetUsd:8}, tasks:[...tasks,{id:'device',externalWait:'unknown'}],
+    firstUsableMinutes:horizon(5,10,20), apiCostUsd:0.423};
+  const competing = {...common, target:'milestone', scope:'Unrelated scope',
+    execution:{mode:'auto',preference:'balanced'},firstUsableMinutes:horizon(1,2,3)};
+  const definition = {...seed, projects:[
+    {...seed.projects[0], delivery:{estimates:[{dueAt},
+      {...subscription,recordedAt:beforeTime,firstUsableMinutes:horizon(2,3,4)},
+      subscription,api,competing]}},
+    {id:'held',name:'Held fixture',state:'approval',delivery:{estimates:[subscription]}},
+    {id:'unknown',name:'No estimates'},
+    {id:'old',name:'Elapsed forecast',delivery:{estimates:[{...subscription,
+      recordedAt:new Date(Date.now()-7200_000).toISOString()}]}},
+    {id:'forbidden',name:'Forbidden-route forecast',delivery:{estimates:[{...common,
+      execution:{mode:'auto',allowedRoutes:['subscription']}, apiCostUsd:1}]}},
+
+  ]};
+  const file = join(directory,'portfolio.json');
+  await writeFile(file,JSON.stringify(definition),{mode:0o600});
+  let modelReads = 0;
+  const app = await start({codex:{models() { modelReads++; throw new Error('No model is needed'); }}});
+  const path = '/api/execution/estimates';
+  assert.equal((await fetch(app.url+path+'?project=example')).status,401);
+  const cookie = await login(app);
+  const get = (route = path+'?project=example') => fetch(app.url+route,{headers:{cookie}});
+  const update = async (revision, settings) => fetch(app.url+'/api/execution/settings?project=example',{method:'POST',
+    headers:{cookie, Origin:app.url, 'Content-Type':'application/json'},body:JSON.stringify({revision,settings})});
+  assert.equal((await get(path+'?project=example&project=held')).status,404);
+  assert.equal((await get(path+'?project=unrelated')).status,404);
+  let result = await get();
+  assert.equal(result.status,200);
+  let view = await result.json();
+  assert.equal(view.mode,'subscription-only');
+  assert.equal(view.settingsRevision,0);
+  assert.equal(view.status,'available');
+  assert.equal(view.selected.recordedAt,time);
+  assert.deepEqual(view.selected.firstUsableMinutes,horizon(4,8,13));
+  assert.deepEqual(view.selected.remainingMinutes,horizon(7,12,20));
+  assert.equal(view.selected.estimatedFinish,new Date(Date.parse(time)+720_000).toISOString());
+  assert.equal(view.selected.apiCostUsd,0);
+  assert.equal(view.selected.subscriptionTurns,3);
+  assert.deepEqual(view.alternatives.map(row=>row.mode),['api-only']);
+  assert.equal(view.alternatives[0].apiCostUsd,0.423);
+  assert.equal(view.alternatives[0].estimatedFinish,null);
+  const held = await (await get(path+'?project=held')).json();
+  assert.equal(held.held,true);
+  assert.equal(held.selected.estimatedFinish,null);
+  assert.equal(held.selected.firstUsableAt,null);
+  assert.deepEqual(held.selected.remainingMinutes,horizon(7,12,20));
+  const missing = await (await get(path+'?project=unknown')).json();
+  assert.equal(missing.status,'missing');
+  assert.equal(missing.selected,null);
+  assert.deepEqual(missing.alternatives,[]);
+  const expired = await (await get(path+'?project=old')).json();
+  assert.equal(expired.selected.firstUsableAt,null);
+  assert.equal(expired.selected.estimatedFinish,null);
+  assert.equal(expired.selected.stale,true);
+  const forbidden = await (await get(path+'?project=forbidden')).json();
+  assert.equal(forbidden.status,'unavailable');
+  assert.equal(forbidden.selected,null);
+
+
+  result = await update(0,{mode:'api-only',apiBudgetUsd:8});
+  assert.equal(result.status,200);
+  view = await (await get()).json();
+  assert.equal(view.mode,'api-only');
+  assert.equal(view.settingsRevision,1);
+  assert.equal(view.selected.apiCostUsd,0.423);
+  assert.equal(view.selected.subscriptionTurns,null);
+  assert.deepEqual(view.selected.firstUsableMinutes,horizon(5,10,20));
+  assert.equal(view.selected.firstUsableAt,null);
+  assert.equal(view.selected.remainingMinutes,null);
+  assert.equal(view.held,true);
+  assert.equal(view.holdReason,'api');
+  result = await update(1,{model:'unmeasured-model'});
+  assert.equal(result.status,200);
+  view = await (await get()).json();
+  assert.equal(view.status,'missing');
+  assert.equal(view.selected,null);
+  assert.deepEqual(view.alternatives,[]);
+
+  const original = await (await get('/api/portfolio')).json();
+  assert.equal(original.projects.find(project=>project.id==='example').schedule.originalDueAt,dueAt);
+  assert.deepEqual(JSON.parse(await readFile(file,'utf8')),definition);
+  assert.equal(modelReads,0);
+});
+
 test('Codex turn evidence requires an exact authenticated project and rechecks scope after native reading', async t => {
   const {directory, start} = await runtimeFixture(t);
   const portfolioPath = join(directory, 'portfolio.json');

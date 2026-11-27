@@ -167,6 +167,33 @@ export async function readDeliveryRecord(source) {
   }
 }
 
+export async function readExecutionEstimateSource(source, projectId) {
+  try {
+    const reader = await openSource(source);
+    const {repository, revision} = reader;
+    const [timeline] = await reader.files(revision,[timelinePath]);
+    const text = timeline.toString('utf8');
+    const fences = [...text.matchAll(/^```route-estimates[ \t]*\r?$/gm)];
+    const blocks = [...text.matchAll(/^```route-estimates[ \t]*\r?\n([\s\S]*?)^```[ \t]*\r?$/gm)];
+    if (fences.length !== blocks.length) throw new Error('Incomplete route estimate');
+    const rows = blocks.flatMap(match=>{
+      const items = JSON.parse(match[1]);
+      if (!Array.isArray(items) || items.some(item=>typeof item?.project !== 'string')) throw new Error('Invalid route estimate');
+      return items.filter(item=>item.project === projectId);
+    });
+    if (rows.length > 256 || rows.some(row=>!Array.isArray(row.evidence) || !row.evidence.length ||
+      row.evidence.length > 8 || row.evidence.some(name=>typeof name !== 'string' || !evidenceName.test(name)))) {
+      throw new Error('Route estimate evidence is invalid');
+    }
+    const evidence = new Set(rows.flatMap(row=>row.evidence));
+    if (evidence.size) await reader.objects(revision,[...evidence].map(file=>initiative+'/'+file));
+    return {rows:rows.map(row=>({...row,links:[link(repository,revision,timelinePath,'記録済みの見積もり'),
+      ...row.evidence.map(file=>link(repository,revision,initiative+'/'+file,file))]})),unavailable:false};
+  } catch {
+    return {rows:[],unavailable:true};
+  }
+}
+
 function isSourceReference(text) {
   return /^https:\/\/\S+$/.test(text) || /^(?:一次資料|参考一次資料)（.+）：$/.test(text) ||
     /^(?:共通開発環境|GORIQ|統合管理構想)：https:\/\/\S+$/.test(text);

@@ -4,6 +4,7 @@ import {ExecutionStore} from './execution-store.mjs';
 import {readCurrentProject, readProjectInitialExecution} from './portfolio.mjs';
 
 const held = new Set(['paused', 'approval', 'limit', 'blocked', 'offline', 'waiting', 'completed']);
+export const executionHeld = state => held.has(state);
 const problem = (status, message, code) => Object.assign(new Error(message), {status, code});
 const unavailableImageModel = () => problem(409, '選択したCodexモデルの画像入力対応を確認できません。', 'CODEX_IMAGE_MODEL_UNAVAILABLE');
 
@@ -13,7 +14,7 @@ export function createExecutionAccess(directory, native) {
 
   function preflight(project, stage, workspace, route, handoverReceipt) {
     const latest = readCurrentProject(directory, project.id);
-    if (!latest || held.has(latest.state)) throw problem(409, '案件の既存の停止条件が解除されていません。');
+    if (!latest || executionHeld(latest.state)) throw problem(409, '案件の既存の停止条件が解除されていません。');
     if (workspace && (!latest.codexWrite || !latest.cwd.includes(workspace))) {
       throw problem(409, 'この案件の実行先の設定が変わりました。');
     }

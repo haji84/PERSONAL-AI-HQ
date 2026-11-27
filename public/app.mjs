@@ -560,10 +560,11 @@ function sourceSection(parent, proof) {
   }
   if (list.children.length) parent.append(node('h3', '', '確認した記録'), list);
 }
+const executionModeLabels = {'subscription-only': 'サブスク専用', 'api-only': 'API専用', auto: '自動選択', hybrid: '工程ごとに指定'};
+
 function executionSettingsFields() {
   const root = node('div', 'stack');
-  const values = {'subscription-only': 'サブスク専用', 'api-only': 'API専用', auto: '自動選択', hybrid: '工程ごとに指定'};
-  const mode = labeledSelect('実行モード', values);
+  const mode = labeledSelect('実行モード', executionModeLabels);
   const preference = labeledSelect('自動選択の優先順', {'subscription-first': 'サブスク優先', 'api-first': 'API優先', balanced: '実測をもとに選択'});
   const routeFields = node('fieldset', 'stack');
   routeFields.append(node('legend', 'small muted', '許可する実行経路'));
@@ -642,36 +643,155 @@ function executionSettingsFields() {
   }};
 }
 
+function executionEstimateDetails(estimate, held) {
+  const section = node('div', 'stack');
+  const facts = node('dl', 'properties');
+  const format = new Intl.NumberFormat('ja-JP', {maximumFractionDigits: 6});
+  const prediction = range => {
+    const values = [range?.optimistic, range?.standard, range?.cautious];
+    if (!values.every(value => Number.isFinite(value) && value >= 0)) return null;
+    const [shortest, standard, cautious] = values.map(value => format.format(value));
+    return `${shortest}〜${cautious}分（標準 ${standard}分）`;
+  };
+  const quantity = (value, unit) => Number.isFinite(value) && value >= 0
+    ? (value > 0 && value < 0.000001 ? '0.000001未満' : format.format(value)) + unit : null;
+  const completion = estimate.target === 'project' ? '案件全体の完成予定' : '対象工程の完了予定';
+  metric(facts, '見積もりの記録日時', time(estimate.recordedAt));
+  if (estimate.model) metric(facts, '見積もりで指定したモデル', estimate.model);
+  if (estimate.reasoningEffort) metric(facts, '見積もりで指定した推論レベル', estimate.reasoningEffort);
+  metric(facts, '初回利用までの見込み', prediction(estimate.firstUsableMinutes));
+  metric(facts, '記録時点の残り時間', prediction(estimate.remainingMinutes));
+  metric(facts, '初回利用の予定', held ? '保留中' : time(estimate.firstUsableAt));
+  metric(facts, completion, held ? '保留中' : time(estimate.estimatedFinish));
+  metric(facts, 'API費用の予測', quantity(estimate.apiCostUsd, ' USD'));
+  metric(facts, 'サブスク利用の予測', quantity(estimate.subscriptionTurns, 'ターン'));
+  section.append(facts);
+  if (estimate.basis) section.append(node('h4', '', '根拠'), node('p', '', estimate.basis));
+  const assumptions = asArray(estimate.assumptions).filter(value => typeof value === 'string' && value);
+  if (assumptions.length) {
+    section.append(node('h4', '', '前提条件'));
+    appendStrings(section, assumptions);
+  }
+  const links = node('ul', 'marked-list');
+  for (const item of asArray(estimate.links)) {
+    const source = item?.label && link(item.label, item.url);
+    if (source) links.append(listItem(source));
+  }
+  if (links.children.length) section.append(links);
+  return section;
+}
+
+function executionEstimates(project, isCurrent) {
+  const root = node('section', 'stack');
+  const status = node('p', 'small muted');
+  status.setAttribute('role', 'status');
+  const records = node('div', 'stack');
+  root.append(node('h3', '', '保存済み設定の見積もり'), status, records);
+  const path = apiPath('/api/execution/estimates', {project});
+  let request;
+
+  function clear(message) {
+    request?.abort();
+    request = null;
+    records.replaceChildren();
+    status.textContent = message;
+  }
+
+  function paint(result, settings) {
+    if (result?.settingsRevision !== settings.revision || result.mode !== settings.settings.mode) {
+      status.textContent = '実行設定を更新してから見積もりを確認してください。';
+      return;
+    }
+    if (result.status === 'missing') {
+      status.textContent = 'この実行経路の見積もりは未記録です。';
+      return;
+    }
+    const selected = result.selected;
+    if (result.status !== 'available' || selected?.mode !== result.mode ||
+        !Object.hasOwn(executionModeLabels, selected?.mode) ||
+        !['milestone', 'project'].includes(selected?.target) || !text(selected.scope, '')) {
+      status.textContent = '現在の見積もりを取得できません。';
+      return;
+    }
+    const held = result.held === true;
+    status.textContent = result.holdReason === 'api' ? 'APIの実行条件を確認できるまで、予定時刻は未確定です。'
+      : held ? '案件の状態により予定時刻は表示していません。'
+      : selected.stale ? '記録済みの予定時刻を過ぎたため、再見積もりが必要です。' : '';
+    records.append(node('p', 'small muted', '対象 ' + (selected.target === 'project' ? '案件全体' : 'マイルストーン') + ' · ' + selected.scope),
+      node('h4', '', executionModeLabels[selected.mode]), executionEstimateDetails(selected, held),
+      node('p', 'small muted', '利用量は見積もりです。API作業上限と請求額は別に管理されます。'));
+    const alternatives = new Map();
+    for (const estimate of asArray(result.alternatives)) {
+      if (estimate?.mode === selected.mode || !Object.hasOwn(executionModeLabels, estimate?.mode) ||
+          estimate.target !== selected.target || estimate.scope !== selected.scope || alternatives.has(estimate.mode)) continue;
+      alternatives.set(estimate.mode, estimate);
+    }
+    if (alternatives.size) records.append(node('h4', '', '同じ範囲の比較'),
+      node('p', 'small muted', '各見積もりの経路・モデルなどの前提と根拠を確認できます。'));
+    for (const estimate of alternatives.values()) {
+      const detail = node('details', 'scope-info');
+      detail.append(node('summary', '', executionModeLabels[estimate.mode]), executionEstimateDetails(estimate, held));
+      records.append(detail);
+    }
+  }
+
+  return {root, clear, async load(settings) {
+    if (!isCurrent()) return;
+    clear('見積もりを取得中…');
+    const pending = new AbortController();
+    request = pending;
+    const current = () => isCurrent() && request === pending;
+    try {
+      const result = await api(path, {signal: AbortSignal.any([pending.signal, AbortSignal.timeout(10000)])});
+      if (current()) paint(result, settings);
+    } catch {
+      if (current()) status.textContent = '現在の見積もりを取得できません。';
+    } finally {
+      if (request === pending) request = null;
+    }
+  }};
+}
+
 function executionSettings(project) {
   const details = node('details', 'scope-info');
   const content = node('div', 'stack');
   details.append(node('summary', '', '案件の実行経路'), content);
   const path = apiPath('/api/execution/settings', {project});
   const key = memoryKey('execution-settings', project);
+  const isCurrent = () => details.isConnected && ui.view === 'dashboard' && ui.project === project;
   function mount() {
     fetchView(key, path, content, (initial, destination) => {
       let current = initial;
       const editor = executionSettingsFields();
+      const estimates = executionEstimates(project, isCurrent);
       const status = node('p', 'small muted');
       status.setAttribute('role', 'status');
       const save = button('案件の実行設定を保存', async () => {
         const problem = editor.problem();
         if (problem) { status.textContent = problem; return; }
         save.disabled = true;
+        estimates.clear('実行設定の保存を確認中…');
         try {
           current = await api(path, {method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({revision: current.revision, settings: editor.value()})});
+          if (!isCurrent()) return;
           resources.set(key, {value: current});
           editor.apply(current.settings);
           status.textContent = 'この案件の実行設定を保存しました。';
-        } catch (error) { status.textContent = error.message; }
-        finally { save.disabled = false; }
+        } catch (error) { if (isCurrent()) status.textContent = error.message; }
+        finally {
+          if (isCurrent()) {
+            save.disabled = false;
+            void estimates.load(current);
+          }
+        }
       }, false);
       destination.append(editor.root,
         node('p', 'small muted', current.apiAvailable ? 'API実行経路を利用できます。' : 'API実行は認証と費用条件を確認できるまで待機します。'),
-        save, status);
+        save, status, estimates.root);
       editor.apply(current.settings);
-    }, () => ui.view === 'dashboard' && ui.project === project);
+      void estimates.load(current);
+    }, isCurrent);
   }
   details.addEventListener('toggle', () => { if (details.open && !content.hasChildNodes()) mount(); });
   return details;
@@ -754,7 +874,8 @@ function projectRegistrationForm(github, pendingKey = null) {
 
   const actions = node('div', 'run-actions');
   actions.append(submit);
-  form.append(fields, node('p', 'small muted', '登録時は待機中になります。作業先と実行権限はホスト側で登録します。'), actions, status);
+  form.append(fields, node('p', 'small muted', '登録前の見積もりは不明です。'),
+    node('p', 'small muted', '登録時は待機中になります。作業先と実行権限はホスト側で登録します。'), actions, status);
   form.addEventListener('submit', async event => {
     event.preventDefault();
     if (busy || !current() || pendingKey && !intent && !registeredId) return;

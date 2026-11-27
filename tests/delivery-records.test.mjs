@@ -105,6 +105,33 @@ test('the initial estimate and actual first usable delivery come from fixed comm
   assert.equal((await view())[0].deliveryRecord.status, 'unavailable');
 });
 
+test('execution forecasts read committed matching project records and require the claimed evidence blobs', async t => {
+  const {checkout, commit} = await fixture(t);
+  const file = initiative + '/DELIVERY.md';
+  const proof = 'mac-fixture-observation.json';
+  await commit({[file]:plan, [initiative+'/'+proof]:'{"evidence":true}\n'});
+  const condition = {kind:'integration-milestone', checkout, repository, ref};
+  const empty = await deliveryRecords.readExecutionEstimateSource(condition,'integration');
+  assert.deepEqual(empty,{rows:[], unavailable:false});
+  const estimate = {project:'integration', recordedAt:'2026-11-27T06:30:00Z', execution:{mode:'subscription-only'},
+    target:'milestone', scope:'Scoped first usable delivery', firstUsableMinutes:{optimistic:4,standard:6,cautious:9},
+    basis:'The recorded verification milestone', evidence:[proof]};
+  const fence = '\u0060'.repeat(3);
+  const withRows = rows => plan+'\n'+fence+'route-estimates\n'+JSON.stringify(rows)+'\n'+fence+'\n';
+  const revision = await commit({[file]:withRows([estimate])});
+  const saved = await deliveryRecords.readExecutionEstimateSource(condition,'integration');
+  assert.equal(saved.unavailable,false);
+  assert.equal(saved.rows.length,1);
+  assert.deepEqual(saved.rows[0].firstUsableMinutes,estimate.firstUsableMinutes);
+  assert.ok(saved.rows[0].links.some(link=>link.url.includes(revision) && link.url.endsWith(proof)));
+  assert.ok(!JSON.stringify(saved).includes(checkout));
+  assert.deepEqual((await deliveryRecords.readExecutionEstimateSource(condition,'unrelated')).rows,[]);
+  await writeFile(join(checkout,file),withRows([{...estimate,firstUsableMinutes:{optimistic:99,standard:99,cautious:99}}]));
+  assert.equal((await deliveryRecords.readExecutionEstimateSource(condition,'integration')).rows[0].firstUsableMinutes.standard,6);
+  await commit({[file]:withRows([{...estimate,evidence:['absent-observation.json']}])});
+  assert.deepEqual(await deliveryRecords.readExecutionEstimateSource(condition,'integration'),{rows:[],unavailable:true});
+});
+
 test('a scoped environment audit requires the untouched owner requirement bytes and all twelve sections', async t => {
   const {directory, checkout, commit, configure} = await fixture(t);
   const owner = Array.from({length:12}, (_,index) => (index+1) + '. Original section').join('\n');

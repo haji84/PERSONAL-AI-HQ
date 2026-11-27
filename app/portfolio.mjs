@@ -211,6 +211,18 @@ export function registerProject(directory, input, {github, hasSavedWork}) {
   return {id, created:true};
 }
 
+export function readProjectEstimateBinding(directory, id) {
+  if (typeof id !== 'string' || !projectKey.test(id)) return null;
+  const raw = readDefinition(directory);
+  const rows = raw.projects.filter(row=>row?.id === id);
+  if (rows.length !== 1) return null;
+  const [row] = rows;
+  return {
+    source:row.deliverySource?.kind === 'integration-milestone' ? row.deliverySource : null,
+    estimates:row.delivery?.estimates ?? [],
+  };
+}
+
 export function readProjectDeliverySource(directory, id) {
   if (typeof id !== 'string' || !projectKey.test(id)) return null;
   const rows = readDefinition(directory).projects.filter(row => row?.id === id);

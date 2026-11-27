@@ -14,6 +14,8 @@ Node.js 24とサインイン済みのCodex CLIを利用します。最初に `np
 
 既存の証跡を案件詳細に表示するには、本人用の `portfolio.json` の対象案件に `deliverySource` を指定します。`checkout` は正本を含むGit作業ツリー、`repository` はそのGitHubリポジトリのHTTPS URL、`ref` はコミット済みのブランチ参照です。統合アプリの初回提供記録には `kind: "integration-milestone"` と `baselineCommit`・`observationCommit`、共通開発環境の初期監査には `kind: "environment-audit"` と `requirementsCommit` を使います。照合する各コミットは完全なSHAを指定します。今の確認対象は実際の初回提供と原要求12節の監査範囲です。
 
+「案件の実行経路」の見積もりは、保存した設定と同じ経路、モデル、予算、工程設定の記録から読み取ります。案件定義に記録する場合は、既存の `delivery.estimates` に `recordedAt`、`target`（`project` または `milestone`）、`scope`、`execution`、`basis`、HTTPSの根拠 `links` を含む行を追加します。`firstUsableMinutes` は最短・標準・慎重、案件全体の残り時間は `tasks` の依存関係、`apiCostUsd` と `subscriptionTurns` は根拠のある値を使います。統合アプリ自身は既存の進行記録に保存した見積もりを読み、当初見積もりを別に表示します。
+
 統合アプリの要求照合も表示する場合は、同じ設定に正本原文の固定コミット `ownerRequestRevision` とファイルの `ownerRequestSha256` を指定します。「要求ごとの照合」を開いたときだけ、原文行と根拠を取得します。
 
 ## Windowsで起動

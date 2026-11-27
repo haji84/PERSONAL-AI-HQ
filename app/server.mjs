@@ -8,13 +8,14 @@ import {homedir} from 'node:os';
 import {basename, dirname, isAbsolute, join, resolve} from 'node:path';
 import {fileURLToPath, pathToFileURL} from 'node:url';
 import {pipeline} from 'node:stream/promises';
-import {readCurrentProject, readPortfolio, readProjectDeliverySource, registerProject} from './portfolio.mjs';
+import {readCurrentProject, readPortfolio, readProjectDeliverySource, readProjectEstimateBinding, registerProject} from './portfolio.mjs';
 import {normalizeSettings} from './execution-policy.mjs';
-import {readOwnerRequirementCoverage} from './delivery-records.mjs';
+import {readExecutionEstimateSource, readOwnerRequirementCoverage} from './delivery-records.mjs';
 import {createChatStore} from './chat-store.mjs';
 import {createCodexClient, emptyNativeActivity, isCodexLoopbackUrl, validEvidenceCursor, validEvidenceTarget} from './codex.mjs';
 import {createOperations} from './operations.mjs';
-import {createExecutionAccess} from './execution-access.mjs';
+import {createExecutionAccess, executionHeld} from './execution-access.mjs';
+import {executionEstimates} from './execution-estimates.mjs';
 import {createPlanAuth, PLAN_AUTH_CALLBACK_PATH} from './chatgpt-plan-auth.mjs';
 import {createChatGPTResponses} from './chatgpt-responses.mjs';
 import {ensurePrivateDirectory, readPrivateRuntimeToken} from './private-directory.mjs';
@@ -437,6 +438,24 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       }));
       const {revision, updatedAt, settings} = execution.settings({id});
       return send(response, created ? 201 : 200, {id, revision, updatedAt, settings});
+    }
+    if (get && route === '/api/execution/estimates') {
+      const ids = target.searchParams.getAll('project');
+      const projectId = ids[0];
+      const binding = ids.length === 1 && readProjectEstimateBinding(directory,projectId);
+      if (!binding) throw error(404, '見積もりを表示する案件を見つけられませんでした。');
+      const input = binding.source ? await readExecutionEstimateSource(binding.source,projectId) : {
+        rows:Array.isArray(binding.estimates) && binding.estimates.filter(row=>row && Object.hasOwn(row,'execution')),
+      };
+      if (!signedIn()) throw error(401, 'サインインが必要です。');
+      if (JSON.stringify(readProjectEstimateBinding(directory,projectId)) !== JSON.stringify(binding)) {
+        throw error(409, '見積もりの参照が更新されました。再取得してください。');
+      }
+      const project = readCurrentProject(directory,projectId);
+      if (!project) throw error(404, '見積もりを表示する案件を見つけられませんでした。');
+      const selection = execution.settings(project);
+      const apiAvailable = apiEnabled && selection.settings.allowedRoutes.includes('api') && apiWork.capabilities(project).available;
+      return send(response, 200, executionEstimates(input,{...selection,apiAvailable},executionHeld(project.state)));
     }
     const portfolioRequest = get && route === '/api/portfolio';
     const portfolio = await readPortfolio(directory, github, portfolioRequest);
