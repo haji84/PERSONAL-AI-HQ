@@ -448,6 +448,12 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       if (typeof data?.id !== 'string') throw error(400, '対象のCodex作業を指定してください。');
       return send(response, 202, await operations.interrupt(project, data.id));
     }
+    if (post && route === '/api/codex/cancel') {
+      if (target.searchParams.getAll('project').length !== 1) throw error(404, '案件を見つけられませんでした。');
+      const data = await jsonBody(request, 4096);
+      if (typeof data?.id !== 'string') throw error(400, '中止するCodex作業を指定してください。');
+      return send(response, 202, await operations.cancel(project, data.id));
+    }
     if (route === '/api/codex/steer') {
       if (get) return send(response, 200, await operations.readSteering(project, target.searchParams.get('id')));
       if (post) return send(response, 202, await operations.steer(project, await jsonBody(request, 64000)));

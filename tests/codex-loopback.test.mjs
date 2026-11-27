@@ -124,7 +124,18 @@ test('authorized loopback shares initialization and preserves scope, checks, and
     excludeTmpdirEnvVar: true, excludeSlashTmp: true});
   assert.deepEqual(turn.input, [{type: 'text', text: request.prompt, text_elements: []}]);
   await assert.rejects(native.interrupt(workspace, 'outside'), {status: 404});
-  await native.interrupt(workspace, fixtureThread.id, fixtureTurn.id);
+  const held = new Error('Cancellation claim was declined');
+  await assert.rejects(native.interrupt(workspace, fixtureThread.id, fixtureTurn.id, () => { throw held; }), error => error === held);
+  assert.equal(calls.some(([method]) => method === 'turn/interrupt'), false);
+  let claimed = false;
+  await native.interrupt(workspace, fixtureThread.id, fixtureTurn.id, () => {
+    assert.equal(calls.at(-1)?.[0], 'thread/read');
+    claimed = true;
+  });
+  assert.equal(claimed, true);
+  assert.deepEqual(calls.filter(([method]) => method === 'turn/interrupt'), [
+    ['turn/interrupt', {threadId: fixtureThread.id, turnId: fixtureTurn.id}],
+  ]);
   assert.equal(await native.steer({workspace, threadId: fixtureThread.id, turnId: fixtureTurn.id,
     prompt: 'Add one instruction.', requestId: 'fixture-steering'}), fixtureTurn.id);
 });

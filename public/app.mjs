@@ -64,8 +64,8 @@ const runViewCleanups = new Set();
 const chatStreams = new Map();
 const activities = new Map();
 const activityLabels = {
-  reserved: '受付済み', sending: 'Codexへの送信を確認中', running: '実行中', interrupting: '中断を要求中',
-  unconfirmed: '状態未確認', completed: 'ターン完了', interrupted: '中断済み', failed: '実行失敗',
+  reserved: '受付済み', sending: 'Codexへの送信を確認中', running: '実行中', interrupting: '中断を要求中', cancelling: '中止を照合中',
+  unconfirmed: '状態未確認', completed: 'ターン完了', interrupted: '中断済み', cancelled: '中止済み', failed: '実行失敗',
 };
 const chatSourceLabels = {'chatgpt-export': 'ChatGPTの書き出し', 'chatgpt-live': 'ChatGPTプラン',
   'api-development': '通常APIの開発', 'codex-history': 'Codex'};
@@ -266,7 +266,8 @@ function paintActivity() {
     return;
   }
   const status = node('p', 'small');
-  const phase = !activity.terminal && Date.now() - Date.parse(activity.observedAt) > 30000 ? 'unconfirmed' : activity.phase;
+  const stale = !activity.terminal && activity.phase !== 'cancelling' && Date.now() - Date.parse(activity.observedAt) > 30000;
+  const phase = stale ? 'unconfirmed' : activity.phase;
   status.append(chip(phase, activityLabels[phase]),
     node('span', 'muted', '  最終確認 ' + time(activity.observedAt)));
   const route = activity.kind === 'api' ? '通常API' : 'Codex';
@@ -293,7 +294,7 @@ async function pollActivity() {
       try {
         ({activity} = await api(apiPath('/api/execution/activity', {project}), {signal: AbortSignal.timeout(6500)}));
       } catch {
-        if (activitySession === session && previous && !previous.terminal) {
+        if (activitySession === session && previous && !previous.terminal && previous.phase !== 'cancelling') {
           activities.set(project, {...previous, phase: 'unconfirmed'});
         }
         return;
@@ -306,7 +307,8 @@ async function pollActivity() {
           (previous?.id !== activity.id || previous.phase !== activity.phase)) {
         const name = projectList().find(item => item.id === project)?.name;
         const route = activity.kind === 'api' ? '通常API' : 'Codex';
-        const messages = {completed: `${route}の作業が完了しました。`, interrupted: `${route}の実行が中断されました。`, failed: `${route}の実行に失敗しました。`};
+        const messages = {completed: `${route}の作業が完了しました。`, interrupted: `${route}の実行が中断されました。`,
+          cancelled: `${route}の作業を中止しました。`, failed: `${route}の実行に失敗しました。`};
         if (name && messages[activity.phase]) setNotice(`${name} · ${messages[activity.phase]}`, activity.phase === 'failed');
       }
     }));
@@ -1466,13 +1468,15 @@ const runPhases = {
   sending: 'Codexへ送信中',
   running: '実行中',
   interrupting: '中断を要求中',
+  cancelling: '中止を照合中',
   unconfirmed: '実行状態未確認',
   completed: 'Codexターン完了',
   interrupted: '中断済み',
+  cancelled: '中止済み',
   failed: '実行失敗',
 };
-const pollingPhases = new Set(['reserved', 'sending', 'running', 'interrupting', 'unconfirmed']);
-const finishedPhases = new Set(['completed', 'interrupted', 'failed']);
+const pollingPhases = new Set(['reserved', 'sending', 'running', 'interrupting', 'cancelling', 'unconfirmed']);
+const finishedPhases = new Set(['completed', 'interrupted', 'cancelled', 'failed']);
 
 const apiWorkMessages = {
   API_AUTHORIZATION_REQUIRED: 'この端末の通常API認証を確認できません。',
@@ -1563,6 +1567,12 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
     const id = run.operation.id;
     await mutate(apiMode ? `${path}/interrupt` : '/api/codex/interrupt', {id});
   }, true);
+  const cancel = button('作業を中止', async () => {
+    if (run.busy || run.checking || !isCurrent() || !canCancel()) return;
+    const id = run.operation.id;
+    if (!window.confirm('このCodex作業を中止して、受付を終了しますか？作業履歴と作成済みのファイルは保持します。')) return;
+    await mutate('/api/codex/cancel', {id});
+  });
   const steer = button('実行中のターンに追加指示', () => sendSteering(), true);
   const checkSteer = button('追加指示の状態を照合', () => requestSteering(false), true);
   const closeSteer = button('この確認を閉じる', () => {
@@ -1577,7 +1587,7 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
     if (!run.busy && !run.checking && intent && reviewMatches(intent)) await mutate(path, intent);
   }, true);
   const check = button('作業状態を確認', () => lookup(), true);
-  actions.append(send, resume, steer, interrupt, recover, check, checkSteer, closeSteer);
+  actions.append(send, resume, steer, interrupt, cancel, recover, check, checkSteer, closeSteer);
   if (!advice) section.append(node('h3', '', apiMode ? '通常APIの開発操作' : 'Codex操作'));
   section.append(caption);
   let attachmentInput;
@@ -1651,6 +1661,10 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
     return run.known && ['running', 'interrupting', 'unconfirmed'].includes(run.operation?.phase) &&
       Boolean(run.operation.threadId && run.operation.turnId);
   }
+  function canCancel() {
+    const phase = run.operation?.phase;
+    return !apiMode && run.known && phase !== 'cancelling' && (pollingPhases.has(phase) || phase === 'interrupted');
+  }
   function hasRoom() {
     return run.known && !readingAttachment && (!apiMode || apiReady()?.available === true) && !ui.runIntents.has(runKey) &&
       (!run.operation || finishedPhases.has(run.operation.phase));
@@ -1682,6 +1696,7 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
     const timestamps = relevantOperation ? [
       '受付 ' + time(run.operation.createdAt),
       run.operation.startedAt ? '開始 ' + time(run.operation.startedAt) : '',
+      run.operation.cancellationRequestedAt ? '中止受付 ' + time(run.operation.cancellationRequestedAt) : '',
       run.operation.updatedAt ? '更新 ' + time(run.operation.updatedAt) : '',
       apiMode ? apiReceiptSummary(asArray(relevantOperation.providerReceipts)) : '',
     ].filter(Boolean) : [];
@@ -1697,15 +1712,16 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
     steeringStatus.textContent = run.steerMessage || (pendingSteering ? '追加指示の受付を照合できます。' : '');
     steeringStatus.hidden = apiMode || !steeringStatus.textContent;
     send.hidden = !hasRoom() || Boolean(handoff && (!handoff.review() || continuation)) || Boolean(native && !native.origin());
-    resume.hidden = apiMode || !hasRoom() || !continuation;
+    resume.hidden = apiMode || !hasRoom() || !continuation || phase === 'cancelled';
     resume.textContent = phase === 'interrupted' ? '中断した作業を再開' : '同じスレッドへ追加指示';
     interrupt.hidden = !canInterrupt();
     interrupt.textContent = !apiMode && phase === 'interrupting' ? '同じターンの中断を再要求' : '中断を要求';
+    cancel.hidden = !canCancel();
     steer.hidden = apiMode || !run.known || phase !== 'running' || !run.operation?.turnId || ui.steerIntents.has(project);
     checkSteer.hidden = !pendingSteering;
     closeSteer.hidden = !pendingSteering || !run.known || !finishedPhases.has(phase);
-    recover.hidden = !intention || !reviewMatches(intention);
-    for (const action of [send, resume, steer, interrupt, recover, check, checkSteer, closeSteer]) {
+    recover.hidden = !intention || !reviewMatches(intention) || (run.known && run.operation?.id === intention.id);
+    for (const action of [send, resume, steer, interrupt, cancel, recover, check, checkSteer, closeSteer]) {
       action.disabled = run.busy || run.checking;
     }
     const body = text(advice ? relevantOperation?.advice :
@@ -1741,14 +1757,17 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
     }
     if (operation) {
       const intent = currentIntent();
-      if (intent?.id === operation.id) {
+      const acceptedTurn = apiMode || Boolean(operation.turnId);
+      if (intent?.id === operation.id && (acceptedTurn || finishedPhases.has(operation.phase))) {
         ui.runIntents.delete(runKey);
-        const key = intentDraftKey(intent);
-        const attachmentSha = intent.imageSha256 ?? intent.documentSha256;
-        if (attachmentSha && ui.attachmentDrafts.get(key)?.digest === attachmentSha) ui.attachmentDrafts.delete(key);
-        if (text(ui.drafts.get(key), '').trim() === intent.prompt) {
-          ui.drafts.delete(key);
-          if (key === draftKey) run.clearDraft = intent.prompt;
+        if (acceptedTurn) {
+          const key = intentDraftKey(intent);
+          const attachmentSha = intent.imageSha256 ?? intent.documentSha256;
+          if (attachmentSha && ui.attachmentDrafts.get(key)?.digest === attachmentSha) ui.attachmentDrafts.delete(key);
+          if (text(ui.drafts.get(key), '').trim() === intent.prompt) {
+            ui.drafts.delete(key);
+            if (key === draftKey) run.clearDraft = intent.prompt;
+          }
         }
         storeTab();
       }
@@ -1761,11 +1780,11 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
     if (newlyCompleted && isCurrent()) advice.onComplete();
   }
 
-  async function lookup() {
+  async function lookup(operationId) {
     if (run.busy || run.checking || !isCurrent()) return;
     run.checking = true;
     run.onChange?.();
-    const id = currentIntent()?.id ??
+    const id = operationId ?? currentIntent()?.id ??
       (run.operation && !finishedPhases.has(run.operation.phase) ? run.operation.id : undefined);
     try {
       const response = await api(apiPath(path, {project, id, handoverReceipt: handoff?.receipt}), {signal: AbortSignal.timeout(9000)});
@@ -1784,6 +1803,7 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
     run.busy = true;
     run.message = '';
     run.onChange?.();
+    let verifyCancellation = false;
     try {
       const {draftReceipt, imageSha256, documentSha256, ...request} = payload;
       const digest = imageSha256 ?? documentSha256;
@@ -1816,9 +1836,11 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
       }
       run.known = Boolean((apiMode || payload.handover || imageModelRejected) && confirmedRejection);
       run.message = error.message + ' 作業状態を確認してください。';
+      verifyCancellation = endpoint === '/api/codex/cancel' && (!error.status || error.status >= 500);
     } finally {
       run.busy = false;
       run.onChange?.();
+      if (verifyCancellation) void lookup(payload.id);
     }
   }
 
@@ -1884,7 +1906,7 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
   }
 
   function submitNew(previous) {
-    if (run.busy || run.checking || !hasRoom() || !isCurrent()) return;
+    if (run.busy || run.checking || !hasRoom() || !isCurrent() || previous?.phase === 'cancelled') return;
     const review = handoff?.review();
     if (handoff && !previous && (!review || (run.operation?.threadId && run.operation?.turnId))) return;
     const nativeOrigin = native?.origin();

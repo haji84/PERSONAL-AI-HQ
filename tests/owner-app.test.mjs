@@ -298,6 +298,42 @@ test('project execution settings block native dispatch in API-only mode and stay
   assert.equal(steers, 0);
 });
 
+test('Codex cancellation is owner-scoped and closes the exact pre-send receipt without dispatch', async t => {
+  const {directory, start} = await runtimeFixture(t);
+  const cwd = join(directory, 'workspaces', 'example');
+  await mkdir(cwd, {recursive: true, mode: 0o700});
+  await writeFile(join(cwd, '.hq-owned-workspace'), 'example\n');
+  await writeFile(join(directory, 'portfolio.json'), JSON.stringify({projects: [
+    {id: 'example', name: 'Fixture', cwd, enableCodexWrite: true},
+    {id: 'foreign', name: 'Foreign fixture'},
+  ]}), {mode: 0o600});
+  let canSubmit;
+  const app = await start({codex: {
+    canWrite: true, subscriptionReady: async () => true,
+    models: async () => ({accountType: 'chatgpt', data: [{id: 'current', isDefault: true,
+      defaultReasoningEffort: 'low', reasoningEfforts: [{reasoningEffort: 'low'}]}]}),
+    async submit(input) { canSubmit = input.onThread; return new Promise(() => {}); },
+    async interrupt() { assert.fail('A pre-send cancellation cannot interrupt a native turn'); },
+  }});
+  const cookie = await login(app);
+  const id = 'fixture-cancelled-operation';
+  const request = (path, body, {authenticated = true, origin = app.url} = {}) => fetch(app.url + path, {
+    method: 'POST', headers: {Origin: origin, 'Content-Type': 'application/json', ...(authenticated ? {cookie} : {})},
+    body: JSON.stringify(body),
+  });
+  const cancelPath = '/api/codex/cancel?project=example';
+  assert.equal((await request('/api/codex/run?project=example', {id, prompt: 'Fixture'})).status, 202);
+  assert.equal((await request(cancelPath, {id}, {authenticated: false})).status, 401);
+  assert.equal((await request(cancelPath, {id}, {origin: 'https://other.example'})).status, 403);
+  assert.equal((await request(cancelPath + '&project=foreign', {id})).status, 404);
+  const response = await request(cancelPath, {id});
+  assert.equal(response.status, 202);
+  assert.equal((await response.json()).operation.phase, 'cancelled');
+  assert.equal(canSubmit('late-thread'), false);
+  const activity = await fetch(app.url + '/api/execution/activity?project=example', {headers: {cookie}});
+  assert.equal((await activity.json()).activity.phase, 'cancelled');
+});
+
 test('a scoped ChatGPT plan stream preserves text and never repeats the provider call on replay', async t => {
   const {directory, start} = await runtimeFixture(t);
   await writeFile(join(directory, 'portfolio.json'), JSON.stringify(seed), {mode: 0o600});

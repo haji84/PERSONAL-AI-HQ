@@ -391,9 +391,9 @@ export function createCodexClient({command, socket, loopback} = {}) {
       if (!answer?.turn?.id) throw unavailable('Codexの受理IDを確認できませんでした。');
       return {threadId: thread.id, turn: answer.turn};
     },
-    async interrupt(workspace, id, turnId) {
+    async interrupt(workspace, id, turnId, beforeSend) {
       const {rpc} = await scopedThread([workspace], id);
-      await rpc.call('turn/interrupt', {threadId: id, turnId});
+      await rpc.call('turn/interrupt', {threadId: id, turnId}, beforeSend);
     },
     async steer({workspace, threadId: id, turnId, requestId, prompt, beforeSteer, beforeSend}) {
       const {rpc, thread} = await scopedThread([workspace], id);

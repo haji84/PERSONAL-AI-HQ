@@ -3,6 +3,7 @@ import {mkdtemp, mkdir, realpath, rm, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
+import {setTimeout as delay} from 'node:timers/promises';
 import test from 'node:test';
 import {createOperations} from '../app/operations.mjs';
 
@@ -12,20 +13,29 @@ async function fixture(t) {
   await mkdir(workspace, {recursive: true, mode: 0o700});
   await writeFile(join(workspace, '.hq-owned-workspace'), 'fixture\n');
   const project = {id: 'fixture', codexWrite: true, cwd: [workspace]};
+  const authorize = enabled => writeFile(join(directory, 'portfolio.json'), JSON.stringify({
+    projects: [{id: project.id, name: 'Fixture', enableCodexWrite: enabled, cwd: workspace, state: 'ready'}],
+  }), {mode: 0o600});
+  await authorize(true);
   const opened = new Set();
   t.after(async () => {
     for (const entry of opened) entry.close();
     await rm(directory, {recursive: true, force: true});
   });
-  return {project, workspace, open(native) {
-    const operations = createOperations(directory, {canWrite: true, subscriptionReady: async () => true, ...native});
-    opened.add(operations);
-    return {...operations, close() { opened.delete(operations); operations.close(); }};
-  }, age(id) {
-    const db = new DatabaseSync(join(directory, 'conversations.sqlite'));
-    db.prepare('UPDATE codex_operations SET updatedAt=? WHERE id=?').run('2000-01-01T00:00:00.000Z', id);
-    db.close();
-  }};
+  return {
+    project, workspace, authorize,
+    database: () => new DatabaseSync(join(directory, 'conversations.sqlite')),
+    open(native) {
+      const operations = createOperations(directory, {canWrite: true, subscriptionReady: async () => true, ...native});
+      opened.add(operations);
+      return {...operations, close() { opened.delete(operations); operations.close(); }};
+    },
+    age(id) {
+      const db = new DatabaseSync(join(directory, 'conversations.sqlite'));
+      try { db.prepare('UPDATE codex_operations SET updatedAt=? WHERE id=?').run('2000-01-01T00:00:00.000Z', id); }
+      finally { db.close(); }
+    },
+  };
 }
 
 test('API-key or unknown accounts cannot start a subscription operation', async t => {
@@ -86,15 +96,16 @@ test('an interrupt held during gateway shutdown can be requested again for the s
   const first = open({async submit(input) {
     assert.equal(input.onThread('fixture-thread'), true);
     return {turn: {id: 'exact-turn', status: 'inProgress'}};
-  }, async interrupt() { startedInterrupt(); return new Promise(() => {}); }});
+  }, async interrupt(_scope, _thread, _turn, beforeSend) { beforeSend(); startedInterrupt(); return new Promise(() => {}); }});
   await first.start(project, request);
   assert.equal((await first.read(project, request.id)).operation.phase, 'running');
   void first.interrupt(project, request.id);
   await interrupted;
   first.close();
   let retries = 0;
-  const reopened = open({async interrupt(...args) {
-    assert.deepEqual(args, [workspace, 'fixture-thread', 'exact-turn']);
+  const reopened = open({async interrupt(scope, thread, turn, beforeSend) {
+    assert.deepEqual([scope, thread, turn], [workspace, 'fixture-thread', 'exact-turn']);
+    beforeSend();
     retries++;
   }});
   assert.equal((await reopened.interrupt(project, request.id)).operation.phase, 'interrupting');
@@ -143,7 +154,7 @@ test('an interrupt wins before a queued steer can send to the native turn', asyn
     input.beforeSend?.();
     dispatched++;
     return 'fixture-turn';
-  }, async interrupt() {}});
+  }, async interrupt(_scope, _thread, _turn, beforeSend) { beforeSend(); }});
   const original = {id: 'request-to-stop', prompt: 'A fixture'};
   await operations.start(project, original);
   assert.equal((await operations.read(project, original.id)).operation.phase, 'running');
@@ -179,4 +190,305 @@ test('stale running activity is unconfirmed until exact native observation', asy
   assert.ok(confirmed.observedAt > stale.observedAt);
   assert.equal(confirmed.terminal, false);
   assert.deepEqual(await reachable.readActivity({...project, cwd: []}), {activity: null});
+});
+
+async function until(check) {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if (await check()) return;
+    await delay(5);
+  }
+  assert.fail('Cancellation did not reach the expected fixture state');
+}
+
+test('cancel closes an unsent reservation and fences the native turn and resume', async t => {
+  const {project, authorize, open} = await fixture(t);
+  const request = {id: 'cancel-reserved', prompt: 'A fixture'};
+  let admit, interrupts = 0;
+  const first = open({async submit(input) { admit = input.onThread; return new Promise(() => {}); },
+    async interrupt() { interrupts++; }});
+  const second = open({async interrupt() { interrupts++; }});
+  assert.equal((await first.start(project, request)).operation.phase, 'reserved');
+  await assert.rejects(second.cancel({...project, id: 'different'}, request.id), {status: 404});
+  await authorize(false);
+  await assert.rejects(second.cancel(project, request.id), {status: 403});
+  assert.equal((await second.read(project, request.id)).operation.phase, 'reserved');
+  assert.equal((await second.read(project, request.id)).operation.cancellationRequestedAt, undefined);
+  await authorize(true);
+  const closed = (await second.cancel(project, request.id)).operation;
+  assert.equal(closed.phase, 'cancelled');
+  assert.ok(Number.isFinite(Date.parse(closed.cancellationRequestedAt)));
+  assert.equal(admit('late-thread'), false);
+  assert.equal((await first.start(project, request)).operation.phase, 'cancelled');
+  await assert.rejects(first.start(project, {...request, id: 'cancelled-resume', resume: request.id}), {status: 409});
+  assert.equal(first.hasActiveWork(project), false);
+  assert.equal(interrupts, 0);
+});
+
+test('cancel waits for the exact accepted turn and never retries a claimed interrupt after restart', async t => {
+  const {project, workspace, authorize, open} = await fixture(t);
+  const request = {id: 'cancel-without-ack', prompt: 'A fixture'};
+  let events, interrupts = 0;
+  const first = open({onEvent(callback) { events = callback; }, async submit(input) {
+    assert.equal(input.onThread('fixture-thread'), true);
+    return new Promise(() => {});
+  }, async interrupt(scope, thread, turn, beforeSend) {
+    assert.deepEqual([scope, thread, turn], [workspace, 'fixture-thread', 'accepted-turn']);
+    beforeSend();
+    interrupts++;
+    throw new Error('uncertain acknowledgement');
+  }});
+  await first.start(project, request);
+  assert.equal((await first.cancel(project, request.id)).operation.phase, 'cancelling');
+  events('turn/started', {threadId: 'fixture-thread', turn: {id: 'unrelated-turn', status: 'inProgress'}});
+  events('item/started', {threadId: 'fixture-thread', turnId: 'unrelated-turn',
+    item: {type: 'userMessage', clientId: 'other-receipt'}});
+  assert.equal((await first.read(project, request.id)).operation.turnId, null);
+  assert.equal(interrupts, 0);
+  await authorize(false);
+  events('item/completed', {threadId: 'fixture-thread', turnId: 'accepted-turn',
+    item: {type: 'userMessage', clientId: request.id}});
+  events('item/agentMessage/delta', {threadId: 'fixture-thread', turnId: 'accepted-turn', delta: 'Partial answer'});
+  assert.equal((await first.read(project, request.id)).operation.turnId, 'accepted-turn');
+  await delay(25);
+  assert.equal(interrupts, 0);
+  await assert.rejects(first.steer(project, {id: 'cancelled-steer', operationId: request.id, prompt: 'No'}), {status: 409});
+  await authorize(true);
+  const second = open({async interrupt(_scope, _thread, _turn, beforeSend) {
+    beforeSend();
+    interrupts++;
+    throw new Error('uncertain acknowledgement');
+  }});
+  await Promise.all([first.read(project, request.id), second.read(project, request.id)]);
+  await until(() => interrupts > 0);
+  assert.equal(interrupts, 1);
+  first.close();
+  second.close();
+  let status = 'inProgress';
+  const reopened = open({async findSubmission(scope, thread, client, turn) {
+    assert.deepEqual([scope, thread, client, turn], [workspace, 'fixture-thread', request.id, 'accepted-turn']);
+    return {id: turn, status};
+  }, async interrupt(_scope, _thread, _turn, beforeSend) { beforeSend(); interrupts++; }});
+  assert.equal((await reopened.cancel(project, request.id)).operation.phase, 'cancelling');
+  assert.equal(interrupts, 1);
+  status = 'interrupted';
+  reopened.close();
+  const confirmed = open({async findSubmission() { return {id: 'accepted-turn', status}; }});
+  const final = (await confirmed.read(project, request.id)).operation;
+  assert.equal(final.phase, 'cancelled');
+  assert.equal(final.output, 'Partial answer');
+  assert.equal(Object.hasOwn(final, 'cancellationDispatchedAt'), false);
+  assert.equal((await confirmed.readActivity(project)).activity.terminal, true);
+  await assert.rejects(confirmed.start(project, {...request, id: 'cancelled-resume', resume: request.id}), {status: 409});
+});
+
+test('native completion wins over a pending cancellation and stale receipts cannot be cancelled', async t => {
+  const {project, workspace, open} = await fixture(t);
+  const request = {id: 'cancel-completing', prompt: 'A fixture'};
+  let event, interrupts = 0;
+  const operations = open({onEvent(callback) { event = callback; }, async submit(input) {
+    assert.equal(input.onThread('fixture-thread'), true);
+    return {turn: {id: input.requestId + '-turn', status: 'inProgress'}};
+  }, async interrupt(scope, thread, turn, beforeSend) {
+    assert.deepEqual([scope, thread, turn], [workspace, 'fixture-thread', request.id + '-turn']);
+    beforeSend();
+    interrupts++;
+    event('turn/completed', {threadId: 'fixture-thread', turn: {id: request.id + '-turn', status: 'completed'}});
+  }});
+  await operations.start(project, request);
+  assert.equal((await operations.read(project, request.id)).operation.phase, 'running');
+  await operations.cancel(project, request.id);
+  await until(async () => (await operations.read(project, request.id)).operation.phase === 'completed');
+  assert.equal(interrupts, 1);
+  const next = {...request, id: 'latest-interrupted'};
+  await operations.start(project, {...next, resume: request.id});
+  await assert.rejects(operations.cancel(project, request.id), {status: 409});
+  event('turn/completed', {threadId: 'fixture-thread', turn: {id: next.id + '-turn', status: 'interrupted'}});
+  assert.equal((await operations.cancel(project, next.id)).operation.phase, 'cancelled');
+  assert.equal(interrupts, 1);
+});
+
+test('cancel adopts an existing ordinary interrupt across connections without dispatching a second one', async t => {
+  const {project, open} = await fixture(t);
+  const observed = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  let events, calls = 0;
+  const ordinary = open({onEvent(callback) { events = callback; }, async submit(input) {
+    assert.ok(input.onThread('fixture-thread'));
+    return {turn: {id: 'fixture-turn', status: 'inProgress'}};
+  }, async interrupt(_scope, _thread, _turn, beforeSend) {
+    beforeSend();
+    calls++;
+    observed.resolve();
+    await release.promise;
+  }});
+  const cancel = open({async interrupt() { calls++; }});
+  const request = {id: 'cancel-existing-stop', prompt: 'A fixture'};
+  await ordinary.start(project, request);
+  const stopping = ordinary.interrupt(project, request.id);
+  await observed.promise;
+  try {
+    assert.equal((await cancel.cancel(project, request.id)).operation.phase, 'cancelling');
+    assert.equal((await cancel.interrupt(project, request.id)).operation.phase, 'cancelling');
+    events('turn/completed', {threadId: 'fixture-thread', turn: {id: 'fixture-turn', status: 'interrupted'}});
+    assert.equal((await cancel.read(project, request.id)).operation.phase, 'cancelled');
+    assert.equal(calls, 1);
+  } finally {
+    release.resolve();
+    await stopping;
+  }
+});
+
+test('a transport failure before the interrupt send gate allows recovery from an exact native read', async t => {
+  const {project, workspace, open} = await fixture(t);
+  const request = {id: 'cancel-retry-before-send', prompt: 'A fixture'};
+  const preflightFailed = Promise.withResolvers();
+  const first = open({async submit(input) {
+    assert.equal(input.onThread('fixture-thread'), true);
+    return {turn: {id: 'fixture-turn', status: 'inProgress'}};
+  }, async interrupt() {
+    preflightFailed.resolve();
+    throw new Error('Connection lost before the send gate');
+  }});
+  await first.start(project, request);
+  assert.equal((await first.cancel(project, request.id)).operation.phase, 'cancelling');
+  await preflightFailed.promise;
+  first.close();
+  let observations = 0, sends = 0, events;
+  const restarted = open({onEvent(callback) { events = callback; },
+    async findSubmission(...args) {
+      assert.deepEqual(args, [workspace, 'fixture-thread', request.id, 'fixture-turn']);
+      observations++;
+      return {id: 'fixture-turn', status: 'inProgress'};
+    },
+    async interrupt(scope, thread, turn, beforeSend) {
+      assert.deepEqual([scope, thread, turn], [workspace, 'fixture-thread', 'fixture-turn']);
+      beforeSend();
+      sends++;
+      events('turn/completed', {threadId: thread, turn: {id: turn, status: 'interrupted'}});
+    }});
+  await restarted.read(project, request.id);
+  await until(async () => (await restarted.read(project, request.id)).operation.phase === 'cancelled');
+  assert.equal(observations, 1);
+  assert.equal(sends, 1);
+});
+
+test('cancellation rechecks current workspace authorization in the wire send gate', async t => {
+  const {project, authorize, open} = await fixture(t);
+  const beforeScopeRead = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const afterGate = Promise.withResolvers();
+  let sent = false;
+  const operations = open({async submit(input) {
+    assert.ok(input.onThread('fixture-thread'));
+    return {turn: {id: 'fixture-turn', status: 'inProgress'}};
+  }, async interrupt(_scope, _thread, _turn, beforeSend) {
+    beforeScopeRead.resolve();
+    await release.promise;
+    try { beforeSend(); sent = true; }
+    catch (error) { afterGate.resolve(error.status); }
+    finally { afterGate.resolve(null); }
+  }});
+  const request = {id: 'cancel-auth-fence', prompt: 'A fixture'};
+  await operations.start(project, request);
+  assert.equal((await operations.cancel(project, request.id)).operation.phase, 'cancelling');
+  await beforeScopeRead.promise;
+  try { await authorize(false); }
+  finally { release.resolve(); }
+  assert.equal(await afterGate.promise, 409);
+  assert.equal(sent, false);
+  assert.equal((await operations.read(project, request.id)).operation.phase, 'cancelling');
+});
+
+test('a pause that fails before its wire gate leaves cancellation free to send once', async t => {
+  const {project, workspace, open} = await fixture(t);
+  const request = {id: 'cancel-after-unsent-pause', prompt: 'A fixture'};
+  let paused = 0, reads = 0, sent = 0, events;
+  const first = open({async submit(input) {
+    assert.ok(input.onThread('fixture-thread'));
+    return {turn: {id: 'fixture-turn', status: 'inProgress'}};
+  }, async interrupt() {
+    paused++;
+    throw new Error('Failed before pause reached the send gate');
+  }});
+  await first.start(project, request);
+  assert.equal((await first.interrupt(project, request.id)).operation.phase, 'unconfirmed');
+  assert.equal(paused, 1);
+  first.close();
+  const second = open({onEvent(callback) { events = callback; },
+    async findSubmission(...args) {
+      assert.deepEqual(args, [workspace, 'fixture-thread', request.id, 'fixture-turn']);
+      reads++;
+      return {id: 'fixture-turn', status: 'inProgress'};
+    },
+    async interrupt(_scope, thread, turn, beforeSend) {
+      beforeSend();
+      sent++;
+      events('turn/completed', {threadId: thread, turn: {id: turn, status: 'interrupted'}});
+    }});
+  assert.equal((await second.cancel(project, request.id)).operation.phase, 'cancelling');
+  await until(async () => (await second.read(project, request.id)).operation.phase === 'cancelled');
+  assert.equal(reads, 1);
+  assert.equal(sent, 1);
+});
+
+test('a late pause cannot reach its wire gate after cancellation takes the receipt', async t => {
+  const {project, open} = await fixture(t);
+  const entered = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  let staleSent = false, cancelledSent = false, events;
+  const pausing = open({async submit(input) {
+    assert.ok(input.onThread('fixture-thread'));
+    return {turn: {id: 'fixture-turn', status: 'inProgress'}};
+  }, async interrupt(_scope, _thread, _turn, beforeSend) {
+    entered.resolve();
+    await release.promise;
+    beforeSend?.();
+    staleSent = true;
+  }});
+  const cancelling = open({onEvent(callback) { events = callback; },
+    async interrupt(_scope, _thread, _turn, beforeSend) { beforeSend(); cancelledSent = true; }});
+  const request = {id: 'cancel-before-pause-wire', prompt: 'A fixture'};
+  await pausing.start(project, request);
+  const pause = pausing.interrupt(project, request.id);
+  await entered.promise;
+  try {
+    assert.equal((await cancelling.cancel(project, request.id)).operation.phase, 'cancelling');
+    release.resolve();
+    assert.equal((await pause).operation.phase, 'cancelling');
+    assert.equal(staleSent, false);
+    await until(() => cancelledSent);
+    events('turn/completed', {threadId: 'fixture-thread', turn: {id: 'fixture-turn', status: 'interrupted'}});
+    assert.equal((await cancelling.read(project, request.id)).operation.phase, 'cancelled');
+  } finally { release.resolve(); }
+});
+
+test('migration treats an old unconfirmed pause with a known turn as possibly sent', async t => {
+  const {project, database, open} = await fixture(t);
+  const request = {id: 'cancel-legacy-pause', prompt: 'A fixture'};
+  const first = open({async submit(input) {
+    assert.ok(input.onThread('fixture-thread'));
+    return {turn: {id: 'fixture-turn', status: 'inProgress'}};
+  }, async interrupt() { throw new Error('Unconfirmed old pause'); }});
+  await first.start(project, request);
+  assert.equal((await first.interrupt(project, request.id)).operation.phase, 'unconfirmed');
+  first.close();
+  const legacy = database();
+  try { legacy.exec('ALTER TABLE codex_operations DROP COLUMN interruptionDispatchedAt'); }
+  finally { legacy.close(); }
+  let events, sent = 0;
+  const migrated = open({onEvent(callback) { events = callback; },
+    async findSubmission() { return {id: 'fixture-turn', status: 'inProgress'}; },
+    async interrupt(_scope, _thread, _turn, beforeSend) { beforeSend(); sent++; }});
+  assert.equal((await migrated.cancel(project, request.id)).operation.phase, 'cancelling');
+  assert.equal((await migrated.read(project, request.id)).operation.phase, 'cancelling');
+  const preserved = database();
+  try {
+    const evidence = preserved.prepare('SELECT interruptionDispatchedAt, cancellationDispatchedAt FROM codex_operations WHERE id=?')
+      .get(request.id);
+    assert.ok(evidence.interruptionDispatchedAt);
+    assert.equal(evidence.cancellationDispatchedAt, evidence.interruptionDispatchedAt);
+  } finally { preserved.close(); }
+  events('turn/completed', {threadId: 'fixture-thread', turn: {id: 'fixture-turn', status: 'interrupted'}});
+  assert.equal((await migrated.read(project, request.id)).operation.phase, 'cancelled');
+  assert.equal(sent, 0);
 });
