@@ -995,10 +995,17 @@ function markEstimateExpiry(readout, deadline) {
   updateEstimateReadout(readout, Date.now());
 }
 
+function markProjectEstimateExpiry(readout, project, finish) {
+  if (project.measurements?.formalCompletion === 100 && project.schedule?.remainingMinutes?.cautious === 0) return;
+  markEstimateExpiry(readout, Date.parse(finish));
+}
+
 function refreshEstimateReadouts() {
-  if (document.hidden || dom.shell.hidden || ui.view !== 'dashboard') return;
+  if (document.hidden || dom.shell.hidden) return;
+  const scope = ui.view === 'dashboard' ? dom.content : dom.content.querySelector('#chat-development:not([hidden])');
+  if (!scope) return;
   const now = Date.now();
-  for (const readout of dom.content.querySelectorAll('[data-estimate-expires]')) updateEstimateReadout(readout, now);
+  for (const readout of scope.querySelectorAll('[data-estimate-expires]')) updateEstimateReadout(readout, now);
 }
 
 function taskEstimateReadout(task) {
@@ -1211,7 +1218,6 @@ function projectDetail() {
   }
   const m = project.measurements ?? {};
   const record = project.deliveryRecord;
-  const completed = m.formalCompletion === 100 && project.schedule?.remainingMinutes?.cautious === 0;
   const wholeProgress = ['implementationCompletion', 'formalCompletion', 'verifiedCompletion', 'usableCompletion']
     .some(key => Number.isFinite(m[key]));
   if (record && !wholeProgress) metric(facts, '案件全体の完成率', '不明');
@@ -1223,11 +1229,11 @@ function projectDetail() {
   }
   if (!record || m.estimateFinish || record.firstUsable) {
     const finish = metric(facts, '完成予定', time(m.estimateFinish));
-    if (!completed) markEstimateExpiry(finish, Date.parse(m.estimateFinish));
+    markProjectEstimateExpiry(finish, project, m.estimateFinish);
   }
   if (project.schedule?.originalDueAt) metric(facts, '当初の完成予定', time(project.schedule.originalDueAt));
   const wholeTime = metric(facts, '案件全体の残り作業時間', estimateLabel(project.schedule?.remainingMinutes));
-  if (!completed) markEstimateExpiry(wholeTime, Date.parse(project.schedule?.estimatedFinish));
+  markProjectEstimateExpiry(wholeTime, project, project.schedule?.estimatedFinish);
   if (!record || Number.isFinite(m.activeMinutes)) {
     metric(facts, '累計実作業時間', Number.isFinite(m.activeMinutes) ? m.activeMinutes + '分' : null);
   }
@@ -1995,8 +2001,10 @@ function chatDevelopmentPanel(project) {
   const metrics = node('dl', 'properties');
   metric(metrics, '案件の記録', stateLabels[project.state]);
   metric(metrics, '正式な要求達成率', project.measurements?.formalCompletion, true);
-  metric(metrics, '残り作業時間', estimateLabel(project.schedule?.remainingMinutes));
-  metric(metrics, '完成予定', time(project.measurements?.estimateFinish));
+  const remaining = metric(metrics, '残り作業時間', estimateLabel(project.schedule?.remainingMinutes));
+  markProjectEstimateExpiry(remaining, project, project.schedule?.estimatedFinish);
+  const finish = metric(metrics, '完成予定', time(project.measurements?.estimateFinish));
+  markProjectEstimateExpiry(finish, project, project.measurements?.estimateFinish);
   metric(metrics, '案件データの取得時刻', time(project.observedAt ?? ui.portfolio?.observedAt));
   area.body.append(metrics);
   if (project.schedule?.delayed === true) area.body.append(node('p', 'chip notice-chip', '当初予定に対して遅延しています'));
@@ -2025,6 +2033,7 @@ function syncChatDevelopment() {
   }
   panel.hidden = !visible;
   panel.parentElement.classList.toggle('with-development', visible);
+  if (visible) refreshEstimateReadouts();
 }
 
 function chat() {
