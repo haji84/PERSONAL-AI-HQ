@@ -1202,6 +1202,109 @@ function requirementsReview(project) {
   return details;
 }
 
+function forecastDateLabel(dates) {
+  if (!dates) return '確定待ち';
+  if (dates.optimistic === dates.cautious) return time(dates.standard);
+  return '最短 ' + time(dates.optimistic) + ' ／ 標準 ' + time(dates.standard) + ' ／ 慎重 ' + time(dates.cautious);
+}
+
+function projectForecastPanel(project) {
+  const forecast=project.forecast;
+  if (!forecast) return null;
+  const details=node('section','stack');
+  details.id='project-forecast';
+  details.append(node('h3','','完成までの見通し'));
+  const {schedule,actual,baseline}=forecast;
+  const facts=node('dl','properties');
+  const checks=forecast.checkpoints;
+  if (checks) metric(facts,'記録済みの受入チェック',taskProgressLabel(checks));
+  if (forecast.progress) {
+    metric(facts,'実装完成率',forecast.progress.implementationCompletion,true);
+    metric(facts,'正式な要求達成率',forecast.progress.formalCompletion,true);
+    metric(facts,'実用完成率',forecast.progress.usableCompletion,true);
+  }
+  if (forecast.stage) metric(facts,'現在の工程',forecast.stage);
+  const work=schedule.workMinutes??schedule.recordedWorkMinutes;
+  if (work) metric(facts,'記録のある工程の残工数',estimateLabel(work));
+  if (schedule.elapsedMinutes) metric(facts,'条件がそろった後の所要時間',estimateLabel(schedule.elapsedMinutes));
+  metric(facts,'全要求の完成予定（日本時間）',forecastDateLabel(schedule.completionDates));
+  if (actual.firstUsableAt) metric(facts,'初回の実用版を提供した日時',time(actual.firstUsableAt));
+  else if (schedule.firstUsableDates) metric(facts,'最初の実用成果物の予定',forecastDateLabel(schedule.firstUsableDates));
+  if (forecast.nextAction) metric(facts,'次に実行する作業',forecast.nextAction);
+  if (forecast.ownerAction) metric(facts,'利用者の対応',forecast.ownerAction);
+  const blocking=asArray(forecast.tasks).find(task=>task.blocker||task.ownerAction);
+  if (blocking?.blocker) metric(facts,'現在の障害',blocking.blocker);
+  if (blocking?.cause) metric(facts,'障害の原因',blocking.cause);
+  if (blocking?.resolution) metric(facts,'解消方法',blocking.resolution);
+  if (!schedule.completionDates) {
+    const condition=asArray(forecast.gaps).find(gap=>['scope','external-wait','calendar'].includes(gap.code));
+    if (condition) metric(facts,'完成予定を更新できる条件',condition.action);
+  }
+  details.append(facts);
+  const source=forecast.source && link(forecast.source.label,forecast.source.url);
+  if (source) details.append(source);
+  const expanded=node('details','scope-info forecast-details');
+  expanded.append(node('summary','','残工程・見積もりの根拠'));
+  const timings=node('dl','properties');
+  const original=baseline.original??baseline.retrospective;
+  if (original?.minutes) metric(timings,baseline.kind==='retrospective'?'開始後の事後推定':'開始時の見積もり',estimateLabel(original.minutes));
+  if (original?.basis) metric(timings,'見積もりの根拠',original.basis);
+  if (baseline.revisionReason) metric(timings,'見積もりの変更理由',baseline.revisionReason);
+  if (schedule.criticalPathMinutes) metric(timings,'依存工程の最長経路',estimateLabel(schedule.criticalPathMinutes));
+  const variance=schedule.forecastDeltaMinutes;
+  if (Number.isFinite(variance)) metric(timings,'当初予定との差',variance===0?'差なし':
+    estimateLabel({optimistic:Math.abs(variance),standard:Math.abs(variance),cautious:Math.abs(variance)}) + (variance>0?'遅れ':'前倒し'));
+  else if (schedule.delayed===true) metric(timings,'当初予定との差','期日超過、差分の見積もり待ち');
+  for (const [label,minutes] of [['累計実作業時間',actual.activeMinutes],['担当別の作業時間合計',actual.agentMinutes],
+    ['累計経過時間',actual.elapsedMinutes],['停止・待機時間',actual.waitingMinutes]]) {
+    if (Number.isFinite(minutes)) metric(timings,label,deliveryDuration(Math.round(minutes*60)));
+  }
+  if (forecast.observedAt) metric(timings,'最終観測',time(forecast.observedAt));
+  metric(timings,'次回の確認',forecast.nextUpdate.at ? time(forecast.nextUpdate.at) :
+    {'owner-resume':'再開時','owner-action':'利用者の対応が済んだとき'}[forecast.nextUpdate.trigger]??
+    '正本に次の作業・観測が記録されたとき');
+  expanded.append(timings);
+  const byId=new Map(asArray(forecast.tasks).map(task=>[task.id,task]));
+  const taskIds=asArray(schedule.orderedTaskIds);
+  const tasks=taskIds.length?taskIds.map(id=>byId.get(id)).filter(Boolean):[...byId.values()];
+  if (tasks.length) {
+    const list=node('ol','task-progress-list');
+    for (const task of tasks) {
+      const item=node('li','stack');
+      item.append(node('strong','',task.title),taskStatus(task));
+      const work=node('dl','properties');
+      metric(work,'残り作業時間',task.expired?'再見積もり待ち':estimateLabel(task.remainingMinutes));
+      const predecessor=asArray(task.dependencies).map(id=>byId.get(id)?.title).filter(Boolean);
+      if (predecessor.length) metric(work,'先に完了する工程',predecessor.join('、'));
+      const owners=[task.owner,task.device].filter(Boolean);
+      if (owners.length) metric(work,'担当AI・端末',owners.join(' ／ '));
+      if (task.cause) metric(work,'障害の原因',task.cause);
+      if (task.resolution) metric(work,'解消方法',task.resolution);
+      if (task.ownerAction) metric(work,'利用者の対応',task.ownerAction);
+      if (task.nextAction) metric(work,'次の作業',task.nextAction);
+      if (task.estimate?.basis) metric(work,'根拠',task.estimate.basis);
+      if (task.estimate?.confidence) metric(work,'確度',{low:'低',medium:'中',high:'高'}[task.estimate.confidence]);
+      item.append(work);
+      appendStrings(item,[...asArray(task.remaining),...asArray(task.estimate?.assumptions),...asArray(task.estimate?.evidence)]);
+      list.append(item);
+    }
+    expanded.append(list);
+  }
+  const gaps=[...asArray(forecast.gaps),...asArray(forecast.diagnostics)];
+  if (gaps.length) {
+    const list=node('ul','rows');
+    for (const gap of gaps) {
+      const item=node('li','stack');
+      item.append(node('strong','',gap.reason),node('p','muted',gap.action));
+      if (gap.investigationMinutes) item.append(node('p','small muted','確認に必要な時間の目安 '+estimateLabel(gap.investigationMinutes)));
+      list.append(item);
+    }
+    expanded.append(node('h4','','確認が必要な情報と対応'),list);
+  }
+  details.append(expanded);
+  return details;
+}
+
 function projectDetail() {
   const project = selectedProject();
   const detail = panel(project ? text(project.name) : 'プロジェクト詳細');
@@ -1215,9 +1318,11 @@ function projectDetail() {
   if (project.summary) detail.body.append(node('p', 'muted', project.summary));
   if (project.scopeRequired) detail.body.append(node('p', 'muted', '実行を始めるには、ホスト側で作業先と実行権限を設定してください。'));
   const facts = node('dl', 'properties');
+  const forecast = projectForecastPanel(project);
   if (project.registration === 'github') {
     metric(facts, 'GitHubでの取得時刻', time(project.observedAt));
     detail.body.append(facts);
+    if (forecast) detail.body.append(forecast);
     const source = link('GitHubでリポジトリを開く', project.repository);
     if (source) detail.body.append(source);
     const registration = !ui.registrationIntents.has(project.id) && projectRegistrationForm(project);
@@ -1246,6 +1351,7 @@ function projectDetail() {
     metric(facts, '累計実作業時間', Number.isFinite(m.activeMinutes) ? m.activeMinutes + '分' : null);
   }
   metric(facts, '情報の取得時刻', time(project.observedAt ?? ui.portfolio?.observedAt));
+  if (forecast) detail.body.append(forecast);
   detail.body.append(facts);
   if (record) detail.body.append(deliveryRecordDetails(record));
   if (record?.requirementsReview === true) detail.body.append(requirementsReview(project));
@@ -1440,6 +1546,8 @@ function dashboard() {
         execution.dataset.executionSummary = '';
         row.firstElementChild.append(execution);
         paintDashboardExecution(execution, item);
+        const checks=item.forecast?.checkpoints;
+        if (checks) row.firstElementChild.append(node('span','small muted','記録済みの受入 '+checks.accepted+'/'+checks.total+'件'));
       }
       list.append(listItem(row));
     }
@@ -3959,7 +4067,7 @@ function canRefreshVisibleDashboard() {
   const focused = document.activeElement;
   const editing = focused?.matches('input, select, textarea, [contenteditable="true"]');
   const pairing = dom.content.querySelector('[data-pair-expires-at]');
-  return !editing && !dom.content.querySelector('details[open]') && !(Date.parse(pairing?.dataset.pairExpiresAt) > Date.now());
+  return !editing && !dom.content.querySelector('details[open]:not(.forecast-details)') && !(Date.parse(pairing?.dataset.pairExpiresAt) > Date.now());
 }
 async function refreshVisibleDashboard() {
   refreshEstimateReadouts();
@@ -3975,10 +4083,13 @@ async function refreshVisibleDashboard() {
     dom['page-summary'].textContent = dashboardSummary();
     if (JSON.stringify(latest) === JSON.stringify(ui.portfolio)) return;
     const focusedProject = document.activeElement?.dataset?.dashboardProject;
+    const forecastOpen = dom.content.querySelector('.forecast-details')?.open;
     rememberScroll();
     ui.portfolio = latest;
     updateProjectSelect();
     render(true, true);
+    const forecastDetails = dom.content.querySelector('.forecast-details');
+    if (forecastOpen && forecastDetails) forecastDetails.open = true;
     if (focusedProject) dashboardProjectRow(focusedProject)?.focus({preventScroll: true});
   } catch {
     if (isCurrent()) dom['page-summary'].textContent = dashboardSummary() + ' · 更新できません。前回の情報を表示しています。';

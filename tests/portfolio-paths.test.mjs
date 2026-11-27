@@ -81,3 +81,31 @@ test('the private portfolio publishes task-level evidence, estimates and unavail
   assert.deepEqual(legacy.tasks, []);
   assert.deepEqual(legacy.remaining, ['古い記録']);
 });
+
+test('new and historical project forecasts are readable without changing saved execution settings or stops', async t => {
+  const {randomUUID} = await import('node:crypto');
+  const {registerProject,readProjectInitialExecution} = await import('../app/portfolio.mjs');
+  const directory = await mkdtemp(join(tmpdir(), 'hq-development-forecasts-'));
+  t.after(() => rm(directory, {recursive: true, force: true}));
+  const initial = {observedAt:'2026-11-28T02:00:00+09:00',projects:[
+    {id:'held',name:'停止案件',goal:'既存のGOAL',state:'paused',remaining:['照合待ち']},
+  ]};
+  await writeFile(join(directory,'portfolio.json'),JSON.stringify(initial));
+  const input={requestId:randomUUID(),name:'新規案件',goal:'成果物と必要な確認を照合する',settings:{mode:'subscription-only'}};
+  const work={hasSavedWork:()=>false};
+  const {id}=registerProject(directory,input,work);
+  const read = async () => (await readPortfolio(directory)).view.projects;
+  const [held, newProject]=await read();
+  assert.equal(held.state,'paused');
+  assert.equal(held.forecast.schedule.completionDates,null);
+  assert.deepEqual(held.forecast.schedule.readyTaskIds,[]);
+  assert.ok(held.forecast.gaps.some(gap=>gap.code==='scope'));
+  assert.equal(newProject.forecast.stage,'着手前');
+  assert.equal(newProject.forecast.baseline.kind,'original');
+  assert.ok(newProject.forecast.tasks[0].remainingMinutes.standard>0);
+  assert.equal(newProject.forecast.schedule.completionDates,null);
+  assert.equal(readProjectInitialExecution(directory,id).settings.mode,'subscription-only');
+  assert.equal(registerProject(directory,input,work).created,false);
+  const [,again]=await read();
+  assert.deepEqual(again.forecast.baseline,newProject.forecast.baseline);
+});

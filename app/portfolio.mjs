@@ -3,8 +3,8 @@ import {closeSync, fsyncSync, lstatSync, openSync, readFileSync, renameSync, unl
 import {lstat, realpath} from 'node:fs/promises';
 import {isAbsolute, join, resolve} from 'node:path';
 import {isDeepStrictEqual} from 'node:util';
-import {deliveryProgress, remainingEstimate, requirementProgress, taskHasOpenWork, taskIsVerified} from './progress.mjs';
-import {readDeliveryRecord, readPortfolioTaskRecords, tasksForRepository} from './delivery-records.mjs';
+import {deliveryProgress, developmentForecast, remainingEstimate, requirementProgress, taskHasOpenWork, taskIsVerified} from './progress.mjs';
+import {readDeliveryRecord, readPortfolioTaskRecords, readProjectForecastState, tasksForRepository} from './delivery-records.mjs';
 import {normalizeSettings} from './execution-policy.mjs';
 
 export const projectKey = /^[a-z0-9][a-z0-9_.-]{0,79}$/i;
@@ -209,6 +209,28 @@ function saveRegistration(file, before, raw) {
   }
 }
 
+function initialDelivery(observedAt, fromGithub) {
+  const minutes = {optimistic:3,standard:6,cautious:12};
+  const basis = '既にある要求・作業先を一度読み合わせる短い初回調査の計画値';
+  const assumptions = [fromGithub ? '登録候補の既存リポジトリと要求にアクセスできる場合' : '提示されたGOALと既存資料を読み戻せる場合',
+    '最初の要求確認の工数。機能実装・認証待ち・全体の完成時期は別途算定する。'];
+  const title = 'GOAL・受入条件・作業先を照合する';
+  return {observationAt:observedAt,stage:'着手前',scopeComplete:false,investigationMinutes:minutes,
+    estimates:[{kind:'original',target:'requirements-readback',recordedAt:observedAt,minutes,basis,assumptions}],
+    nextAction:title,tasks:[{id:'requirements-readback',title,status:'pending',actionable:false,
+      remainingMinutes:minutes,estimate:{basis,assumptions,confidence:'low'},observedAt}]};
+}
+
+function forecastInput(project, local, tracking, deliveryRecord) {
+  const recorded = local?.tasks?.length ? local : tracking ? {...tracking.delivery,tasks:tracking.tasks,
+    observationAt:date(tracking.delivery?.observationAt)??tracking.observationAt} : local;
+  if (recorded) return {...recorded,goal:recorded.goal??project.goal,
+    firstUsableAt:recorded.firstUsableAt??deliveryRecord?.firstUsable?.actualAt};
+  return {goal:project.goal,observationAt:project.observedAt,scopeComplete:false,
+    firstUsableAt:deliveryRecord?.firstUsable?.actualAt,
+    tasks:project.remaining.map((title,index)=>({id:'remaining-'+(index+1),title,status:'unknown',actionable:false})),
+    nextAction:project.registration==='github' ? '対象案件を登録し、GOALと作業範囲を照合する。' : undefined};
+}
 // The caller holds the existing SQLite writer lock while replacing the portfolio.
 export function registerProject(directory, input, {github, hasSavedWork}) {
   if (!input || typeof input !== 'object' || Array.isArray(input) ||
@@ -256,6 +278,7 @@ export function registerProject(directory, input, {github, hasSavedWork}) {
 
   const updatedAt = new Date().toISOString();
   const row = {id, name: candidate ? candidate.name : name, goal, state:'waiting', observedAt:updatedAt,
+    delivery:initialDelivery(updatedAt,fromGithub),
     ...(candidate && {repository:candidate.repository}), registrationRequestId:input.requestId, registrationFingerprint:fingerprint,
     initialExecution:{updatedAt, settings, sha256:digest([id, updatedAt, orderedSettings(settings)])}};
   const definition = before ? raw : {observedAt:updatedAt, artifacts:[]};
@@ -296,6 +319,7 @@ export async function readPortfolio(directory, githubProjects, refreshGithub = f
     raw.taskProgressSource ? readPortfolioTaskRecords(raw.taskProgressSource) : null,
   ]) : [[], null];
   const deliveryRecords = new Map(deliveryEntries);
+  const localDelivery = new Map(raw.projects.map(row=>[row.id,row.delivery]));
   const visible = [...projects, ...discovered];
   const taskMatches = new Map();
   for (const row of projects) {
@@ -303,6 +327,9 @@ export async function readPortfolio(directory, githubProjects, refreshGithub = f
     if (record) taskMatches.set(record, (taskMatches.get(record) ?? 0) + 1);
   }
   const unmatchedTaskRecords = [...(taskRecords?.projects.values() ?? [])].filter(record => taskMatches.get(record) !== 1).length;
+  const scopedStates = new Map(refreshGithub ? await Promise.all(projects.filter(project=>project.cwd.length===1 &&
+    project.repository && !localDelivery.get(project.id) && !tasksForRepository(taskRecords,project.repository)).map(async project=>
+    [project.id,await readProjectForecastState(project.cwd[0],project.repository)])) : []);
   const rawArtifacts = Array.isArray(raw.artifacts) ? raw.artifacts.slice(0, 150) : [];
   const artifacts = (await Promise.all(rawArtifacts.map(row => normalizeArtifact(row, byId, observedAt)))).filter(Boolean);
   if (new Set(artifacts.map(row => row.id)).size !== artifacts.length) throw new Error('Duplicate artifact');
@@ -321,8 +348,15 @@ export async function readPortfolio(directory, githubProjects, refreshGithub = f
         {status: 'unavailable'}}),
       projects: visible.map(({cwd, handoverRequirements, nativeHandover, ...project}) => {
         const tracking = byId.has(project.id) && tasksForRepository(taskRecords, project.repository);
-        if (!project.tasks.length && tracking && taskMatches.get(tracking) === 1) project.tasks = taskProgress(tracking);
+        const matched = tracking && taskMatches.get(tracking) === 1 ? tracking : null;
+        if (!project.tasks.length && matched) project.tasks = taskProgress(matched);
         const deliveryRecord = deliveryRecords.get(project.id);
+        const scoped = scopedStates.get(project.id);
+        const projectHeld = ['paused','completed','blocked','approval','limit','offline'].includes(project.state);
+        const forecast = developmentForecast(scoped?.delivery??forecastInput(project,localDelivery.get(project.id),matched,deliveryRecord),
+          {goal:project.goal,status:projectHeld?project.state:scoped?.status??project.state,
+            nextAction:scoped?.nextAction??deliveryRecord?.nextAction,verifiedTaskIds:scoped?.verifiedTaskIds});
+        project.forecast = {...forecast,source:scoped?.source??(matched?taskRecords.source:null)};
         if (deliveryRecord) {
           project.deliveryRecord = deliveryRecord;
           if (deliveryRecord.scope === '統合アプリの初回提供') {
