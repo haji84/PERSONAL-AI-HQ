@@ -406,14 +406,15 @@ export async function readPortfolio(directory, githubProjects, refreshGithub = f
         const portableLocal = Boolean(shared?.localProjectId && !scoped);
         const projectHeld = ['paused','completed','blocked','approval','limit','offline'].includes(project.state);
         const input = scoped?.delivery ?? forecastInput(project,local,shared,deliveryRecord);
-        if (project.scopeRequired || portableLocal) {
+        if (project.scopeRequired) {
           input.ownerAction = ['ホスト側でこの案件の作業先と実行権限を設定する。',text(input.ownerAction,360)].filter(Boolean).join(' ');
           delete input.ownerActionAppliesTo;
         }
         const forecast = developmentForecast(input,
           {goal:project.goal,status:projectHeld?project.state:scoped?.status??project.state,
             nextAction:scoped?.nextAction??input.nextAction??deliveryRecord?.nextAction,
-            verifiedTaskIds:scoped?.verifiedTaskIds??(portableLocal?new Set():undefined)});
+            verifiedTaskIds:scoped?.verifiedTaskIds??(portableLocal?new Set():undefined),
+            workspaceUnconfirmed:portableLocal});
         if (isIntake && (scoped || shared)) {
           forecast.baseline.intake = developmentForecast({estimates:local.estimates}).baseline.original;
         }

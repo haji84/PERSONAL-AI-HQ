@@ -553,7 +553,9 @@ test('the existing shared observation can carry a local project across devices b
     stage:'Evidence check',scopeComplete:true,capacity:{calendar:'continuous'}}};
   const path=initiative+'/portfolio-observation.json';
   const saved=await commit({[path]:JSON.stringify({taskProgress:{observedAt,projects:[],localProjects:[localRecord]}})});
-  const local={id,name:'Same name'};
+  const registeredWorkspace=join(directory,'local-workspace');
+  await mkdir(registeredWorkspace);
+  const local={id,name:'Same name',cwd:[registeredWorkspace]};
   await configure([local,{id:'different',name:'Same name'}]);
   const settings=JSON.parse(await readFile(portfolioPath,'utf8'));
   settings.taskProgressSource={checkout,repository,ref};
@@ -566,6 +568,8 @@ test('the existing shared observation can carry a local project across devices b
   assert.ok(matched.forecast.source.url.includes(saved));
   assert.deepEqual(matched.forecast.schedule.readyTaskIds,[]);
   assert.equal(matched.forecast.schedule.completionDates,null);
+  assert.equal(matched.forecast.ownerAction,null);
+  assert.ok(matched.forecast.gaps.some(({code})=>code==='workspace-observation'));
   assert.equal(other.forecast.source,null);
   assert.equal(portfolio.taskProgressSource.unmatched,0);
 

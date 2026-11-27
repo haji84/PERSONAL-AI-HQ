@@ -1237,7 +1237,9 @@ function projectForecastPanel(project) {
   if (blocking?.cause) metric(facts,'障害の原因',blocking.cause);
   if (blocking?.resolution) metric(facts,'解消方法',blocking.resolution);
   if (!schedule.completionDates) {
-    const condition=asArray(forecast.gaps).find(gap=>['scope','external-wait','calendar'].includes(gap.code));
+    const gaps=asArray(forecast.gaps);
+    const condition=gaps.find(gap=>gap.code==='workspace-observation') ??
+      gaps.find(gap=>['scope','external-wait','calendar'].includes(gap.code));
     if (condition) metric(facts,'完成予定を更新できる条件',condition.action);
   }
   details.append(facts);
