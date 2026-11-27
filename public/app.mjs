@@ -1032,6 +1032,12 @@ function taskStatus(task) {
   return chip(task.status);
 }
 
+function taskProgressLabel(progress) {
+  return progress && Number.isFinite(progress.percent)
+    ? progress.percent + '%（' + progress.accepted + '/' + progress.total + '件確認・残り' +
+      (progress.total - progress.accepted) + '件）' : '算定待ち';
+}
+
 function progressRow(task) {
   const row = node('li', 'task-progress-row');
   const work = node('div');
@@ -1045,10 +1051,7 @@ function progressRow(task) {
   }
   if (task.blocker) work.append(node('p', 'small', task.blocker));
   const metrics = node('dl', 'task-progress-facts');
-  const progress = task.progress;
-  const progressValue = progress && Number.isFinite(progress.percent)
-    ? progress.percent + '%（' + progress.accepted + '/' + progress.total + '件確認・残り' +
-      (progress.total - progress.accepted) + '件）' : '算定待ち';
+  const progressValue = taskProgressLabel(task.progress);
   const remaining = taskEstimateReadout(task);
   for (const [label, value] of [['進捗率', node('dd', 'strong', progressValue)], ['残り作業時間', remaining]]) {
     const entry = node('div');
@@ -2012,7 +2015,10 @@ function chatDevelopmentPanel(project) {
   if (task) {
     const current = node('p', 'task-title');
     current.append(node('strong', '', task.title), taskStatus(task));
-    area.body.append(node('h3', '', '確認が残るタスク'), current);
+    const taskMetrics = node('dl', 'properties');
+    metric(taskMetrics, 'タスクの進捗率', taskProgressLabel(task.progress));
+    taskMetrics.append(node('dt', '', 'タスクの残り作業時間'), taskEstimateReadout(task));
+    area.body.append(node('h3', '', '確認が残るタスク'), current, taskMetrics);
     if (task.observedAt) area.body.append(node('p', 'small muted', 'タスクの記録 ' + time(task.observedAt)));
   }
   if (ui.capabilities.executionActivity === true) area.body.append(activityPanel());
