@@ -9,7 +9,7 @@ import {ensurePrivateDirectory} from '../app/private-directory.mjs';
 
 const seed = {
   observedAt: '2026-11-27T06:25:00.000Z',
-  projects: [{id: 'example', name: '検証用プロジェクト', state: 'unknown', goal: '帰属範囲の確認', cwd: '/fixture-scope'}],
+  projects: [{id: 'example', name: '検証用プロジェクト', state: 'unknown', goal: '帰属範囲の確認', cwd: resolve(tmpdir(), 'fixture-scope')}],
   artifacts: [],
 };
 
@@ -22,7 +22,7 @@ async function fixture(t) {
   const app = await startOwnerApp({directory, port: 0, codex: {
     async listThreads(paths) {
       nativeReads++;
-      assert.deepEqual(paths, ['/fixture-scope']);
+      assert.deepEqual(paths, [resolve(tmpdir(), 'fixture-scope')]);
       return {data: [], nextCursor: null};
     },
     async findSubmission() { nativeReads++; return null; },
@@ -76,9 +76,10 @@ test('execution activity is owner-scoped and returns only status metadata', asyn
   const insert = db.prepare(`INSERT INTO codex_operations
     (id,project,workspace,fingerprint,phase,threadId,turnId,createdAt,updatedAt,startedAt,output)
     VALUES (?,?,?,'private-digest',?,'private-thread','private-turn',?,?,?,'private-output')`);
-  insert.run('fixture-operation', 'example', '/fixture-scope', 'interrupted', observedAt, observedAt, observedAt);
-  insert.run('out-of-scope-operation', 'example', '/different-workspace', 'running', '2026-02-01T00:00:00.000Z', observedAt, observedAt);
-  insert.run('different-project-operation', 'another', '/fixture-scope', 'running', '2026-02-01T00:00:00.000Z', observedAt, observedAt);
+  const fixtureScope = seed.projects[0].cwd;
+  insert.run('fixture-operation', 'example', fixtureScope, 'interrupted', observedAt, observedAt, observedAt);
+  insert.run('out-of-scope-operation', 'example', resolve(tmpdir(), 'different-workspace'), 'running', '2026-02-01T00:00:00.000Z', observedAt, observedAt);
+  insert.run('different-project-operation', 'another', fixtureScope, 'running', '2026-02-01T00:00:00.000Z', observedAt, observedAt);
   db.close();
   const url = `${app.url}/api/execution/activity`;
   assert.equal((await fetch(`${url}?project=example`)).status, 401);
