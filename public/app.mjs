@@ -64,6 +64,7 @@ const activityLabels = {
   reserved: '受付済み', sending: 'Codexへの送信を確認中', running: '実行中', interrupting: '中断を要求中',
   unconfirmed: '状態未確認', completed: 'ターン完了', interrupted: '中断済み', failed: '実行失敗',
 };
+const chatSourceLabels = {'chatgpt-export': 'ChatGPTの書き出し', 'chatgpt-live': 'ChatGPTプラン', 'api-development': '通常APIの開発'};
 let requestSequence = 0;
 let mounted = 0;
 let pendingScroll;
@@ -253,7 +254,10 @@ function paintActivity() {
   const phase = !activity.terminal && Date.now() - Date.parse(activity.observedAt) > 30000 ? 'unconfirmed' : activity.phase;
   status.append(chip(phase, activityLabels[phase]),
     node('span', 'muted', '  最終確認 ' + time(activity.observedAt)));
-  section.replaceChildren(node('h3', '', 'このアプリからのCodex実行'), status);
+  const route = activity.kind === 'api' ? '通常API' : 'Codex';
+  section.replaceChildren(node('h3', '', `このアプリからの${route}実行`), status);
+  const details = [text(activity.model, ''), workStageLabels[activity.stage]].filter(Boolean);
+  if (details.length) section.append(node('p', 'small muted', details.join(' · ')));
   section.hidden = false;
 }
 async function pollActivity() {
@@ -282,10 +286,12 @@ async function pollActivity() {
       if (activitySession !== session || (activity !== null && (typeof activity?.id !== 'string' ||
           typeof activity.terminal !== 'boolean' || !Object.hasOwn(activityLabels, activity.phase)))) return;
       activities.set(project, activity);
+      if (activity?.kind === 'api' && (previous?.id !== activity.id || previous.phase !== activity.phase)) evictChats(project);
       if (previous !== undefined && activity?.terminal &&
           (previous?.id !== activity.id || previous.phase !== activity.phase)) {
         const name = projectList().find(item => item.id === project)?.name;
-        const messages = {completed: 'Codexのターンが完了しました。', interrupted: 'Codexの実行が中断されました。', failed: 'Codexの実行に失敗しました。'};
+        const route = activity.kind === 'api' ? '通常API' : 'Codex';
+        const messages = {completed: `${route}の作業が完了しました。`, interrupted: `${route}の実行が中断されました。`, failed: `${route}の実行に失敗しました。`};
         if (name && messages[activity.phase]) setNotice(`${name} · ${messages[activity.phase]}`, activity.phase === 'failed');
       }
     }));
@@ -817,8 +823,12 @@ function planComposer(project, onConversation) {
       if (!prompt) status.textContent = '相談する内容を入力してください。';
       return;
     }
-    const id = crypto.randomUUID();
     const conversationId = reference.checked ? ui.chatIds.get(project) : undefined;
+    if (conversationId?.startsWith('api/')) {
+      status.textContent = '通常APIの記録をChatGPTプランに引き継ぐには、作業の照合が必要です。';
+      return;
+    }
+    const id = crypto.randomUUID();
     ui.chatIntents.set(project, {id, conversationId, model: model.value, prompt});
     ui.chatTurns.set(project, id);
     storeTab();
@@ -965,9 +975,14 @@ function chat() {
         return;
       }
       thread.header.replaceChildren(node('h2', '', text(conversation.title, '会話')));
-      const live = conversation.source === 'chatgpt-live';
-      const source = live ? 'ChatGPTプラン · 開始 ' : 'ChatGPTの書き出し · 取り込み ';
-      destination.append(node('p', 'small muted', source + time(conversation.importedAt)));
+      const apiArchive = conversation.source === 'api-development';
+      const source = chatSourceLabels[conversation.source] ?? '取得元未確認';
+      const observed = conversation.source === 'chatgpt-export' ? '取り込み ' : '更新 ';
+      destination.append(node('p', 'small muted', `${source} · ${observed}${time(conversation.importedAt)}`));
+      if (apiArchive) {
+        const status = conversation.outcome === 'in_progress' ? '実行中' : activityLabels[conversation.outcome] ?? '状態未確認';
+        destination.append(node('p', 'small muted', [status, text(conversation.model, '')].filter(Boolean).join(' · ')));
+      }
       const messages = node('div', 'messages messages-embedded');
       destination.append(messages);
       if (!messagesInto(messages, conversation.messages)) {
@@ -979,7 +994,7 @@ function chat() {
         moveToDraft(project, 'codex', recent, 'この案件でのChatGPTの回答');
       });
       function updateTransfer() {
-        transfer.hidden = !asArray(conversation.messages).some(message => message.role === 'assistant' && message.text);
+        transfer.hidden = apiArchive || !asArray(conversation.messages).some(message => message.role === 'assistant' && message.text);
       }
       const load = button('続きの発言を表示', async () => {
         load.disabled = true;
@@ -1021,7 +1036,7 @@ function chat() {
       const rows = node('ul', 'rows');
       for (const conversation of conversations) {
         rows.append(listItem(rowButton(text(conversation.title, '無題の会話'),
-          (conversation.source === 'chatgpt-live' ? 'ChatGPTプラン · ' : '取り込み ') + time(conversation.importedAt),
+          `${chatSourceLabels[conversation.source] ?? '取得元未確認'} · ${time(conversation.importedAt)}`,
           ui.chatIds.get(project) === conversation.id, event => {
             ui.chatIds.set(project, conversation.id);
             storeTab();
@@ -1073,6 +1088,7 @@ const finishedPhases = new Set(['completed', 'interrupted', 'failed']);
 
 const apiWorkMessages = {
   API_AUTHORIZATION_REQUIRED: 'この端末の通常API認証を確認できません。',
+  API_RUNTIME_UNSUPPORTED: 'この端末で通常APIの隔離実行を確認できません。',
   API_AUTHORITY_MISSING: '本人が確認したAPIの組織・費用設定がありません。',
   API_AUTHORITY_UNSAFE: '通常APIの設定ファイルの所有権とアクセス権を確認してください。',
   API_AUTHORITY_UNBOUND: '通常APIを許可する組織の予算管理先を確認できません。',

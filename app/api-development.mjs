@@ -16,8 +16,25 @@ const digest = value => sha(JSON.stringify(value));
 const problem = (status, code) => Object.assign(new Error(code), {status, code});
 const publicPhase = {reserved: 'reserved', running: 'running', uncertain: 'unconfirmed', awaiting_settlement: 'unconfirmed',
   completed: 'completed', failed: 'failed', interrupted: 'interrupted', cancelled: 'interrupted'};
+const terminalPhases = new Set(['completed', 'failed', 'interrupted']);
+const observedAt = work => work.completedAt ?? work.settlementObservedAt ?? work.dispatchedAt ?? work.createdAt;
 
-export function createApiDevelopment({directory, store, withProjectWorkLock, hasNativeWork,
+function currentPhase(work, local) {
+  if (local?.controller.signal.aborted && ['reserved', 'running'].includes(work.status)) return 'interrupting';
+  if (!local && work.status === 'running') return 'unconfirmed';
+  return publicPhase[work.status];
+}
+
+function latestApiActivity(store, projectId, localJob) {
+  const {operation} = store.getWork(projectId);
+  if (operation?.route !== 'api') return null;
+  const phase = currentPhase(operation, localJob(operation.executionId));
+  return {id: operation.taskId, kind: 'api', phase, route: operation.route, model: operation.model, stage: operation.task?.stage,
+    observedAt: observedAt(operation), createdAt: operation.createdAt, startedAt: operation.dispatchedAt ?? null,
+    terminal: terminalPhases.has(phase)};
+}
+
+export function createApiDevelopment({directory, store, conversations, withProjectWorkLock, hasNativeWork,
   getKey = () => process.env.OPENAI_API_KEY, fetchImpl, readAuthority = readApiAuthority}) {
   const jobs = new Map();
   const artifacts = join(directory, 'api-work');
@@ -39,9 +56,10 @@ export function createApiDevelopment({directory, store, withProjectWorkLock, has
   }
 
   function authorized(projectId, forDispatch = true) {
-    const owned = ownedProject(projectId);
+    if (process.platform !== 'darwin') throw problem(409, 'API_RUNTIME_UNSUPPORTED');
     const key = getKey();
-    if (process.platform !== 'darwin' || typeof key !== 'string' || !key.trim()) throw problem(409, 'API_AUTHORIZATION_REQUIRED');
+    if (typeof key !== 'string' || !key.trim()) throw problem(409, 'API_AUTHORIZATION_REQUIRED');
+    const owned = ownedProject(projectId);
     let authority;
     try { authority = readAuthority(directory, Date.now(), {forDispatch}); }
     catch (cause) { throw problem(409, cause.code ?? 'API_AUTHORITY_INVALID'); }
@@ -84,16 +102,23 @@ export function createApiDevelopment({directory, store, withProjectWorkLock, has
 
   function view(project, work) {
     if (!work || work.route !== 'api') return {operation: null};
-    const local = jobs.get(work.executionId);
-    const phase = local?.controller.signal.aborted && ['reserved', 'running'].includes(work.status) ? 'interrupting' :
-      !local && work.status === 'running' ? 'unconfirmed' : publicPhase[work.status];
+    const phase = currentPhase(work, jobs.get(work.executionId));
     const output = resultReport(work);
     const changes = work.status === 'completed' ? output?.changes ?? [] : [];
     return {operation: {id: work.taskId, project, route: 'api', stage: work.task?.stage, model: work.model, phase,
-      createdAt: work.createdAt, startedAt: work.dispatchedAt ?? null, updatedAt: work.completedAt ?? work.dispatchedAt ?? work.createdAt,
+      createdAt: work.createdAt, startedAt: work.dispatchedAt ?? null, updatedAt: observedAt(work),
       result: output?.reason ?? work.reason ?? (phase === 'unconfirmed' ? 'API_SETTLEMENT_UNKNOWN' : null),
       verification: output?.verification ?? null, artifactCount: changes.length,
       changes: changes.map(({path, sha256, bytes}) => ({path, sha256, bytes}))}};
+  }
+
+  function archiveOutcome(projectId, work) {
+    const outcome = publicPhase[work.status];
+    if (!terminalPhases.has(outcome) && outcome !== 'unconfirmed') return;
+    const report = outcome === 'completed' ? resultReport(work) : null;
+    if (outcome === 'completed' && !report) throw problem(409, 'API_ARTIFACT_CHANGED');
+    conversations.finishDevelopment(projectId, {id: work.executionId, outcome, summary: report?.summary ?? '',
+      updatedAt: observedAt(work)});
   }
 
   async function run({projectId, operation, prior, scope, model, prompt, controller}) {
@@ -106,6 +131,8 @@ export function createApiDevelopment({directory, store, withProjectWorkLock, has
     let baseSha = null;
     let verification = null;
     let finished = null;
+    let summary = '';
+    let conversationSaved = false;
     let reason = 'API_VERIFICATION_FAILED';
     const fingerprint = binding(scope, model);
     const reauthorize = (forDispatch = true) => {
@@ -116,6 +143,8 @@ export function createApiDevelopment({directory, store, withProjectWorkLock, has
       return fresh;
     };
     try {
+      conversations.beginDevelopment(projectId, {id: executionId, prompt, model: model.id, createdAt: operation.createdAt});
+      conversationSaved = true;
       await ensurePrivateDirectory(artifacts);
       reauthorize();
       const previousChanges = new Map();
@@ -152,7 +181,7 @@ export function createApiDevelopment({directory, store, withProjectWorkLock, has
         signal.throwIfAborted();
         if (verification.passed) {
           const result = await candidate.finish();
-          if (result.changes.length) { finished = result; reason = null; }
+          if (result.changes.length) { finished = result; summary = answer.proposal.summary; reason = null; }
           else reason = 'API_NO_WORKSPACE_CHANGE';
           break;
         }
@@ -162,18 +191,21 @@ export function createApiDevelopment({directory, store, withProjectWorkLock, has
     }
 
     if (!dispatched) {
-      store.cancelReserved(projectId, taskId, executionId, Date.now(), reason);
+      const saved = store.cancelReserved(projectId, taskId, executionId, Date.now(), reason);
+      if (conversationSaved) archiveOutcome(projectId, saved.operation);
       return;
     }
     if (awaitingReceipt) {
-      store.recordOutcome({projectId, taskId, executionId, outcome: 'interrupted', confirmedTerminal: false, effectsReconciled: false});
+      const saved = store.recordOutcome({projectId, taskId, executionId, outcome: 'interrupted', confirmedTerminal: false, effectsReconciled: false});
+      archiveOutcome(projectId, saved.operation);
       return;
     }
     if (finished) {
       try { reauthorize(false); }
       catch (cause) { finished = null; reason = signal.aborted ? 'INTERRUPTED' : cause.code ?? 'API_AUTHORITY_CHANGED'; }
     }
-    const report = {executionId, projectId, baseSha, reason, verification, candidate: finished ? basename(finished.candidatePath) : null,
+    const report = {executionId, projectId, baseSha, reason, verification, summary: finished ? summary : '',
+      candidate: finished ? basename(finished.candidatePath) : null,
       changes: finished?.changes ?? []};
     const bytes = JSON.stringify(report);
     writeFileSync(join(jobRoot, 'result.json'), bytes, {flag: 'wx', mode: 0o600});
@@ -183,11 +215,29 @@ export function createApiDevelopment({directory, store, withProjectWorkLock, has
       stopHash: digest({scope: fingerprint, phase: signal.aborted ? 'interrupted' : 'settled'}),
       budgetHash: digest({organization: scope.authority.organization, reservedMicros: operation.reservedMicros, spentMicros}),
       artifactsHash: sha(bytes)};
-    store.recordOutcome({projectId, taskId, executionId, outcome: signal.aborted ? 'interrupted' : finished ? 'completed' : 'failed',
+    const saved = store.recordOutcome({projectId, taskId, executionId, outcome: signal.aborted ? 'interrupted' : finished ? 'completed' : 'failed',
       confirmedTerminal: true, effectsReconciled: true, actualCostUsd: spentMicros / 1_000_000, checkpoint});
+    archiveOutcome(projectId, saved.operation);
   }
 
   return {
+    activity(project) { return latestApiActivity(store, project.id, id => jobs.get(id)); },
+    conversationView(project, result, offset) {
+      const {conversation} = result;
+      if (conversation.source !== 'api-development' || terminalPhases.has(conversation.outcome)) return result;
+      const observed = outcome => ({...result, conversation: {...conversation, outcome}});
+      try {
+        const work = store.findExecution(project.id, conversation.id.slice('api/'.length));
+        if (work?.route !== 'api') return observed('unconfirmed');
+        const saved = publicPhase[work.status];
+        if (terminalPhases.has(saved) || (saved === 'unconfirmed' && conversation.outcome !== 'unconfirmed')) {
+          archiveOutcome(project.id, work);
+          return conversations.read(project.id, conversation.id, offset);
+        }
+        const phase = currentPhase(work, jobs.get(work.executionId));
+        return observed(phase === 'running' ? 'in_progress' : phase);
+      } catch { return observed('unconfirmed'); }
+    },
     capabilities(project) {
       try {
         if (!store.getSettings(project.id).settings.allowedRoutes.includes('api')) throw problem(409, 'ROUTE_NOT_ALLOWED');

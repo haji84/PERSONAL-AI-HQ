@@ -29,6 +29,7 @@ const sessionAge = 8 * 60 * 60;
 const error = (status, message) => Object.assign(new Error(message), {status});
 const apiMessages = {
   API_AUTHORIZATION_REQUIRED: 'この端末の通常API実行は認証が保留中です。',
+  API_RUNTIME_UNSUPPORTED: 'この端末で通常APIの隔離実行を確認できません。',
   API_AUTHORITY_MISSING: '本人が確認したAPIの費用・組織設定がありません。',
   API_AUTHORITY_UNSAFE: 'APIの権限設定ファイルを所有者専用として確認できません。',
   API_AUTHORITY_INVALID: 'APIの権限設定を照合できません。',
@@ -129,12 +130,13 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
   const chats = createChatStore(directory);
   const execution = createExecutionAccess(directory, native);
   const operations = createOperations(directory, native, execution);
-  const apiWork = apiDevelopment ? createApiDevelopment({...(apiDevelopment === true ? {} : apiDevelopment),
-    directory, store: execution.store, hasNativeWork: operations.hasNativeWork,
+  const apiEnabled = Boolean(apiDevelopment);
+  const apiWork = createApiDevelopment({...(!apiEnabled || apiDevelopment === true ? {} : apiDevelopment),
+    directory, store: execution.store, conversations: chats, hasNativeWork: operations.hasNativeWork,
     withProjectWorkLock: (project, act) => operations.updateExecution(project, () => {
       if (chats.hasActiveLive(project.id)) throw error(409, 'ChatGPTの応答が終わるまで開始できません。');
       return act();
-    })}) : null;
+    })});
   if (plan === true) {
     const auth = createPlanAuth({directory});
     plan = {auth, responses: createChatGPTResponses({auth})};
@@ -250,7 +252,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
         await Promise.resolve(native.subscriptionReady?.()).catch(() => false) === true;
       return send(response, 200, {authenticated, capabilities: {chatImport: true, codexWrite: enabled,
         executionSettings: authenticated, executionActivity: authenticated, chatgptPlan: authenticated && Boolean(plan),
-        apiDevelopment: authenticated && Boolean(apiWork)}});
+        apiDevelopment: authenticated && apiEnabled}});
     }
     if (post && route === '/api/session') {
       if (!['null', url].includes(request.headers.origin)) throw error(403, 'ログイン元を確認できません。');
@@ -291,10 +293,13 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
     if (!project) throw error(404, '案件を見つけられませんでした。');
     if (get && route === '/api/execution/activity') {
       if (target.searchParams.getAll('project').length !== 1) throw error(404, '案件を見つけられませんでした。');
-      return send(response, 200, await operations.readActivity(project));
+      const {activity: codexActivity} = await operations.readActivity(project);
+      const apiActivity = apiWork.activity(project);
+      const activity = apiActivity && (!codexActivity || apiActivity.createdAt >= codexActivity.createdAt) ? apiActivity : codexActivity;
+      return send(response, 200, {activity});
     }
     if (route === '/api/execution/settings') {
-      if (get) return send(response, 200, {...execution.settings(project), apiAvailable: apiWork?.capabilities(project).available === true});
+      if (get) return send(response, 200, {...execution.settings(project), apiAvailable: apiEnabled && apiWork.capabilities(project).available});
       if (post) {
         const input = await jsonBody(request, 8192);
         return send(response, 200, operations.updateExecution(project, () => {
@@ -304,7 +309,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       }
     }
     if (route.startsWith('/api/execution/api')) {
-      if (!apiWork) throw error(409, apiMessages.API_AUTHORIZATION_REQUIRED);
+      if (!apiEnabled) throw error(409, apiMessages.API_AUTHORIZATION_REQUIRED);
       if (target.searchParams.getAll('project').length !== 1) throw error(404, '案件を見つけられませんでした。');
       if (get && route === '/api/execution/api/capabilities') return send(response, 200, apiWork.capabilities(project));
       if (get && route === '/api/execution/api') return send(response, 200, apiWork.read(project, target.searchParams.get('id') ?? undefined));
@@ -343,7 +348,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       if (!Number.isSafeInteger(offset) || offset < 0 || offset > 5000) throw error(400, '会話の位置が正しくありません。');
       const result = id ? chats.read(project.id, id, offset) : chats.list(project.id, (target.searchParams.get('q') ?? '').slice(0, 200));
       if (!result) throw error(404, '会話を見つけられませんでした。');
-      return send(response, 200, result);
+      return send(response, 200, id ? apiWork.conversationView(project, result, offset) : result);
     }
     if (route === '/api/chat/live') {
       if (get) return send(response, 200, {turn: chats.readLive(project.id, target.searchParams.get('id'))});
@@ -375,7 +380,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
   async function close() {
     closing ??= (async () => {
       for (const controller of liveRequests) controller.abort();
-      if (apiWork) await apiWork.close();
+      await apiWork.close();
       await new Promise(done => server.close(done));
       operations.close();
       await native.close?.();

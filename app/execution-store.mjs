@@ -121,7 +121,8 @@ export class ExecutionStore {
   getWork(projectId, taskId) {
     const project = this.#project(this.#read(), projectId);
     const operations = Object.values(project.operations);
-    const operation = taskId === undefined ? operations.at(-1) ?? null
+    const operation = taskId === undefined ? operations.reduce((latest, item) =>
+      !latest || item.createdAt >= latest.createdAt ? item : latest, null)
       : Object.hasOwn(project.operations, id(taskId)) ? project.operations[taskId] : null;
     const checkpointOperation = project.checkpoint
       ? operations.find(item => item.checkpointVersion === project.checkpoint.version) ?? null : null;
@@ -129,6 +130,12 @@ export class ExecutionStore {
       .sort((a, b) => a.checkpointVersion - b.checkpointVersion) : [];
     return clone({operation, checkpoint: project.checkpoint, checkpointOperation, verifiedApiOperations,
       busy: operations.some(item => active.has(item.status))});
+  }
+
+  findExecution(projectId, executionId) {
+    id(executionId);
+    const project = this.#project(this.#read(), projectId);
+    return clone(Object.values(project.operations).find(item => item.executionId === executionId) ?? null);
   }
 
   updateSettings(projectId, expectedRevision, input) {
@@ -279,10 +286,12 @@ export class ExecutionStore {
       if (!terminals.has(result.outcome)) error('INVALID_OUTCOME');
       if (result.confirmedTerminal !== true || result.effectsReconciled !== true) {
         operation.status = 'uncertain';
+        operation.settlementObservedAt ??= new Date().toISOString();
         return { replayed: false, operation };
       }
       if (operation.route === 'api' && (typeof result.actualCostUsd !== 'number' || !Number.isFinite(result.actualCostUsd) || result.actualCostUsd < 0)) {
         operation.status = 'awaiting_settlement';
+        operation.settlementObservedAt ??= new Date().toISOString();
         return { replayed: false, operation };
       }
       if (!verifyHandover(result.checkpoint, result.checkpoint).ok || (project.checkpoint && (result.checkpoint.version <= project.checkpoint.version || result.checkpoint.goalId !== project.checkpoint.goalId))) error('INVALID_CHECKPOINT');

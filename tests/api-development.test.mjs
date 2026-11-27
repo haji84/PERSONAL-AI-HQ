@@ -7,17 +7,30 @@ import {tmpdir} from 'node:os';
 import {setTimeout as wait} from 'node:timers/promises';
 import {startOwnerApp} from '../app/server.mjs';
 import {apiAuthorityFile} from '../app/api-authority.mjs';
+import {createChatStore} from '../app/chat-store.mjs';
 import {ExecutionStore} from '../app/execution-store.mjs';
 
 const instruction = {id: 'api-fixture-task', prompt: '答えを2にする', stage: 'implementation'};
 const id = 'api-fixture';
 const modelId = 'fixture-model-2026-11-27';
 
+async function authenticatedRequests(app) {
+  const signIn = await readFile(app.signInFile, 'utf8');
+  const login = await fetch(app.url + '/api/session', {method: 'POST', redirect: 'manual', headers: {Origin: 'null'},
+    body: new URLSearchParams({key: /name="key" value="([a-f0-9]+)"/.exec(signIn)[1]})});
+  const cookie = login.headers.get('set-cookie').split(';')[0];
+  return (path, {data, project = id, query = {}, auth = true, origin = app.url} = {}) =>
+    fetch(app.url + path + '?' + new URLSearchParams({project, ...query}), {method: data ? 'POST' : 'GET',
+      headers: {...(auth ? {cookie} : {}), ...(data ? {Origin: origin, 'Content-Type': 'application/json'} : {})},
+      ...(data ? {body: JSON.stringify(data)} : {})});
+}
+
 async function fixture(t, fetchImpl) {
   const directory = await realpath(await mkdtemp(join(tmpdir(), 'hq-api-app-')));
-  let app;
+  let app, requests;
+  const servers = new Set();
   t.after(async () => {
-    await app?.close();
+    await Promise.all([...servers].map(server => server.close()));
     await rm(directory, {recursive: true, force: true});
   });
   const checkout = join(directory, 'workspaces', id);
@@ -50,22 +63,25 @@ test('answer equals the required value', () => assert.equal(answer, 2));\n`);
     models: [{id: modelId, contextTokens: 16000, outputTokens: 2000, inputUsdPerMillion: 2, outputUsdPerMillion: 8, reasoningEfforts: []}],
     projects: {[id]: {files: [{path: 'source.mjs', writable: true}], testPaths: ['check.test.mjs']}},
   }), {mode: 0o600});
-  app = await startOwnerApp({directory, port: 0, codex: {}, apiDevelopment: {getKey: () => 'fixture-only', fetchImpl}});
-  const signIn = await readFile(app.signInFile, 'utf8');
-  const login = await fetch(app.url + '/api/session', {method: 'POST', redirect: 'manual', headers: {Origin: 'null'},
-    body: new URLSearchParams({key: /name="key" value="([a-f0-9]+)"/.exec(signIn)[1]})});
-  const cookie = login.headers.get('set-cookie').split(';')[0];
-  function call(path, {data, project = id, query = {}, auth = true, origin = app.url} = {}) {
-    return fetch(app.url + path + '?' + new URLSearchParams({project, ...query}), {method: data ? 'POST' : 'GET',
-      headers: {...(auth ? {cookie} : {}), ...(data ? {Origin: origin, 'Content-Type': 'application/json'} : {})},
-      ...(data ? {body: JSON.stringify(data)} : {})});
+  async function open(enableExecution) {
+    await app?.close();
+    servers.delete(app);
+    app = await startOwnerApp({directory, port: 0, codex: {}, apiDevelopment: enableExecution && {getKey: () => 'fixture-only', fetchImpl}});
+    servers.add(app);
+    requests = await authenticatedRequests(app);
+  }
+  await open(true);
+  async function openReader() {
+    const reader = await startOwnerApp({directory, port: 0, codex: {}});
+    servers.add(reader);
+    return authenticatedRequests(reader);
   }
   const commitSource = async text => {
     await writeFile(source, text);
     git('add', '--', 'source.mjs');
     git('commit', '--quiet', '-m', 'Fixture checkout change');
   };
-  return {call, source, directory, store, ledgerFile, commitSource};
+  return {call: (...args) => requests(...args), source, directory, store, ledgerFile, commitSource, open, openReader};
 }
 
 async function waitFor(call, target, taskId = instruction.id) {
@@ -81,7 +97,7 @@ async function waitFor(call, target, taskId = instruction.id) {
 
 test('owner API-only work repairs actual source in an isolated Mac and returns a verified artifact', {skip: process.platform !== 'darwin'}, async t => {
   let requests = 0;
-  const {call, source} = await fixture(t, async (_url, request) => {
+  const {call, source, open} = await fixture(t, async (_url, request) => {
     requests++;
     const body = JSON.parse(request.body);
     const input = JSON.parse(body.input[1].content);
@@ -113,6 +129,27 @@ test('owner API-only work repairs actual source in an isolated Mac and returns a
   assert.equal(await (await call('/api/execution/api/artifact', {query})).text(), 'export const answer = 2;\n');
   assert.equal(await readFile(source, 'utf8'), 'export const answer = 1;\n');
   assert.equal((await call('/api/execution/api', {data: {...instruction, prompt: '別の指示'}})).status, 409);
+  const {conversations} = await (await call('/api/chat', {query: {q: instruction.prompt}})).json();
+  assert.equal(conversations.length, 1);
+  assert.equal(conversations[0].source, 'api-development');
+  const timelineId = conversations[0].id;
+  const {conversation} = await (await call('/api/chat', {query: {id: timelineId}})).json();
+  assert.equal(conversation.outcome, 'completed');
+  assert.equal(conversation.model, modelId);
+  assert.deepEqual(conversation.messages.map(({role, text}) => [role, text]), [
+    ['user', instruction.prompt], ['assistant', '定数を修正'],
+  ]);
+  assert.equal((await call('/api/chat', {query: {id: timelineId}, project: 'other-fixture'})).status, 404);
+  const {activity} = await (await call('/api/execution/activity')).json();
+  assert.equal(activity.kind, 'api');
+  assert.equal(activity.phase, 'completed');
+  assert.equal(activity.model, modelId);
+  await open(false);
+  assert.equal((await call('/api/execution/api', {data: instruction})).status, 409);
+  const restarted = await (await call('/api/chat', {query: {id: timelineId}})).json();
+  assert.deepEqual(restarted.conversation, conversation);
+  assert.deepEqual((await (await call('/api/execution/activity')).json()).activity, activity);
+  assert.equal(requests, 2);
 });
 
 function providerAnswer(answer) {
@@ -121,6 +158,61 @@ function providerAnswer(answer) {
       summary: '実行確認', changes: [{path: 'source.mjs', text: `export const answer = ${answer};\n`}],
     })}]}]});
 }
+
+test('a second gateway cannot finalize a still-running archived conversation', {skip: process.platform !== 'darwin'}, async t => {
+  let release, reportArrival;
+  const awaitingRelease = new Promise(resolve => { release = resolve; });
+  const providerCalled = new Promise(resolve => { reportArrival = resolve; });
+  const {call, openReader} = await fixture(t, async () => {
+    reportArrival();
+    await awaitingRelease;
+    return providerAnswer(2);
+  });
+  try {
+    assert.equal((await call('/api/execution/settings', {data: {revision: 0, settings: {mode: 'api-only', apiBudgetUsd: 1}}})).status, 200);
+    assert.equal((await call('/api/execution/api', {data: instruction})).status, 202);
+    await Promise.race([providerCalled, wait(4000, null, {ref: false}).then(() => assert.fail('Provider did not receive the fixture'))]);
+    const reader = await openReader();
+    const {conversations} = await (await reader('/api/chat')).json();
+    const query = {id: conversations[0].id};
+    assert.equal((await (await call('/api/chat', {query})).json()).conversation.outcome, 'in_progress');
+    assert.equal((await (await reader('/api/chat', {query})).json()).conversation.outcome, 'unconfirmed');
+    release();
+    await waitFor(call, 'completed');
+    const {conversation} = await (await reader('/api/chat', {query})).json();
+    assert.equal(conversation.outcome, 'completed');
+    assert.deepEqual(conversation.messages.map(message => message.role), ['user', 'assistant']);
+  } finally { release(); }
+});
+
+test('an unstarted receipt reads as reserved, and a broken ledger cannot hide imported ChatGPT history', {skip: process.platform !== 'darwin'}, async t => {
+  let requests = 0;
+  const {call, store, directory, ledgerFile} = await fixture(t, async () => { requests++; return providerAnswer(2); });
+  assert.equal((await call('/api/execution/settings', {data: {revision: 0, settings: {mode: 'api-only', apiBudgetUsd: 1}}})).status, 200);
+  const now = Date.now();
+  const receipt = store.prepareDispatch({projectId: id, taskId: instruction.id, instructionDigest: 'a'.repeat(64), expectedRevision: 1,
+    task: {route: 'api', stage: 'implementation'}}, {now, capabilities: {api: {available: true, executorId: 'owner-mac-responses',
+      defaultModel: modelId, models: [{id: modelId, reasoningEfforts: []}]}}, safety: {authorized: true, status: 'ready',
+      allowedRoutes: ['api'], api: {organizationId: 'org-fixture', creditOrganizationId: 'org-fixture',
+        reservationAuthorityId: store.authorityId, ledgerBinding: store.reservationBinding(), availableCreditUsd: 2,
+        observedAt: new Date(now).toISOString(), expiresAt: new Date(now + 300000).toISOString(),
+        zeroAdditionalCostGuaranteed: true, maxRequestCostUsd: 0.1}}});
+  assert.equal(receipt.dispatchable, true);
+  const chats = createChatStore(directory);
+  const {executionId, createdAt} = receipt.operation;
+  try { chats.beginDevelopment(id, {id: executionId, createdAt, model: modelId, prompt: instruction.prompt}); }
+  finally { chats.close(); }
+  const query = {id: `api/${executionId}`};
+  assert.equal((await (await call('/api/chat', {query})).json()).conversation.outcome, 'reserved');
+  const archive = {id: 'export-fixture', title: '既存の相談', current_node: 'message', mapping: {message: {parent: null,
+    message: {author: {role: 'user'}, content: {parts: ['保存しておいた事実']}}}}};
+  assert.equal((await call('/api/chat/import', {data: [archive]})).status, 200);
+  await writeFile(ledgerFile, '{}');
+  const {conversation} = await (await call('/api/chat', {query: {id: archive.id}})).json();
+  assert.equal(conversation.messages[0].text, '保存しておいた事実');
+  assert.equal((await (await call('/api/chat', {query})).json()).conversation.outcome, 'unconfirmed');
+  assert.equal(requests, 0);
+});
 
 test('copying a credit observation and ledger to another runtime does not create another reservation authority', {skip: process.platform !== 'darwin'}, async t => {
   let requests = 0;
@@ -177,11 +269,18 @@ test('revocation during the provider response records known usage and withholds 
 
 test('lost API settlement holds the project across repeated requests', {skip: process.platform !== 'darwin'}, async t => {
   let requests = 0;
-  const {call} = await fixture(t, async () => { requests++; throw new Error('fixture transport break'); });
+  const {call, open} = await fixture(t, async () => { requests++; throw new Error('fixture transport break'); });
   await call('/api/execution/settings', {data: {revision: 0, settings: {mode: 'api-only', apiBudgetUsd: 1}}});
   assert.equal((await call('/api/execution/api', {data: instruction})).status, 202);
   const result = await waitFor(call, 'unconfirmed');
   assert.equal(result.result, 'API_SETTLEMENT_UNKNOWN');
+  assert.equal((await call('/api/execution/api', {data: instruction})).status, 202);
+  assert.equal((await call('/api/execution/api', {data: {...instruction, id: 'another-task'}})).status, 409);
+  await open(true);
+  const {conversations} = await (await call('/api/chat')).json();
+  const {conversation} = await (await call('/api/chat', {query: {id: conversations[0].id}})).json();
+  assert.equal(conversation.outcome, 'unconfirmed');
+  assert.deepEqual(conversation.messages.map(item => item.role), ['user']);
   assert.equal((await call('/api/execution/api', {data: instruction})).status, 202);
   assert.equal((await call('/api/execution/api', {data: {...instruction, id: 'another-task'}})).status, 409);
   assert.equal(requests, 1);

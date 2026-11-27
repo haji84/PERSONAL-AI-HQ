@@ -36,6 +36,31 @@ const liveIdPattern = /^live\/[a-f0-9-]{36}$/;
 const liveLease = 10 * 60 * 1000;
 const liveStatuses = new Set(['completed', 'failed', 'incomplete', 'aborted', 'interrupted']);
 const storeError = (status, code, message) => Object.assign(new Error(message), {status, code});
+const developmentSource = 'api-development';
+const developmentStatuses = new Set(['completed', 'failed', 'interrupted', 'unconfirmed']);
+
+function developmentId(id) {
+  if (typeof id !== 'string' || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(id)) {
+    throw storeError(400, 'INVALID_DEVELOPMENT_RECEIPT', 'API作業の受付番号を確認できません。');
+  }
+  return `api/${id}`;
+}
+
+function isoTime(value) {
+  const time = typeof value === 'string' ? Date.parse(value) : NaN;
+  if (!Number.isFinite(time) || !/^\d{4}-/.test(value) || new Date(time).toISOString() !== value) {
+    throw storeError(400, 'INVALID_DEVELOPMENT_TIME', 'API作業の記録時刻を確認できません。');
+  }
+  return time;
+}
+
+function archiveView(row, offset = 0) {
+  const {messages: saved, ...details} = row;
+  const parsed = JSON.parse(saved);
+  const {model, outcome, messages} = row.source === developmentSource ? parsed : {messages: parsed};
+  return {conversation: {...details, ...(row.source === developmentSource ? {model, outcome} : {}), messages: messages.slice(offset, offset + 40)},
+    nextOffset: offset + 40 < messages.length ? offset + 40 : null};
+}
 
 function boundedHistory(messages, budget = chatInputLimit) {
   const result = [];
@@ -61,6 +86,7 @@ export function createChatStore(directory, {now = Date.now} = {}) {
     CREATE TABLE IF NOT EXISTS conversations (
       project TEXT NOT NULL, id TEXT NOT NULL, title TEXT NOT NULL,
       imported_at TEXT NOT NULL, modified REAL NOT NULL, messages TEXT NOT NULL,
+      source TEXT NOT NULL DEFAULT 'chatgpt-export',
       PRIMARY KEY(project,id)
     );
     CREATE TABLE IF NOT EXISTS live_conversations (
@@ -78,12 +104,26 @@ export function createChatStore(directory, {now = Date.now} = {}) {
     );
     CREATE INDEX IF NOT EXISTS live_timeline ON live_turns(project,conversation_id);
     CREATE UNIQUE INDEX IF NOT EXISTS live_in_progress ON live_turns(project,conversation_id) WHERE status='in_progress'`);
+  try {
+    inTransaction(() => {
+      if (!db.prepare('PRAGMA table_info(conversations)').all().some(({name}) => name === 'source')) {
+        db.exec("ALTER TABLE conversations ADD COLUMN source TEXT NOT NULL DEFAULT 'chatgpt-export'");
+      }
+    });
+  } catch (error) {
+    db.close();
+    throw error;
+  }
   const add = db.prepare(`INSERT INTO conversations (project,id,title,imported_at,modified,messages)
     VALUES (?,?,?,?,?,?) ON CONFLICT(project,id) DO UPDATE SET title=excluded.title,
       imported_at=excluded.imported_at, modified=excluded.modified, messages=excluded.messages
-    WHERE excluded.modified > conversations.modified`);
+    WHERE conversations.source='chatgpt-export' AND excluded.modified > conversations.modified`);
+  const insertDevelopment = db.prepare(`INSERT INTO conversations (project,id,title,imported_at,modified,messages,source)
+    VALUES (?,?,?,?,?,?,'api-development')`);
+  const finalizeDevelopment = db.prepare(`UPDATE conversations SET imported_at=?,modified=?,messages=?
+    WHERE project=? AND id=? AND source='api-development'`);
   const list = db.prepare(`SELECT id,title,importedAt,source FROM (
-    SELECT id,title,imported_at AS importedAt,'chatgpt-export' AS source FROM conversations
+    SELECT id,title,imported_at AS importedAt,source FROM conversations
       WHERE project=?1 AND (?2='' OR instr(lower(title),lower(?2))>0 OR instr(lower(messages),lower(?2))>0)
     UNION ALL
     SELECT c.id,c.title,c.updated_at,'chatgpt-live' FROM live_conversations c
@@ -91,7 +131,7 @@ export function createChatStore(directory, {now = Date.now} = {}) {
         EXISTS(SELECT 1 FROM live_turns t WHERE t.project=c.project AND t.conversation_id=c.id AND
           (instr(lower(t.prompt),lower(?2))>0 OR instr(lower(t.text),lower(?2))>0)))
     ) ORDER BY importedAt DESC,id LIMIT 250`);
-  const get = db.prepare(`SELECT id,title,imported_at AS importedAt,messages FROM conversations WHERE project=? AND id=?`);
+  const get = db.prepare(`SELECT id,title,imported_at AS importedAt,messages,source FROM conversations WHERE project=? AND id=?`);
   const getLive = db.prepare(`SELECT id,title,updated_at AS importedAt,source_id AS sourceConversationId,history
     FROM live_conversations WHERE project=? AND id=?`);
   const insertLive = db.prepare(`INSERT INTO live_conversations(project,id,title,updated_at,source_id,history) VALUES(?,?,?,?,?,?)`);
@@ -161,11 +201,7 @@ export function createChatStore(directory, {now = Date.now} = {}) {
     list: (project, query = '') => ({conversations: list.all({1: project, 2: query})}),
     read(project, id, offset) {
       const row = get.get(project, id);
-      if (row) {
-        const messages = JSON.parse(row.messages);
-        return {conversation: {...row, source: 'chatgpt-export', messages: messages.slice(offset, offset + 40)},
-          nextOffset: offset + 40 < messages.length ? offset + 40 : null};
-      }
+      if (row) return archiveView(row, offset);
       const live = getLive.get(project, id);
       if (!live) return null;
       expireTurnLeases(project, now());
@@ -175,6 +211,55 @@ export function createChatStore(directory, {now = Date.now} = {}) {
       messages.push(...page.all({1: project, 2: id, 3: 41 - messages.length, 4: Math.max(0, offset - snapshot.length)}));
       return {conversation: {...details, source: 'chatgpt-live', messages: messages.slice(0, 40)},
         nextOffset: messages.length > 40 ? offset + 40 : null};
+    },
+    beginDevelopment(project, {id, prompt, model, createdAt}) {
+      const archive = developmentId(id);
+      const time = isoTime(createdAt);
+      if (typeof prompt !== 'string' || !prompt.trim() || prompt.length > 12000 ||
+          typeof model !== 'string' || !chatModelPattern.test(model)) {
+        throw storeError(400, 'INVALID_DEVELOPMENT_REQUEST', 'API作業の指示またはモデルを確認できません。');
+      }
+      return inTransaction(() => {
+        const previous = get.get(project, archive);
+        if (previous) {
+          const view = archiveView(previous);
+          const [original] = view.conversation.messages;
+          if (previous.source !== developmentSource || view.conversation.model !== model ||
+              original.text !== prompt || original.createdAt !== createdAt) {
+            throw storeError(409, 'DEVELOPMENT_REQUEST_CONFLICT', 'API作業の受付番号が別の指示に使われています。');
+          }
+          return view;
+        }
+        const messages = [{role: 'user', text: prompt, createdAt}];
+        insertDevelopment.run(project, archive, title(prompt), createdAt, time,
+          JSON.stringify({model, outcome: 'in_progress', messages}));
+        return archiveView(get.get(project, archive));
+      });
+    },
+    finishDevelopment(project, {id, outcome, summary = '', updatedAt}) {
+      const archive = developmentId(id);
+      const time = isoTime(updatedAt);
+      if (!developmentStatuses.has(outcome) || typeof summary !== 'string' || summary.length > 2000 ||
+          (outcome === 'unconfirmed' && summary.trim())) {
+        throw storeError(400, 'INVALID_DEVELOPMENT_RESULT', 'API作業の記録内容を確認できません。');
+      }
+      const text = summary.trim();
+      return inTransaction(() => {
+        const row = get.get(project, archive);
+        if (row?.source !== developmentSource) throw storeError(404, 'DEVELOPMENT_NOT_FOUND', 'この案件のAPI作業を確認できません。');
+        const {model, outcome: previous, messages} = JSON.parse(row.messages);
+        const settledAfterUncertainty = previous === 'unconfirmed' && outcome !== 'unconfirmed' && updatedAt > row.importedAt;
+        if (previous !== 'in_progress' && !settledAfterUncertainty) {
+          if (previous !== outcome || (messages[1]?.text ?? '') !== text || row.importedAt !== updatedAt) {
+            throw storeError(409, 'DEVELOPMENT_RESULT_CONFLICT', '保存済みのAPI作業結果を上書きできません。');
+          }
+          return archiveView(row);
+        }
+        if (updatedAt < row.importedAt) throw storeError(409, 'DEVELOPMENT_TIME_CONFLICT', 'API作業の終了時刻が受付より前です。');
+        if (text) messages.push({role: 'assistant', text, createdAt: updatedAt});
+        finalizeDevelopment.run(updatedAt, time, JSON.stringify({model, outcome, messages}), project, archive);
+        return archiveView(get.get(project, archive));
+      });
     },
     hasActiveLive: project => Boolean(activeProject.get(project, now())),
     beginLive(project, {id, conversationId = null, model, prompt}, beforeReserve) {
@@ -197,7 +282,8 @@ export function createChatStore(directory, {now = Date.now} = {}) {
 
         const createdAt = new Date(time).toISOString();
         const live = conversationId && getLive.get(project, conversationId);
-        const source = !live && conversationId && get.get(project, conversationId);
+        const archive = !live && conversationId && get.get(project, conversationId);
+        const source = archive?.source === 'chatgpt-export' ? archive : null;
         if (conversationId && !live && !source) throw storeError(404, 'CHAT_NOT_FOUND', '会話を見つけられませんでした。');
         if (live && activeTurn.get(project, live.id)) {
           throw storeError(409, 'CHAT_IN_PROGRESS', 'この会話では応答の生成中です。');
