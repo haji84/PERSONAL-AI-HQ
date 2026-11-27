@@ -10,10 +10,35 @@ const observationWindowMs = 15000;
 const allowedId = /^[a-z0-9_-]{8,80}$/i;
 const receiptId = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
 const reviewHash = /^[a-f0-9]{64}$/;
+const imageByteLimit = 512 * 1024;
+const imageBase64Limit = 4 * Math.ceil(imageByteLimit / 3);
+const pngMagic = Buffer.from('89504e470d0a1a0a', 'hex');
+const jpegMagic = Buffer.from('ffd8ff', 'hex');
+const imageSignatures = new Map([
+  ['image/png', bytes => bytes.subarray(0, pngMagic.length).equals(pngMagic)],
+  ['image/jpeg', bytes => bytes.subarray(0, jpegMagic.length).equals(jpegMagic)],
+  ['image/webp', bytes => bytes.toString('latin1', 0, 4) === 'RIFF' && bytes.toString('latin1', 8, 12) === 'WEBP'],
+]);
 const steerClientId = id => `hq:steer:${id}`;
 const timestamp = () => new Date().toISOString();
-const problem = (status, message) => Object.assign(new Error(message), {status});
+const problem = (status, message, code) => Object.assign(new Error(message), {status, code});
 const phase = value => terminal.has(value) ? value : value === 'inProgress' ? 'running' : null;
+
+function validatedImage(value) {
+  if (value === undefined) return null;
+  const invalid = () => problem(400, 'PNG、JPEG、WebPの画像を1枚指定してください。');
+  const tooLarge = () => problem(413, '画像は512 KiB以下にしてください。');
+  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length !== 2 ||
+      !Object.hasOwn(value, 'mime') || !Object.hasOwn(value, 'data')) throw invalid();
+  const {mime, data} = value;
+  const matches = imageSignatures.get(mime);
+  if (!matches || typeof data !== 'string' || !data.length) throw invalid();
+  if (data.length > imageBase64Limit) throw tooLarge();
+  const bytes = Buffer.from(data, 'base64');
+  if (bytes.toString('base64') !== data || !matches(bytes)) throw invalid();
+  if (bytes.length > imageByteLimit) throw tooLarge();
+  return {image: {mime, data}, digest: createHash('sha256').update(bytes).digest('hex')};
+}
 
 export function createOperations(directory, native, execution, {prepareHandover} = {}) {
   const db = new DatabaseSync(join(directory, 'conversations.sqlite'));
@@ -132,13 +157,14 @@ export function createOperations(directory, native, execution, {prepareHandover}
     throw problem(409, 'この案件の分離作業先を確認できません。');
   }
 
-  async function configureModel(model, effort) {
-    if (model === undefined && effort === undefined) return;
+  async function configureModel(model, effort, requireModel) {
+    if (model === undefined && effort === undefined && !requireModel) return;
     const {data} = await native.models();
     const selected = model === undefined ? data.find(row => row.isDefault) : data.find(row => row.id === model);
     if (!selected || (effort !== undefined && !selected.reasoningEfforts.some(row => row.reasoningEffort === effort))) {
       throw problem(400, 'このCodex接続で利用できるモデルまたは推論レベルを選択してください。');
     }
+    return selected;
   }
 
   async function checkHandoverUsage() {
@@ -217,6 +243,7 @@ export function createOperations(directory, native, execution, {prepareHandover}
             typeof handover.review !== 'string' || !reviewHash.test(handover.review) || input.resume !== undefined || input.route !== 'subscription'))) {
         throw problem(400, '有効な指示を入力してください。');
       }
+      const attachment = validatedImage(input.image);
       const previous = input.resume ? byId.get(project.id, input.resume) : null;
       const expected = await confirmedWorkspace(project);
       if (input.resume && (!previous?.threadId || !previous.turnId || !terminal.has(previous.phase) || previous.workspace !== expected)) {
@@ -225,6 +252,7 @@ export function createOperations(directory, native, execution, {prepareHandover}
       const choice = input.stage || input.route ? [input.stage, input.route] : [];
       const identity = [input.prompt, input.model, input.effort, input.resume, ...choice];
       if (beginsHandover) identity.push(handover.receipt, handover.review);
+      if (attachment) identity.push({mime: attachment.image.mime, sha256: attachment.digest});
       const digest = createHash('sha256').update(JSON.stringify(identity)).digest('hex');
       const duplicate = () => {
         const row = byId.get(project.id, input.id);
@@ -244,10 +272,19 @@ export function createOperations(directory, native, execution, {prepareHandover}
         if (beginsHandover && (!prepareHandover || !execution)) throw problem(409, '引継ぎの照合を利用できません。');
         execution?.preflight(project, stage, expected, route, handoverReceipt);
         if (!await native.subscriptionReady?.()) throw problem(403, 'ChatGPTプランの認証を確認できないため、実行していません。');
-        selection = execution ? await execution.authorize(project, {stage, route, model: input.model, effort: input.effort, handoverReceipt})
+        selection = execution ? await execution.authorize(project, {stage, route, model: input.model, effort: input.effort, handoverReceipt,
+          ...(attachment ? {imageRequired: true} : {})})
           : {model: input.model, effort: input.effort};
         if (handoverReceipt) await checkHandoverUsage();
-        if (!execution) await configureModel(selection.model, selection.effort);
+        if (!execution) {
+          const selected = await configureModel(selection.model, selection.effort, Boolean(attachment));
+          if (attachment) {
+            if (!Array.isArray(selected.inputModalities) || !selected.inputModalities.includes('image')) {
+              throw problem(409, '選択したCodexモデルの画像入力対応を確認できません。', 'CODEX_IMAGE_MODEL_UNAVAILABLE');
+            }
+            selection = {...selection, model: selected.id};
+          }
+        }
         if (beginsHandover) {
           const checked = await prepareHandover(project, handover, expected);
           if (checked.revision !== selection.revision) throw problem(409, '実行設定が変わりました。');
@@ -282,7 +319,7 @@ export function createOperations(directory, native, execution, {prepareHandover}
         readyForTurn = true;
       } : undefined;
       void native.submit({workspace: expected, prompt: submittedPrompt, knownId: previous?.threadId,
-        model: selection.model, effort: selection.effort, requestId: input.id,
+        model: selection.model, effort: selection.effort, requestId: input.id, ...(attachment ? {image: attachment.image} : {}),
         beforeThread: maySubmit, ...(beforeTurn ? {beforeTurn} : {}),
         onThread: id => readyForTurn && maySubmit() && (!beginsHandover || stillCurrent?.() === true) &&
           setThread.run(id, timestamp(), project.id, input.id).changes === 1,
@@ -330,7 +367,7 @@ export function createOperations(directory, native, execution, {prepareHandover}
     async steer(project, input) {
       if (typeof input?.id !== 'string' || !allowedId.test(input.id) ||
           typeof input.operationId !== 'string' || !allowedId.test(input.operationId) ||
-          typeof input.prompt !== 'string' || !input.prompt.trim() || input.prompt.length > 16000) {
+          typeof input.prompt !== 'string' || !input.prompt.trim() || input.prompt.length > 16000 || input.image !== undefined) {
         throw problem(400, '追加指示と対象の作業を指定してください。');
       }
       const workspace = await confirmedWorkspace(project);

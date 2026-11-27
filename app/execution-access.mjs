@@ -4,7 +4,8 @@ import {ExecutionStore} from './execution-store.mjs';
 import {readCurrentProject} from './portfolio.mjs';
 
 const held = new Set(['paused', 'approval', 'limit', 'blocked', 'offline', 'waiting', 'completed']);
-const problem = (status, message) => Object.assign(new Error(message), {status});
+const problem = (status, message, code) => Object.assign(new Error(message), {status, code});
+const unavailableImageModel = () => problem(409, '選択したCodexモデルの画像入力対応を確認できません。', 'CODEX_IMAGE_MODEL_UNAVAILABLE');
 
 export function createExecutionAccess(directory, native) {
   const store = new ExecutionStore(join(directory, 'execution-policy.json'), {authorityId: 'personal-ai-hq-local'});
@@ -53,7 +54,7 @@ export function createExecutionAccess(directory, native) {
         throw error;
       }
     },
-    async authorize(project, {stage, route, model, effort, catalog, handoverReceipt}) {
+    async authorize(project, {stage, route, model, effort, catalog, handoverReceipt, imageRequired = false}) {
       const {settings, revision} = preflight(project, stage, undefined, route, handoverReceipt);
       // Only the verified subscription provider is currently connected to this server.
       const observed = catalog ?? await native.models();
@@ -66,10 +67,15 @@ export function createExecutionAccess(directory, native) {
         models: observed.data.map(item => ({id: item.id, reasoningEfforts: item.reasoningEfforts.map(value => value.reasoningEffort)})),
       }}});
       if (!chosen.allowed || chosen.route !== 'subscription') {
+        if (imageRequired && chosen.code === 'MODEL_UNAVAILABLE') throw unavailableImageModel();
         const message = ['MODEL_UNAVAILABLE', 'REASONING_UNAVAILABLE'].includes(chosen.code)
           ? 'この経路で利用できるモデルと推論レベルを選んでください。'
           : '案件設定と現在利用できる接続を照合できませんでした。';
         throw problem(409, message);
+      }
+      if (imageRequired) {
+        const modalities = observed.data.find(item => item.id === chosen.model)?.inputModalities;
+        if (!Array.isArray(modalities) || !modalities.includes('image')) throw unavailableImageModel();
       }
       return {model: chosen.model, effort: chosen.reasoningEffort ?? undefined, revision};
     },

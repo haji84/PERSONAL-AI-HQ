@@ -363,7 +363,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
     }
     if (route === '/api/codex/run') {
       if (get) return send(response, 200, await operations.read(project, target.searchParams.get('id'), target.searchParams.get('handoverReceipt')));
-      if (post) return send(response, 202, await operations.start(project, await jsonBody(request, 64000)));
+      if (post) return send(response, 202, await operations.start(project, await jsonBody(request, 768 * 1024)));
     }
     if (post && route === '/api/codex/interrupt') {
       const data = await jsonBody(request, 4096);
@@ -406,7 +406,8 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
     respond(request, response).catch(problem => {
       if (response.headersSent) { response.destroy(); return; }
       const status = typeof problem?.status === 'number' ? problem.status : 500;
-      send(response, status, {error: status === 500 ? '状態を読み取れませんでした。' : apiMessages[problem.code] ?? problem.message});
+      send(response, status, {error: status === 500 ? '状態を読み取れませんでした。' : apiMessages[problem.code] ?? problem.message,
+        ...(problem.code === 'CODEX_IMAGE_MODEL_UNAVAILABLE' ? {code: problem.code} : {})});
     });
   });
   async function close() {

@@ -49,6 +49,7 @@ const ui = {
   options: new Map(Object.entries(saved.modelOptions ?? {})),
   scroll: new Map(Object.entries(savedTab.scroll ?? {})),
   drafts: new Map(Object.entries(savedTab.drafts ?? {})),
+  imageDrafts: new Map(),
   searches: new Map(Object.entries(savedTab.searches ?? {})),
   runIntents: new Map(Object.entries(savedTab.runIntents ?? {})),
   steerIntents: new Map(Object.entries(savedTab.steerIntents ?? {})),
@@ -232,6 +233,7 @@ function endSession() {
   activities.clear();
   activitySession = undefined;
   resources.clear();
+  ui.imageDrafts.clear();
   ui.portfolio = null;
   dom.content.replaceChildren();
   gate('サインイン', 'この端末のサインイン用ファイルを開いてください。', true);
@@ -331,6 +333,7 @@ async function api(path, options = {}) {
     const message = typeof problem?.error === 'string' && problem.error.length <= 240 ? problem.error : '';
     const error = new Error(message || httpMessages[response.status] || '読み込みに失敗しました。');
     error.status = response.status;
+    error.code = problem?.code;
     throw error;
   }
   try { return await response.json(); }
@@ -650,7 +653,7 @@ function dashboard() {
   }
 }
 
-function fetchView(key, path, container, paint, isCurrent = () => true) {
+function viewResource(key, path) {
   let entry = resources.get(key);
   if (!entry) {
     entry = {};
@@ -659,6 +662,11 @@ function fetchView(key, path, container, paint, isCurrent = () => true) {
     entry.pending = api(path).then(value => { entry.value = value; }, error => { entry.error = error.message; })
       .finally(() => { entry.pending = null; });
   }
+  return entry;
+}
+
+function fetchView(key, path, container, paint, isCurrent = () => true) {
+  const entry = viewResource(key, path);
   function settle() {
     if (!container.isConnected || !isCurrent()) return;
     container.replaceChildren();
@@ -1233,8 +1241,23 @@ const apiWorkMessages = {
 };
 
 const apiAdviceStages = {consultation: '相談', design: '設計'};
+const codexImageTypes = ['image/png', 'image/jpeg', 'image/webp'];
+const codexImageLimit = 512 * 1024;
 
-function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {handoff, advice} = {}) {
+async function imageDigest(bytes) {
+  const hash = await crypto.subtle.digest('SHA-256', bytes);
+  return Array.from(new Uint8Array(hash), byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function imageBase64(bytes) {
+  const characters = [];
+  for (let offset = 0; offset < bytes.length; offset += 16384) {
+    characters.push(String.fromCharCode(...bytes.subarray(offset, offset + 16384)));
+  }
+  return btoa(characters.join(''));
+}
+
+function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {handoff, advice, imageModel} = {}) {
   const apiMode = Boolean(apiReady);
   const runKey = apiMode ? memoryKey('api-work', project) : project;
   const native = advice?.native;
@@ -1290,7 +1313,60 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
   const check = button('作業状態を確認', () => lookup(), true);
   actions.append(send, resume, steer, interrupt, recover, check, checkSteer, closeSteer);
   if (!advice) section.append(node('h3', '', apiMode ? '通常APIの開発操作' : 'Codex操作'));
-  section.append(caption, status, details, warning, steeringStatus, actions, output, artifacts);
+  section.append(caption);
+  let imageControls;
+  let imageInput;
+  let imageInfo;
+  let removeImage;
+  let imageSequence = 0;
+  let imageMessage = '';
+  let imageReading = false;
+  if (imageModel) {
+    imageControls = node('div', 'stack');
+    const imageLabel = node('label', 'picker');
+    imageInput = node('input');
+    imageInput.type = 'file';
+    imageInput.accept = codexImageTypes.join(',');
+    imageLabel.append(node('span', '', 'Codexへの画像添付'), imageInput);
+    imageInfo = node('p', 'small muted');
+    imageInfo.setAttribute('role', 'status');
+    removeImage = button('画像を外す', () => {
+      imageSequence++;
+      imageReading = false;
+      ui.imageDrafts.delete(draftKey);
+      imageMessage = '';
+      paint();
+    });
+    imageInput.addEventListener('change', async () => {
+      const imageFile = imageInput.files?.[0];
+      if (!imageFile) return;
+      imageInput.value = '';
+      const sequence = ++imageSequence;
+      if (!codexImageTypes.includes(imageFile.type) || !imageFile.size || imageFile.size > codexImageLimit) {
+        imageReading = false;
+        imageMessage = '512 KiB以内のPNG、JPEG、WebPを選んでください。';
+        paint();
+        return;
+      }
+      imageReading = true;
+      imageMessage = '添付画像を照合しています。';
+      paint();
+      try {
+        const bytes = await imageFile.arrayBuffer();
+        const digest = await imageDigest(bytes);
+        if (sequence !== imageSequence || !isCurrent()) return;
+        ui.imageDrafts.set(draftKey, {file: imageFile, digest});
+        imageMessage = '';
+      } catch {
+        if (sequence === imageSequence) imageMessage = '画像を読み取れませんでした。';
+      } finally {
+        if (sequence === imageSequence) { imageReading = false; paint(); }
+      }
+    });
+    imageControls.append(imageLabel, imageInfo, removeImage);
+    section.append(imageControls);
+  }
+  section.append(status, details, warning, steeringStatus, actions, output, artifacts);
   area.body.append(section);
 
   let timer;
@@ -1307,7 +1383,7 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
       Boolean(run.operation.threadId && run.operation.turnId);
   }
   function hasRoom() {
-    return run.known && (!apiMode || apiReady()?.available === true) && !ui.runIntents.has(runKey) &&
+    return run.known && !imageReading && (!apiMode || apiReady()?.available === true) && !ui.runIntents.has(runKey) &&
       (!run.operation || finishedPhases.has(run.operation.phase));
   }
   function paint() {
@@ -1315,6 +1391,14 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
     clearTimeout(timer);
     const phase = run.operation?.phase;
     const intention = currentIntent();
+    if (imageControls) {
+      const image = ui.imageDrafts.get(draftKey);
+      imageControls.hidden = !imageModel() && !image && !intention?.imageSha256;
+      imageInput.disabled = !imageModel() && !intention?.imageSha256;
+      imageInfo.textContent = imageMessage || (image ? `${image.file.name} · ${Math.ceil(image.file.size / 1024)} KiB` :
+        intention?.imageSha256 ? '再送する場合は、同じ画像を選んでください。' : 'PNG、JPEG、WebPを1枚、512 KiBまで送れます。');
+      removeImage.hidden = !image;
+    }
     const relevantOperation = matchesStage(run.operation) && (!intention || intention.id === run.operation?.id) ? run.operation : null;
     const otherWork = apiMode && ((!intention && ui.runIntents.has(runKey)) ||
       (run.operation && !relevantOperation && !finishedPhases.has(phase)));
@@ -1387,6 +1471,7 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
       if (intent?.id === operation.id) {
         ui.runIntents.delete(runKey);
         const key = intentDraftKey(intent);
+        if (intent.imageSha256 && ui.imageDrafts.get(key)?.digest === intent.imageSha256) ui.imageDrafts.delete(key);
         if (text(ui.drafts.get(key), '').trim() === intent.prompt) {
           ui.drafts.delete(key);
           if (key === draftKey) run.clearDraft = intent.prompt;
@@ -1426,7 +1511,15 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
     run.message = '';
     run.onChange?.();
     try {
-      const {draftReceipt, ...request} = payload;
+      const {draftReceipt, imageSha256, ...request} = payload;
+      if (imageSha256) {
+        const image = ui.imageDrafts.get(intentDraftKey(payload));
+        if (image?.digest !== imageSha256) throw new Error('再送する画像を選んでください。');
+        const bytes = new Uint8Array(await image.file.arrayBuffer());
+        if (await imageDigest(bytes) !== imageSha256) throw new Error('送信する画像の内容が変わりました。');
+        if (!isCurrent()) return;
+        request.image = {mime: image.file.type, data: imageBase64(bytes)};
+      }
       const result = await api(apiPath(endpoint, {project}), {
         method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(request),
         signal: AbortSignal.timeout(payload.nativeOrigin ? 30000 : payload.handover ? 16000 : 12000),
@@ -1434,14 +1527,16 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
       if (!result?.operation) throw new Error('作業の受付結果を照合できませんでした。');
       accept(result, payload.id);
     } catch (error) {
-      const confirmedRejection = [400, 403, 413].includes(error.status) || (apiMode || payload.handover) && error.status === 409;
+      const imageModelRejected = Boolean(payload.imageSha256) && error.code === 'CODEX_IMAGE_MODEL_UNAVAILABLE';
+      const confirmedRejection = [400, 403, 413].includes(error.status) || imageModelRejected ||
+        (apiMode || payload.handover) && error.status === 409;
       if (endpoint === path && confirmedRejection && ui.runIntents.get(runKey)?.id === payload.id) {
         ui.runIntents.delete(runKey);
         if (payload.handover) handoff?.invalidate();
         if (payload.nativeOrigin) native?.invalidate();
         storeTab();
       }
-      run.known = Boolean((apiMode || payload.handover) && confirmedRejection);
+      run.known = Boolean((apiMode || payload.handover || imageModelRejected) && confirmedRejection);
       run.message = error.message + ' 作業状態を確認してください。';
     } finally {
       run.busy = false;
@@ -1490,6 +1585,11 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
 
   function sendSteering() {
     if (steer.hidden || run.busy || run.checking || !isCurrent() || ui.steerIntents.has(project)) return;
+    if (ui.imageDrafts.has(draftKey)) {
+      run.steerMessage = '添付した画像は、このスレッドの次のターンに送れます。';
+      paint();
+      return;
+    }
     const prompt = draft.value.trim();
     if (!prompt) {
       run.steerMessage = '追加する指示を下書きに入力してください。';
@@ -1510,6 +1610,13 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
     if (handoff && !previous && (!review || (run.operation?.threadId && run.operation?.turnId))) return;
     const nativeOrigin = native?.origin();
     if (native && !nativeOrigin) return;
+    const image = ui.imageDrafts.get(draftKey);
+    const selectedImageModel = image && imageModel?.();
+    if (image && !selectedImageModel) {
+      run.message = apiMode ? '添付した画像はCodex操作から送信してください。' : '画像入力に対応するモデルを選んでください。';
+      paint();
+      return;
+    }
     const prompt = draft.value.trim() ||
       (previous?.phase === 'interrupted' ? 'このスレッドで中断した作業を再開してください。' : '');
     if (!prompt) {
@@ -1519,6 +1626,10 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
       return;
     }
     const intent = {id: crypto.randomUUID(), prompt, ...choices()};
+    if (image) {
+      intent.imageSha256 = image.digest;
+      intent.model = selectedImageModel;
+    }
     if (previous) {
       intent.resume = previous.id;
       if (handoff) intent.draftReceipt = handoff.receipt;
@@ -1658,6 +1769,9 @@ function modelSettings() {
   draftLabel.append(draft);
   const form = node('fieldset', 'model-pickers');
   area.body.append(form, node('h3', '', '下書き'), draftLabel);
+  let nativeRun;
+  let imageModel = null;
+  const projectSettings = canWrite ? viewResource(memoryKey('execution-settings', project), apiPath('/api/execution/settings', {project})) : null;
   let runChoices = {};
   if (canWrite) {
     const details = node('details', 'scope-info');
@@ -1668,8 +1782,9 @@ function modelSettings() {
     fields.append(route.field, stage.field);
     details.append(node('summary', '', 'この作業の経路を指定'), fields);
     if (ui.capabilities.executionSettings === true) area.body.append(details);
-    mountCodexRun(area, project, draft, draftKey, () => ({...runChoices,
-      ...(route.input.value ? {route: route.input.value} : {}), ...(stage.input.value ? {stage: stage.input.value} : {})}));
+    nativeRun = mountCodexRun(area, project, draft, draftKey, () => ({...runChoices,
+      ...(route.input.value ? {route: route.input.value} : {}), ...(stage.input.value ? {stage: stage.input.value} : {})}),
+    null, {imageModel: () => imageModel});
   }
   else if (ui.capabilities.apiDevelopment !== true) {
     area.body.append(node('p', 'small muted draft-hint', '現在の接続では履歴を閲覧できます。下書きはこのタブに保存されます。'));
@@ -1685,17 +1800,24 @@ function modelSettings() {
     }
     const model = node('select');
     const effort = node('select');
+    model.setAttribute('aria-label', 'モデル');
+    effort.setAttribute('aria-label', '推論レベル');
     const modelLabel = node('label', 'picker');
     const effortLabel = node('label', 'picker');
     modelLabel.append(node('span', '', 'モデル'), model);
     effortLabel.append(node('span', '', '推論レベル'), effort);
-    const stored = ui.options.get(project) ?? {};
     for (const item of models) {
       const option = node('option', '', text(item.displayName, item.id));
       option.value = item.id;
       model.append(option);
     }
-    model.value = models.find(item => item.id === stored.model)?.id ?? models.find(item => item.isDefault)?.id ?? models[0].id;
+    const configuredModel = () => projectSettings?.value?.settings?.model;
+    function applyModelDefault() {
+      const preference = ui.options.get(project);
+      const selection = preference?.sendModel ? preference.model : configuredModel();
+      model.value = models.find(item => item.id === selection)?.id ?? models.find(item => item.isDefault)?.id ?? models[0].id;
+    }
+    applyModelDefault();
     function save({sendModel, sendEffort}) {
       ui.options.set(project, {model: model.value, effort: effort.value, sendModel, sendEffort});
       runChoices = {};
@@ -1705,6 +1827,11 @@ function modelSettings() {
     }
     function populateEffort(modelChanged = false) {
       const entry = models.find(item => item.id === model.value);
+      const previous = ui.options.get(project);
+      const explicit = modelChanged || (previous?.sendModel === true && previous.model === entry?.id);
+      const current = configuredModel();
+      imageModel = asArray(entry?.inputModalities).includes('image') && (explicit ||
+        (projectSettings?.value && (!current ? entry.isDefault === true : current === entry.id))) ? entry.id : null;
       const values = asArray(entry?.reasoningEfforts).map(item => item.reasoningEffort).filter(item => typeof item === 'string');
       effort.replaceChildren();
       for (const item of values) {
@@ -1717,13 +1844,13 @@ function modelSettings() {
         option.value = '';
         effort.append(option);
       }
-      const previous = ui.options.get(project);
       effort.disabled = !values.length;
       effort.value = previous?.model === model.value && values.includes(previous.effort) ? previous.effort :
         values.includes(entry?.defaultReasoningEffort) ? entry.defaultReasoningEffort : values[0] ?? '';
       const sameModel = previous?.model === model.value;
       save({sendModel: modelChanged || (sameModel && previous?.sendModel === true),
         sendEffort: sameModel && previous?.effort === effort.value && previous?.sendEffort === true});
+      nativeRun?.paint();
     }
     model.addEventListener('change', () => populateEffort(true));
     effort.addEventListener('change', () => {
@@ -1732,6 +1859,11 @@ function modelSettings() {
     });
     populateEffort();
     destination.append(modelLabel, effortLabel);
+    if (projectSettings?.pending) void projectSettings.pending.then(() => {
+      if (!form.isConnected || !model.isConnected) return;
+      if (!ui.options.get(project)?.sendModel) applyModelDefault();
+      populateEffort();
+    });
   });
   return area.root;
 }

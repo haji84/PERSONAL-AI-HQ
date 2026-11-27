@@ -13,6 +13,7 @@ const turnItemPageLimit = 12;
 const turnItemPageCount = 4;
 const handoverMessageLimit = 24000;
 const handoverByteLimit = 64 * 1024;
+const inputModalities = ['text', 'image', 'audio'];
 const maxFrame = 2 * 1024 ** 2;
 const clean = (value, limit = 500) => typeof value === 'string' ? value.slice(0, limit) : '';
 const items = value => Array.isArray(value) ? value : [];
@@ -258,7 +259,7 @@ export function createCodexClient({command = binary(), socket} = {}) {
     canWrite: Boolean(socket),
     onEvent(listener) { listeners.add(listener); return () => listeners.delete(listener); },
     async subscriptionReady() { return Boolean(socket) && await subscriptionReady(await current()); },
-    async submit({workspace, prompt, knownId, model, effort, requestId, beforeThread, beforeTurn, onThread}) {
+    async submit({workspace, prompt, knownId, model, effort, requestId, beforeThread, beforeTurn, onThread, image}) {
       if (!socket) throw unavailable('独立して稼働するCodex接続が必要です。');
       const rpc = await current();
       if (!await subscriptionReady(rpc)) throw unavailable('ChatGPTプランの認証を確認できません。');
@@ -277,8 +278,10 @@ export function createCodexClient({command = binary(), socket} = {}) {
         throw unavailable('分離作業先をCodexで確認できませんでした。');
       }
       if (beforeTurn) await beforeTurn();
+      const input = [{type: 'text', text: prompt, text_elements: []}];
+      if (image) input.push({type: 'image', url: `data:${image.mime};base64,${image.data}`});
       const answer = await rpc.call('turn/start', {threadId: thread.id, clientUserMessageId: requestId,
-        input: [{type: 'text', text: prompt, text_elements: []}], cwd: workspace, approvalPolicy: 'never',
+        input, cwd: workspace, approvalPolicy: 'never',
         sandboxPolicy: {type: 'workspaceWrite', writableRoots: [workspace], networkAccess: false,
           excludeTmpdirEnvVar: true, excludeSlashTmp: true}, ...(model ? {model} : {}), ...(effort ? {effort} : {})}, () => {
         if (onThread(thread.id) !== true) throw unavailable('送信権限を確認できませんでした。');
@@ -367,6 +370,7 @@ export function createCodexClient({command = binary(), socket} = {}) {
       ]);
       return {data: items(models.data).filter(row => row?.model && row.hidden !== true).map(row => ({
         id: row.model, displayName: clean(row.displayName, 100) || row.model, isDefault: row.isDefault === true,
+        inputModalities: inputModalities.filter(modality => items(row.inputModalities).includes(modality)),
         reasoningEfforts: items(row.supportedReasoningEfforts).map(option => ({reasoningEffort: clean(option.reasoningEffort, 24),
           description: clean(option.description, 160)})), defaultReasoningEffort: clean(row.defaultReasoningEffort, 24),
       })), accountType: clean(account?.account?.type, 32) || null};
