@@ -439,6 +439,9 @@ test('route estimates use the matching saved settings while preserving the origi
       recordedAt:new Date(Date.now()-7200_000).toISOString()}]}},
     {id:'forbidden',name:'Forbidden-route forecast',delivery:{estimates:[{...common,
       execution:{mode:'auto',allowedRoutes:['subscription']}, apiCostUsd:1}]}},
+    {id:'auto-case',name:'Fallback forecast',delivery:{estimates:[{...common,
+      execution:{mode:'auto',preference:'api-first',allowFallback:true}, apiCostUsd:0.125,tasks}]}},
+
 
   ]};
   const file = join(directory,'portfolio.json');
@@ -449,7 +452,7 @@ test('route estimates use the matching saved settings while preserving the origi
   assert.equal((await fetch(app.url+path+'?project=example')).status,401);
   const cookie = await login(app);
   const get = (route = path+'?project=example') => fetch(app.url+route,{headers:{cookie}});
-  const update = async (revision, settings) => fetch(app.url+'/api/execution/settings?project=example',{method:'POST',
+  const update = async (revision, settings, project = 'example') => fetch(app.url+'/api/execution/settings?project='+project,{method:'POST',
     headers:{cookie, Origin:app.url, 'Content-Type':'application/json'},body:JSON.stringify({revision,settings})});
   assert.equal((await get(path+'?project=example&project=held')).status,404);
   assert.equal((await get(path+'?project=unrelated')).status,404);
@@ -484,6 +487,14 @@ test('route estimates use the matching saved settings while preserving the origi
   const forbidden = await (await get(path+'?project=forbidden')).json();
   assert.equal(forbidden.status,'unavailable');
   assert.equal(forbidden.selected,null);
+  assert.equal((await update(0,{mode:'auto',preference:'api-first',allowFallback:true},'auto-case')).status,200);
+  const auto = await (await get(path+'?project=auto-case')).json();
+  assert.equal(auto.status,'available');
+  assert.equal(auto.held,true);
+  assert.equal(auto.holdReason,'api');
+  assert.equal(auto.selected.firstUsableAt,null);
+  assert.equal(auto.selected.estimatedFinish,null);
+
 
 
   result = await update(0,{mode:'api-only',apiBudgetUsd:8});

@@ -88,9 +88,10 @@ function visibleEstimate({key, time, ...estimate}, hideDates, now) {
 }
 
 export function executionEstimates(input, {settings, revision, apiAvailable}, projectHeld, now = Date.now()) {
-  const holdReason = projectHeld ? 'project' : needsApi(settings) && !apiAvailable ? 'api' : null;
-  const held = holdReason !== null;
-  const summary = {mode:settings.mode, settingsRevision:revision, held, holdReason};
+  function selection(apiCostUsd) {
+    const holdReason = projectHeld ? 'project' : !apiAvailable && (needsApi(settings) || apiCostUsd > 0) ? 'api' : null;
+    return {mode:settings.mode, settingsRevision:revision, held:holdReason !== null, holdReason};
+  }
   try {
     if (input.unavailable || !Array.isArray(input.rows) || input.rows.length > 256) throw invalid();
     const estimates = input.rows.map(row=>normalizeEstimate(row,now)).sort((left,right)=>right.time-left.time);
@@ -102,15 +103,16 @@ export function executionEstimates(input, {settings, revision, apiAvailable}, pr
     }
     const key = executionKey(settings);
     const chosen = estimates.find(item=>item.key === key);
-    if (!chosen) return {...summary,status:'missing',selected:null,alternatives:[]};
+    if (!chosen) return {...selection(),status:'missing',selected:null,alternatives:[]};
     const alternatives = new Map();
     for (const item of estimates) {
       if (item.mode === settings.mode || alternatives.has(item.mode) ||
           item.target !== chosen.target || item.scope !== chosen.scope) continue;
       alternatives.set(item.mode,visibleEstimate(item,true,now));
     }
-    return {...summary,status:'available',selected:visibleEstimate(chosen,held,now),alternatives:[...alternatives.values()]};
+    const summary = selection(chosen.apiCostUsd);
+    return {...summary,status:'available',selected:visibleEstimate(chosen,summary.held,now),alternatives:[...alternatives.values()]};
   } catch {
-    return {...summary,status:'unavailable',selected:null,alternatives:[]};
+    return {...selection(),status:'unavailable',selected:null,alternatives:[]};
   }
 }
