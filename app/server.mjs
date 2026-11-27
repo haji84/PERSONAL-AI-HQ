@@ -537,7 +537,8 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       const summaries = portfolioExecution(portfolio.projects);
       const projects = portfolio.view.projects.map(project=>portfolio.projects.has(project.id)
         ? {...project,executionSummary:summaries.get(project.id) ?? unknownExecution} : project);
-      return send(response, 200, {...portfolio.view, projects, newProjectExecutionSettings:normalizeSettings(),
+      return send(response, 200, {...portfolio.view, projects, appHostPlatform:process.platform,
+        newProjectExecutionSettings:normalizeSettings(),
         recentWorkOutcomes:recentWorkOutcomes(directory, portfolio.projects, operations, apiWork)});
     }
     if (get && route === '/api/artifacts/file') return download(response, portfolio.artifacts.get(target.searchParams.get('id')));

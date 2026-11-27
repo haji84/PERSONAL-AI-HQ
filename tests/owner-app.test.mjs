@@ -77,13 +77,16 @@ async function login(app) {
 
 test('owner credentials are one-use and private API calls never expose the workspace path', async t => {
   const {app, reads} = await fixture(t);
-  assert.equal((await fetch(`${app.url}/api/portfolio`)).status, 401);
+  const anonymous = await fetch(`${app.url}/api/portfolio`);
+  assert.equal(anonymous.status, 401);
+  assert.equal((await anonymous.json()).appHostPlatform, undefined);
   assert.equal((await fetch(`${app.url}/api/codex/threads?project=example`)).status, 401);
   assert.equal(reads(), 0);
   const cookie = await login(app);
   const response = await fetch(`${app.url}/api/portfolio`, {headers: {cookie}});
   assert.equal(response.status, 200);
   const portfolio = await response.json();
+  assert.equal(portfolio.appHostPlatform, process.platform);
   assert.equal(portfolio.projects[0].name, '検証用プロジェクト');
   assert.equal(portfolio.projects[0].cwd, undefined);
   assert.equal(portfolio.apiCreditObservation.balanceUsd, 10);

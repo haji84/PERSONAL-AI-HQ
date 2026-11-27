@@ -250,10 +250,22 @@ function setNotice(message = '', isError = false) {
   dom.notice.classList.toggle('error', isError);
 }
 const connectionMessages = {
-  offline: '端末はオフラインです。表示中の情報は前回取得したものです。',
+  offline: 'このブラウザーはオフラインです。表示中の情報は前回取得したものです。',
   unreachable: 'アプリとの通信を確認できません。表示中の情報は前回取得したものです。',
   checking: 'アプリへの再接続を確認しています。',
 };
+let appHostObservation;
+function paintAppHostConnection(indicator = document.getElementById('app-host-connection')) {
+  if (!indicator) return;
+  const connected = connectionState === 'connected' && appHostObservation?.generation === connectionGeneration &&
+    performance.now() - appHostObservation.receivedAt < 60000;
+  indicator.textContent = connected ? '応答あり' : '応答未確認';
+  indicator.classList.toggle('positive', connected);
+}
+function forgetAppHostObservation() {
+  appHostObservation = undefined;
+  paintAppHostConnection();
+}
 function showConnection(state) {
   if (connectionState === state) return;
   connectionState = state;
@@ -277,6 +289,7 @@ function showConnection(state) {
   }
   if (state === 'connected' && document.activeElement === retry) dom['refresh-button'].focus({preventScroll: true});
   status.hidden = state === 'connected';
+  paintAppHostConnection();
 }
 function gate(title, description, canRetry) {
   dom.shell.hidden = true;
@@ -300,6 +313,7 @@ function endSession() {
   resources.clear();
   ui.attachmentDrafts.clear();
   ui.portfolio = null;
+  appHostObservation = undefined;
   dom.content.replaceChildren();
   syncChatDevelopment();
   if (ui.capabilities.tailnetSignIn === true) {
@@ -1561,6 +1575,8 @@ function dashboardProjectRow(projectId) {
 
 function setObservedPortfolio(portfolio, generation) {
   ui.portfolio = portfolio;
+  appHostObservation = {generation, receivedAt: performance.now()};
+  paintAppHostConnection();
   let newlyConfirmed = false;
   for (const {executionSummary} of projectList()) {
     if (!executionSummary || typeof executionSummary !== 'object' ||
@@ -1741,18 +1757,29 @@ function dashboard() {
   right.append(usagePanel());
 
   const devices = panel('実行端末');
+  devices.root.id = 'execution-devices';
+  const systems = {darwin:'macOS', win32:'Windows', linux:'Linux'};
+  const platform = ui.portfolio?.appHostPlatform;
+  if (Object.hasOwn(systems, platform)) {
+    const host = node('div', 'device-row');
+    const indicator = node('span', 'chip');
+    indicator.id = 'app-host-connection';
+    paintAppHostConnection(indicator);
+    host.append(node('span', 'strong', 'アプリ接続先 · ' + systems[platform]), indicator);
+    devices.body.append(host);
+  }
   const rows = node('ul', 'rows');
   for (const device of asArray(ui.portfolio?.devices)) {
     const item = node('div', 'device-row');
     const block = node('span', 'strong', text(device.name));
-    block.append(node('span', 'small muted', '観測 ' + time(device.observedAt)));
-    item.append(block, chip(device.state, stateLabels[statusKey(device.state)] ?? text(device.state, '状態未確認')));
+    const observed = '前回の観測 ' + time(device.observedAt);
+    const note = stateLabels[statusKey(device.state)] ?? text(device.state, '');
+    block.append(node('span', 'small muted', note ? observed + ' · ' + note : observed));
+    item.append(block, chip('unknown', '現在の端末状態は未確認'));
     rows.append(listItem(item));
   }
-  if (rows.children.length) {
-    devices.body.remove();
-    devices.root.append(rows);
-  } else devices.body.append(node('p', 'muted', '実行端末の状態を確認できません。'));
+  if (rows.children.length) devices.body.append(rows);
+  else devices.body.append(node('p', 'muted', '実行端末の観測記録を取得できません。'));
   right.append(devices.root);
 
   const recent = asArray(ui.portfolio?.artifacts).slice(0, 3);
@@ -4884,6 +4911,7 @@ function canRefreshVisibleDashboard() {
 }
 async function refreshVisibleDashboard() {
   refreshEstimateReadouts();
+  paintAppHostConnection();
   if (portfolioPollRunning || !canRefreshVisibleDashboard()) return;
   const generation = requestSequence;
   const connection = connectionGeneration;
@@ -4928,6 +4956,7 @@ async function refreshVisibleDashboard() {
     }
     if (focusedProject) dashboardProjectRow(focusedProject)?.focus({preventScroll: true});
   } catch {
+    if (generation === requestSequence && connection === connectionGeneration) forgetAppHostObservation();
     if (isCurrent()) dom['page-summary'].textContent = dashboardSummary() + ' · 更新できません。前回の情報を表示しています。';
   } finally { portfolioPollRunning = false; }
 }
@@ -4952,6 +4981,7 @@ async function refresh() {
     render();
   } catch (error) {
     if (id !== requestSequence) return;
+    if (generation === connectionGeneration) forgetAppHostObservation();
     if (ui.portfolio) setNotice(generation === connectionGeneration ? error.message : '', true);
     else if (error.status !== 401) gate('情報を取得できません', error.message, true);
   } finally {
