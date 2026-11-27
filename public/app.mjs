@@ -70,6 +70,7 @@ const activityLabels = {
 const chatSourceLabels = {'chatgpt-export': 'ChatGPTの書き出し', 'chatgpt-live': 'ChatGPTプラン',
   'api-development': '通常APIの開発', 'codex-history': 'Codex'};
 let requestSequence = 0;
+let portfolioPollRunning = false;
 let mounted = 0;
 let pendingScroll;
 let activityTimer;
@@ -210,6 +211,7 @@ function changeView() {
   ui.view = next;
   if (next === 'dashboard') resources.delete(memoryKey('usage'));
   render();
+  if (next === 'dashboard') void refreshVisibleDashboard();
 }
 function setTheme() {
   document.documentElement.dataset.theme = ui.theme;
@@ -597,6 +599,7 @@ function tailnetPanel() {
     for (const control of buttons) control.disabled = true;
     status.textContent = '';
     paired.replaceChildren();
+    delete paired.dataset.pairExpiresAt;
     try { accept(await api(path, {method: 'POST'})); }
     catch (error) { status.textContent = error.message; }
     finally { for (const control of buttons) control.disabled = false; }
@@ -608,6 +611,7 @@ function tailnetPanel() {
       const address = link(result.url, result.url);
       if (address) paired.append(address);
       paired.append(node('p', 'small muted', '接続コード'), node('code', '', result.code));
+      paired.dataset.pairExpiresAt = result.expiresAt;
       status.textContent = '有効期限 ' + time(result.expiresAt);
     }), false), button('すべての遠隔接続を終了', () => run('/api/access/revoke', () => {
       status.textContent = '遠隔接続と未使用の接続コードを無効にしました。';
@@ -2368,7 +2372,8 @@ function emptyProject() {
 }
 
 const screens = {dashboard, chat, codex, artifacts};
-function render(restore = true) {
+const dashboardSummary = () => '案件データの観測 ' + time(ui.portfolio?.observedAt);
+function render(restore = true, keepNotice = false) {
   if (dom.shell.hidden) return;
   abortLocalDictation();
   stopSpeech();
@@ -2376,7 +2381,7 @@ function render(restore = true) {
   mounted++;
   const intended = ui.scroll.get(routeKey());
   pendingScroll = restore ? {epoch: mounted, y: Number.isFinite(intended) ? intended : 0} : null;
-  setNotice();
+  if (!keepNotice) setNotice();
   dom.content.replaceChildren();
   for (const anchor of dom.navigation.querySelectorAll('[data-view]')) {
     if (anchor.dataset.view === ui.view) anchor.setAttribute('aria-current', 'page');
@@ -2386,7 +2391,7 @@ function render(restore = true) {
   document.title = title + ' · Personal AI HQ';
   dom['page-title'].textContent = title;
   const summaries = {
-    dashboard: '情報の取得時刻 ' + time(ui.portfolio?.observedAt),
+    dashboard: dashboardSummary(),
     chat: 'プロジェクト別の会話履歴',
     codex: '端末から取得したスレッドと会話本文',
     artifacts: '確認された成果物を横断して検索',
@@ -2396,6 +2401,31 @@ function render(restore = true) {
   paintActivity();
   void pollActivity();
   if (restore) restoreScroll();
+}
+function canRefreshVisibleDashboard() {
+  if (document.hidden || dom.shell.hidden || ui.view !== 'dashboard' || !ui.portfolio || dom['refresh-button'].disabled) return false;
+  const focused = document.activeElement;
+  const editing = focused?.matches('input, select, textarea, [contenteditable="true"]');
+  const pairing = dom.content.querySelector('[data-pair-expires-at]');
+  return !editing && !dom.content.querySelector('details[open]') && !(Date.parse(pairing?.dataset.pairExpiresAt) > Date.now());
+}
+async function refreshVisibleDashboard() {
+  if (portfolioPollRunning || !canRefreshVisibleDashboard()) return;
+  const generation = requestSequence;
+  const isCurrent = () => generation === requestSequence && canRefreshVisibleDashboard();
+  portfolioPollRunning = true;
+  try {
+    const latest = await api('/api/portfolio', {signal: AbortSignal.timeout(6500)});
+    if (!isCurrent()) return;
+    dom['page-summary'].textContent = dashboardSummary();
+    if (JSON.stringify(latest) === JSON.stringify(ui.portfolio)) return;
+    rememberScroll();
+    ui.portfolio = latest;
+    updateProjectSelect();
+    render(true, true);
+  } catch {
+    if (isCurrent()) dom['page-summary'].textContent = dashboardSummary() + ' · 更新できません。前回の情報を表示しています。';
+  } finally { portfolioPollRunning = false; }
 }
 async function refresh() {
   const id = ++requestSequence;
@@ -2468,8 +2498,12 @@ window.addEventListener('pagehide', () => {
 });
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) abortLocalDictation();
-  else void pollActivity();
+  else {
+    void refreshVisibleDashboard();
+    void pollActivity();
+  }
 });
+window.setInterval(() => void refreshVisibleDashboard(), 30000);
 if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
 setTheme();
 void activate();
