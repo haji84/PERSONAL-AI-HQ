@@ -70,6 +70,7 @@ const chatStreams = new Map();
 const activities = new Map();
 const nativeActivities = new Map();
 const nativeNotices = new Map();
+const dashboardExecutionGenerations = new WeakMap();
 const activityLabels = {
   reserved: '受付済み', sending: 'Codexへの送信を確認中', running: '実行中', interrupting: '中断を要求中', cancelling: '中止を照合中',
   unconfirmed: '状態未確認', completed: 'ターン完了', interrupted: '中断済み', cancelled: '中止済み', failed: '実行失敗',
@@ -92,6 +93,8 @@ let activityTimer;
 let activityPollRunning = false;
 let activitySession;
 let activeSpeech;
+let connectionState = 'connected';
+let connectionGeneration = 0;
 
 function storePreferences() {
   writeStorage(localStorage, prefsKey, {
@@ -122,6 +125,21 @@ function button(text, handler, secondary = true) {
   element.type = 'button';
   element.addEventListener('click', handler);
   return element;
+}
+function mountConnectionStatus() {
+  const status = node('div', 'notice connection-status');
+  const message = node('span');
+  const retry = button('接続を再確認', recheckConnection);
+  status.id = 'connection-status';
+  status.hidden = true;
+  message.id = 'connection-message';
+  message.setAttribute('role', 'status');
+  retry.id = 'connection-retry';
+  status.append(message, retry);
+  dom.notice.before(status);
+  dom['connection-status'] = status;
+  dom['connection-message'] = message;
+  dom['connection-retry'] = retry;
 }
 function labeledSelect(label, options) {
   const field = node('label', 'picker');
@@ -242,6 +260,35 @@ function setNotice(message = '', isError = false) {
   dom.notice.hidden = !message;
   dom.notice.classList.toggle('error', isError);
 }
+const connectionMessages = {
+  offline: '端末はオフラインです。表示中の情報は前回取得したものです。',
+  unreachable: 'アプリとの通信を確認できません。表示中の情報は前回取得したものです。',
+  checking: 'アプリへの再接続を確認しています。',
+};
+function showConnection(state) {
+  if (connectionState === state) return;
+  connectionState = state;
+  connectionGeneration++;
+  const status = dom['connection-status'];
+  const retry = dom['connection-retry'];
+  dom['connection-message'].textContent = connectionMessages[state] ?? '';
+  retry.disabled = state !== 'unreachable';
+  status.classList.toggle('error', state === 'offline' || state === 'unreachable');
+  if (state !== 'connected' && state !== 'checking') {
+    for (const [project, activity] of activities) {
+      if (activity && !activity.terminal && activity.phase !== 'cancelling') {
+        activities.set(project, {...activity, phase: 'unconfirmed'});
+      }
+    }
+    for (const [project, snapshot] of nativeActivities) {
+      if (snapshot.status === 'observed') nativeActivities.set(project, {...snapshot, status: 'unavailable'});
+    }
+    paintActivity();
+    repaintDashboardExecutions();
+  }
+  if (state === 'connected' && document.activeElement === retry) dom['refresh-button'].focus({preventScroll: true});
+  status.hidden = state === 'connected';
+}
 function gate(title, description, canRetry) {
   dom.shell.hidden = true;
   dom.gate.hidden = false;
@@ -252,6 +299,7 @@ function gate(title, description, canRetry) {
 }
 function endSession() {
   requestSequence++;
+  connectionGeneration++;
   abortLocalDictation();
   stopSpeech();
   for (const stop of runViewCleanups) stop();
@@ -291,7 +339,7 @@ function paintNativeActivity() {
   if (!snapshot) return;
   const info = section.querySelector('p');
   const list = section.querySelector('ul');
-  const current = snapshot.status === 'observed' && performance.now() - snapshot.receivedAt <= 30000;
+  const current = connectionState === 'connected' && snapshot.status === 'observed' && performance.now() - snapshot.receivedAt <= 30000;
   const rows = current ? snapshot.live : [];
   const scopes = current ? [
     rows.length ? '接続先で稼働中のスレッドを' + rows.length + '件確認' : '稼働中と確認できたスレッドは0件',
@@ -376,7 +424,8 @@ function paintActivity() {
     return;
   }
   const status = node('p', 'small');
-  const stale = !activity.terminal && activity.phase !== 'cancelling' && Date.now() - Date.parse(activity.observedAt) > 30000;
+  const stale = !activity.terminal && activity.phase !== 'cancelling' &&
+    (connectionState !== 'connected' || Date.now() - Date.parse(activity.observedAt) > 30000);
   const phase = stale ? 'unconfirmed' : activity.phase;
   status.append(chip(phase, activityLabels[phase]),
     node('span', 'muted', '  最終確認 ' + time(activity.observedAt)));
@@ -389,9 +438,11 @@ function paintActivity() {
 async function pollActivity() {
   if (ui.capabilities.executionActivity !== true || !ui.portfolio || !ui.project || activityPollRunning) return;
   clearTimeout(activityTimer);
-  if (document.hidden) return;
+  if (document.hidden || connectionState === 'offline' || connectionState === 'checking') return;
   activityPollRunning = true;
   const session = activitySession ??= Symbol();
+  const generation = connectionGeneration;
+  const isCurrent = () => activitySession === session && generation === connectionGeneration;
   const currentProject = ui.project;
   const selected = new Set(selectedProject()?.registration === 'github' ? [] : [currentProject]);
   const now = performance.now();
@@ -416,7 +467,7 @@ async function pollActivity() {
         for (const key of watched.keys()) params.append('watch', key);
         ({activity, nativeActivity: observedNative} = await api(params.size ? path + '&' + params : path, {signal: AbortSignal.timeout(6500)}));
       } catch {
-        if (activitySession === session) {
+        if (isCurrent()) {
           if (previous && !previous.terminal && previous.phase !== 'cancelling') {
             activities.set(project, {...previous, phase: 'unconfirmed'});
           }
@@ -424,7 +475,7 @@ async function pollActivity() {
         }
         return;
       }
-      if (activitySession !== session || (activity !== null && (typeof activity?.id !== 'string' ||
+      if (!isCurrent() || (activity !== null && (typeof activity?.id !== 'string' ||
           typeof activity.terminal !== 'boolean' || !Object.hasOwn(activityLabels, activity.phase)))) return;
       activities.set(project, activity);
       if (observeNative) recordNativeActivity(project, observedNative, watched, trackNewTurns);
@@ -463,10 +514,24 @@ const httpMessages = {
   429: '取得が混み合っています。少し待ってから更新してください。',
   503: '接続先の現在の状態を確認できません。',
 };
-async function api(path, options = {}) {
+function transportFailed(generation, signal) {
+  if (generation === connectionGeneration && !signal?.aborted && !dom.shell.hidden && connectionState !== 'checking') {
+    showConnection(navigator.onLine ? 'unreachable' : 'offline');
+  }
+}
+async function requestOwner(path, options = {}) {
+  const generation = connectionGeneration;
   let response;
-  try { response = await fetch(path, {...options, credentials: 'same-origin', cache: 'no-store'}); }
-  catch { throw new Error('通信できませんでした。接続してから更新してください。'); }
+  try { response = await fetch(path, {...options, credentials: 'same-origin'}); }
+  catch {
+    transportFailed(generation, options.signal);
+    throw new Error('通信できませんでした。接続してから更新してください。');
+  }
+  return response;
+}
+async function api(path, options = {}) {
+  const generation = connectionGeneration;
+  const response = await requestOwner(path, {...options, cache: 'no-store'});
   if (response.status === 401) endSession();
   if (!response.ok) {
     const problem = await response.json().catch(() => null);
@@ -476,8 +541,40 @@ async function api(path, options = {}) {
     error.code = problem?.code;
     throw error;
   }
-  try { return await response.json(); }
-  catch { throw new Error('対応するデータを読み込めませんでした。'); }
+  try {
+    const data = await response.json();
+    if (generation === connectionGeneration && connectionState === 'unreachable') void recheckConnection();
+    return data;
+  } catch (error) {
+    if (error instanceof TypeError) transportFailed(generation, options.signal);
+    throw new Error('対応するデータを読み込めませんでした。');
+  }
+}
+async function recheckConnection() {
+  if (dom.shell.hidden || connectionState === 'checking') return;
+  if (!navigator.onLine) { showConnection('offline'); return; }
+  showConnection('checking');
+  const generation = connectionGeneration;
+  const isCurrent = () => generation === connectionGeneration && !dom.shell.hidden;
+  try {
+    const response = await requestOwner('/api/session', {cache: 'no-store', signal: AbortSignal.timeout(6500)});
+    if (!isCurrent()) return;
+    if (response.status === 401) { endSession(); return; }
+    if (!response.ok) throw new Error();
+    const session = await response.json();
+    if (!isCurrent()) return;
+    if (session?.authenticated === false) {
+      ui.capabilities = session.capabilities ?? {};
+      endSession();
+      return;
+    }
+    if (session?.authenticated !== true) throw new Error();
+    showConnection('connected');
+    void refreshVisibleDashboard();
+    void pollActivity();
+  } catch {
+    if (isCurrent()) showConnection(navigator.onLine ? 'unreachable' : 'offline');
+  }
 }
 
 function panel(name) {
@@ -780,12 +877,13 @@ function executionSettings(project) {
         save.disabled = true;
         estimates.clear('実行設定の保存を確認中…');
         try {
+          const generation = connectionGeneration;
           const saved = await api(path, {method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({revision: current.revision, settings: editor.value()})});
           if (resources.get(key)?.value?.revision > saved.revision || !ui.portfolio) return;
           current = saved;
           resources.set(key, {value: current});
-          applyDashboardExecution(project, current.executionSummary);
+          applyDashboardExecution(project, current.executionSummary, generation);
           if (!isCurrent()) return;
           editor.apply(current.settings);
           status.textContent = 'この案件の実行設定を保存しました。';
@@ -907,13 +1005,18 @@ function projectRegistrationForm(github, pendingKey = null) {
       intent = null;
       if (!current()) return;
       const sequence = requestSequence;
+      const generation = connectionGeneration;
       const latest = await api('/api/portfolio', {signal: AbortSignal.timeout(10000)});
       if (!current() || sequence !== requestSequence) return;
+      if (generation !== connectionGeneration) {
+        status.textContent = '登録した案件の一覧をもう一度取得できます。';
+        return;
+      }
       if (!asArray(latest?.projects).some(project => project.id === registeredId)) {
         throw new Error('登録した案件が一覧に表示されるまで、もう一度取得してください。');
       }
       rememberScroll();
-      ui.portfolio = latest;
+      setObservedPortfolio(latest, generation);
       ui.project = registeredId;
       updateProjectSelect();
       setNotice('案件を登録しました。');
@@ -1351,6 +1454,28 @@ function dashboardProjectRow(projectId) {
   return [...dom.content.querySelectorAll('[data-dashboard-project]')].find(row => row.dataset.dashboardProject === projectId);
 }
 
+function setObservedPortfolio(portfolio, generation) {
+  ui.portfolio = portfolio;
+  let newlyConfirmed = false;
+  for (const {executionSummary} of projectList()) {
+    if (!executionSummary || typeof executionSummary !== 'object' ||
+        dashboardExecutionGenerations.get(executionSummary) === generation) continue;
+    dashboardExecutionGenerations.set(executionSummary, generation);
+    newlyConfirmed = true;
+  }
+  return newlyConfirmed;
+}
+
+function repaintDashboardExecutions() {
+  if (ui.view !== 'dashboard') return;
+  const projects = new Map(projectList().map(project => [project.id, project]));
+  for (const row of dom.content.querySelectorAll('[data-dashboard-project]')) {
+    const summary = row.querySelector('[data-execution-summary]');
+    const project = projects.get(row.dataset.dashboardProject);
+    if (summary && project) paintDashboardExecution(summary, project);
+  }
+}
+
 function paintDashboardExecution(element, project) {
   clearTimeout(dashboardExecutionTimers.get(element));
   if (project.registration === 'github' || !project.executionSummary) {
@@ -1366,7 +1491,8 @@ function paintDashboardExecution(element, project) {
   const observed = Date.parse(summary.observedAt);
   const lastConfirmed = Date.parse(summary.observedUntil);
   const activeUntil = Date.parse(summary.activeUntil);
-  const verified = route && ['active','observed'].includes(summary.routeState) && observed <= now && now < lastConfirmed;
+  const verified = connectionState === 'connected' && dashboardExecutionGenerations.get(summary) === connectionGeneration &&
+    route && ['active','observed'].includes(summary.routeState) && observed <= now && now < lastConfirmed;
   const active = verified && summary.routeState === 'active' && now < activeUntil;
   const routeLabel = active ? route + ' · 実行中' : verified ? route + ' · 確認 ' + time(summary.observedAt) : '不明';
   const reason = Object.hasOwn(executionStopLabels, summary.stopReason) && executionStopLabels[summary.stopReason];
@@ -1396,10 +1522,11 @@ function paintDashboardExecution(element, project) {
   }
 }
 
-function applyDashboardExecution(projectId, summary) {
+function applyDashboardExecution(projectId, summary, generation) {
   const project = projectList().find(item => item.id === projectId);
-  if (!project || project.registration === 'github' || !summary) return;
+  if (!project || project.registration === 'github' || !summary || typeof summary !== 'object') return;
   project.executionSummary = summary;
+  dashboardExecutionGenerations.set(summary, generation);
   dashboardExecutionVersion++;
   const element = dashboardProjectRow(projectId)?.querySelector('[data-execution-summary]');
   if (element) paintDashboardExecution(element, project);
@@ -1608,7 +1735,7 @@ function speechControls(project, text) {
     status.textContent = '音声を準備しています。';
     audio.hidden = true;
     try {
-      const request = () => fetch(apiPath('/api/chat/speech', {project}), {method: 'POST', cache: 'no-store', credentials: 'same-origin',
+      const request = () => requestOwner(apiPath('/api/chat/speech', {project}), {method: 'POST', cache: 'no-store',
         headers: {'Content-Type': 'application/json'}, body: JSON.stringify({text: content}), signal: playback.controller.signal});
       let response = await request();
       if (response.status === 409 && playback.replacing && isCurrent(playback)) {
@@ -2003,7 +2130,7 @@ function planComposer(project, onConversation) {
     attachmentError = '';
     controls();
     try {
-      const response = await fetch(path, {credentials: 'same-origin'});
+      const response = await requestOwner(path);
       if (response.status === 401) { endSession(); return; }
       if (!response.ok || response.headers.get('content-type') !== expected.mime) {
         throw new Error('添付画像を取得できませんでした。');
@@ -2179,7 +2306,7 @@ function planComposer(project, onConversation) {
         }
         payload.image = {mime: attachment.file.type, data: imageBase64(bytes)};
       }
-      const response = await fetch(apiPath('/api/chat/live', {project}), {method: 'POST', credentials: 'same-origin',
+      const response = await requestOwner(apiPath('/api/chat/live', {project}), {method: 'POST',
         headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload),
         signal: controller.signal});
       if (response.status === 401) endSession();
@@ -3955,6 +4082,7 @@ function render(restore = true, keepNotice = false) {
   if (restore) restoreScroll();
 }
 function canRefreshVisibleDashboard() {
+  if (connectionState === 'offline' || connectionState === 'checking') return false;
   if (document.hidden || dom.shell.hidden || ui.view !== 'dashboard' || !ui.portfolio || dom['refresh-button'].disabled) return false;
   const focused = document.activeElement;
   const editing = focused?.matches('input, select, textarea, [contenteditable="true"]');
@@ -3965,18 +4093,22 @@ async function refreshVisibleDashboard() {
   refreshEstimateReadouts();
   if (portfolioPollRunning || !canRefreshVisibleDashboard()) return;
   const generation = requestSequence;
+  const connection = connectionGeneration;
   const executionVersion = dashboardExecutionVersion;
-  const isCurrent = () => generation === requestSequence &&
+  const isCurrent = () => generation === requestSequence && connection === connectionGeneration &&
     executionVersion === dashboardExecutionVersion && canRefreshVisibleDashboard();
   portfolioPollRunning = true;
   try {
     const latest = await api('/api/portfolio', {signal: AbortSignal.timeout(6500)});
     if (!isCurrent()) return;
     dom['page-summary'].textContent = dashboardSummary();
-    if (JSON.stringify(latest) === JSON.stringify(ui.portfolio)) return;
+    if (JSON.stringify(latest) === JSON.stringify(ui.portfolio)) {
+      if (setObservedPortfolio(ui.portfolio, connection)) repaintDashboardExecutions();
+      return;
+    }
     const focusedProject = document.activeElement?.dataset?.dashboardProject;
     rememberScroll();
-    ui.portfolio = latest;
+    setObservedPortfolio(latest, connection);
     updateProjectSelect();
     render(true, true);
     if (focusedProject) dashboardProjectRow(focusedProject)?.focus({preventScroll: true});
@@ -3986,6 +4118,7 @@ async function refreshVisibleDashboard() {
 }
 async function refresh() {
   const id = ++requestSequence;
+  const generation = connectionGeneration;
   const executionVersion = dashboardExecutionVersion;
   dom['refresh-button'].disabled = true;
   const onPage = !dom.shell.hidden;
@@ -3993,17 +4126,18 @@ async function refresh() {
   try {
     const portfolio = await api('/api/portfolio');
     if (id !== requestSequence) return;
-    if (executionVersion !== dashboardExecutionVersion) { setNotice(); return; }
+    if (generation !== connectionGeneration || executionVersion !== dashboardExecutionVersion) { setNotice(); return; }
     if (onPage) rememberScroll();
-    ui.portfolio = portfolio;
-    resources.clear();
-    updateProjectSelect();
     dom.gate.hidden = true;
     dom.shell.hidden = false;
+    if (!onPage) showConnection(navigator.onLine ? 'connected' : 'offline');
+    setObservedPortfolio(portfolio, connectionGeneration);
+    resources.clear();
+    updateProjectSelect();
     render();
   } catch (error) {
     if (id !== requestSequence) return;
-    if (ui.portfolio) setNotice(error.message, true);
+    if (ui.portfolio) setNotice(generation === connectionGeneration ? error.message : '', true);
     else if (error.status !== 401) gate('情報を取得できません', error.message, true);
   } finally {
     if (id === requestSequence) dom['refresh-button'].disabled = false;
@@ -4042,6 +4176,7 @@ dom['gate-tailnet'].addEventListener('submit', async event => {
 dom['gate-retry'].addEventListener('click', activate);
 dom['project-select'].addEventListener('change', event => selectProject(event.target.value));
 dom['refresh-button'].addEventListener('click', refresh);
+mountConnectionStatus();
 dom['chat-development-toggle'].addEventListener('click', () => {
   ui.showChatDevelopment = !ui.showChatDevelopment;
   storeTab();
@@ -4059,6 +4194,12 @@ dom['theme-button'].addEventListener('click', () => {
   storePreferences();
 });
 window.addEventListener('hashchange', changeView);
+window.addEventListener('offline', () => {
+  if (!dom.shell.hidden) showConnection('offline');
+});
+window.addEventListener('online', () => {
+  if (connectionState !== 'connected') void recheckConnection();
+});
 for (const input of ['wheel', 'touchstart', 'pointerdown', 'keydown']) {
   window.addEventListener(input, () => { pendingScroll = null; }, {passive: true});
 }

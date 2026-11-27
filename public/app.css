@@ -117,6 +117,8 @@ main { width: 100%; max-width: 1440px; margin: 0 auto; padding: 33px clamp(16px,
 .button.secondary { border-color: var(--line); background: var(--surface); color: var(--text); }
 .notice { margin: 0 0 15px; padding: 8px 12px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-soft); color: var(--muted); font-size: .875rem; overflow-wrap: anywhere; }
 .notice.error { background: var(--warn-bg); color: var(--warn-ink); }
+.connection-status { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; }
+.connection-status .button { min-height: 44px; }
 .metrics { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 9px; margin-bottom: 22px; }
 .stat { min-width: 0; padding: 12px 13px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
 .stat strong { display: block; color: var(--accent); font-size: 1.4rem; line-height: 1.25; font-variant-numeric: tabular-nums; }
