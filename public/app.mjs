@@ -1,3 +1,5 @@
+import {abortLocalDictation, createLocalDictation} from './dictation.mjs';
+
 const pages = {
   dashboard: 'ダッシュボード',
   chat: 'チャット',
@@ -231,6 +233,7 @@ function gate(title, description, canRetry) {
 }
 function endSession() {
   requestSequence++;
+  abortLocalDictation();
   stopSpeech();
   for (const stop of runViewCleanups) stop();
   clearTimeout(activityTimer);
@@ -741,6 +744,10 @@ function stopSpeech() {
   current.toggle.textContent = '読み上げ';
   current.status.textContent = '';
 }
+function addDictation(area, draft) {
+  const control = createLocalDictation(draft, {beforeStart: stopSpeech});
+  if (control) area.append(control);
+}
 function speechChunks(text) {
   const speakable = text.replaceAll('[[', '[ [').replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/gu, ' ');
   const chunks = [];
@@ -769,6 +776,7 @@ function speechControls(project, text) {
       stopSpeech();
       return;
     }
+    abortLocalDictation();
     const replacing = Boolean(activeSpeech);
     stopSpeech();
     const playback = {audio, status, toggle, controller: new AbortController(), chunks: speechChunks(text), next: 0, url: '', replacing};
@@ -952,7 +960,9 @@ function planComposer(project, onConversation) {
     } catch (error) { status.textContent = error.message; signIn.disabled = false; }
   });
   actions.append(send, stop, check, retry, discard);
-  picks.append(modelLabel, referenceLabel, draftLabel, actions, output);
+  picks.append(modelLabel, referenceLabel, draftLabel);
+  addDictation(picks, draft);
+  picks.append(actions, output);
   area.body.append(status, signIn, picks);
   signIn.hidden = true;
   picks.hidden = true;
@@ -1006,6 +1016,7 @@ function planComposer(project, onConversation) {
       status.textContent = '別の経路の記録をChatGPTプランに引き継ぐには、作業の照合が必要です。';
       return;
     }
+    abortLocalDictation(draft);
     const id = crypto.randomUUID();
     ui.chatIntents.set(project, {id, conversationId, model: model.value, prompt});
     ui.chatTurns.set(project, id);
@@ -1168,6 +1179,7 @@ function mountChatHandoff(destination, project, conversation, isCurrent) {
   const label = node('label', 'picker');
   label.append(node('span', '', 'Codexで続ける指示'), draft);
   root.append(label);
+  addDictation(root, draft);
   destination.append(root);
   run = mountCodexRun({root, body: root}, project, draft, key, () => ({route: 'subscription', stage: 'implementation'}), null, {
     handoff: {
@@ -1211,6 +1223,7 @@ function chat() {
     cleanupAdvice = advice.cleanup;
   }
   function showChatDetails() {
+    abortLocalDictation();
     stopSpeech();
     cleanupHandoff?.();
     cleanupHandoff = undefined;
@@ -1791,6 +1804,7 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
       return;
     }
     const request = {id: crypto.randomUUID(), operationId: run.operation.id, prompt};
+    abortLocalDictation(draft);
     if (handoff) request.draftReceipt = handoff.receipt;
     ui.steerIntents.set(project, request);
     storeTab();
@@ -1820,6 +1834,7 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
       return;
     }
     const intent = {id: crypto.randomUUID(), prompt, ...choices()};
+    abortLocalDictation(draft);
     if (isImage) {
       intent.imageSha256 = attachment.digest;
       intent.model = selectedImageModel;
@@ -1838,6 +1853,7 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
 
   run.onChange = paint;
   const cleanup = () => {
+    abortLocalDictation(draft);
     disposed = true;
     clearTimeout(timer);
     if (run.onChange === paint) run.onChange = null;
@@ -1940,6 +1956,7 @@ function apiAdviceComposer(project, onComplete, threadId) {
     area.body.append(verify, status);
   }
   area.body.append(label);
+  addDictation(area.body, draft);
   run = mountApiControls(area, project, draft, draftKey, {native, onComplete() {
     if (origin) native.invalidate();
     onComplete();
@@ -1965,6 +1982,7 @@ function modelSettings() {
   draftLabel.append(draft);
   const form = node('fieldset', 'model-pickers');
   area.body.append(form, node('h3', '', '下書き'), draftLabel);
+  addDictation(area.body, draft);
   let nativeRun;
   let imageModel = null;
   const projectSettings = canWrite ? viewResource(memoryKey('execution-settings', project), apiPath('/api/execution/settings', {project})) : null;
@@ -2284,6 +2302,7 @@ function emptyProject() {
 const screens = {dashboard, chat, codex, artifacts};
 function render(restore = true) {
   if (dom.shell.hidden) return;
+  abortLocalDictation();
   stopSpeech();
   for (const stop of runViewCleanups) stop();
   mounted++;
@@ -2375,8 +2394,14 @@ window.addEventListener('hashchange', changeView);
 for (const input of ['wheel', 'touchstart', 'pointerdown', 'keydown']) {
   window.addEventListener(input, () => { pendingScroll = null; }, {passive: true});
 }
-window.addEventListener('pagehide', () => { if (!dom.shell.hidden) rememberScroll(); });
-document.addEventListener('visibilitychange', () => { if (!document.hidden) void pollActivity(); });
+window.addEventListener('pagehide', () => {
+  abortLocalDictation();
+  if (!dom.shell.hidden) rememberScroll();
+});
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) abortLocalDictation();
+  else void pollActivity();
+});
 if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
 setTheme();
 void activate();

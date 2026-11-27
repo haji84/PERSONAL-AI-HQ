@@ -23,6 +23,7 @@ import {createTailnetAccess, tailnetCookieName} from './tailnet-access.mjs';
 
 const root = fileURLToPath(new URL('../public/', import.meta.url));
 const assets = new Map([['/', ['index.html', 'text/html']], ['/app.mjs', ['app.mjs', 'text/javascript']],
+  ['/dictation.mjs', ['dictation.mjs', 'text/javascript']],
   ['/app.css', ['app.css', 'text/css']]]);
 const defaultRuntime = process.platform === 'win32'
   ? join(process.env.LOCALAPPDATA ?? join(homedir(), 'AppData', 'Local'), 'PersonalAIHQ', 'integration')
