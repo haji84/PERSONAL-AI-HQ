@@ -59,11 +59,12 @@ async function openSource(source, {allowHead=false, localOnly=false} = {}) {
     return (await cli(command.executable, command.args, {env:command.env, signal, encoding:'buffer',
       timeout:3000, maxBuffer:256 * 1024})).stdout;
   }
-  const [root, origin, selected] = await Promise.all([git('rev-parse','--show-toplevel'), localOnly ? null : git('config','--local','--get','remote.origin.url'),
+  const root = await git('rev-parse','--show-toplevel');
+  if (normalize(root.toString().trim()) !== checkout) throw new Error('Delivery source identity did not match');
+  const [origin, selected] = await Promise.all([localOnly ? null : git('config','--local','--get','remote.origin.url'),
     git('rev-parse','--verify',ref + '^{commit}')]);
   const revision = selected.toString().trim();
-  if (normalize(root.toString().trim()) !== checkout ||
-      (!localOnly && gitHubRepository(origin.toString().trim())?.toLowerCase() !== repository.toLowerCase()) ||
+  if ((!localOnly && gitHubRepository(origin.toString().trim())?.toLowerCase() !== repository.toLowerCase()) ||
       !commitId.test(revision)) throw new Error('Delivery source identity did not match');
   async function objects(version, names) {
     const tree = (await git('ls-tree','-z',version,'--',...names)).toString().split('\0');
