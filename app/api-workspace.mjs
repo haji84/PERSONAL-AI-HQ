@@ -93,14 +93,23 @@ async function diskBytes({ current, stat }) {
   }
 }
 
+export function readOnlyGitInvocation(checkout, args) {
+  const windows = process.platform === 'win32';
+  const env = {
+    PATH: windows ? process.env.PATH : '/usr/bin:/bin',
+    ...(windows && process.env.SystemRoot && {SystemRoot:process.env.SystemRoot}),
+    GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: windows ? 'NUL' : '/dev/null',
+    GIT_TERMINAL_PROMPT: '0', GIT_NO_LAZY_FETCH: '1',
+  };
+  return {executable:windows ? 'git' : '/usr/bin/git',
+    args:['--no-replace-objects', '--literal-pathspecs', '-c', 'protocol.allow=never', '-C', checkout, ...args], env};
+}
+
 function git(checkout, args) {
   try {
-    return execFileSync('/usr/bin/git', [
-      '--no-replace-objects', '--literal-pathspecs', '-c', 'protocol.allow=never', '-C', checkout, ...args,
-    ], {
-      env: { PATH: '/usr/bin:/bin', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_TERMINAL_PROMPT: '0', GIT_NO_LAZY_FETCH: '1' },
-      stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: MAX_FILE_BYTES + 1024, timeout: 3000,
-    });
+    const command = readOnlyGitInvocation(checkout, args);
+    return execFileSync(command.executable, command.args, {env:command.env,
+      stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: MAX_FILE_BYTES + 1024, timeout: 3000});
   } catch {
     throw new Error('Could not read the approved API source from Git');
   }

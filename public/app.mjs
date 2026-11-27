@@ -630,6 +630,57 @@ function executionSettings(project) {
   details.addEventListener('toggle', () => { if (details.open && !content.hasChildNodes()) mount(); });
   return details;
 }
+function deliveryRecordDetails(record) {
+  const section = node('section', 'stack');
+  section.append(node('h3', '', '進捗の観測記録'));
+  if (record.scope) section.append(node('p', 'small muted', '対象 ' + record.scope));
+  if (Number.isFinite(Date.parse(record.observedAt))) {
+    section.append(node('p', 'small muted', '記録日時 ' + time(record.observedAt)));
+  }
+  if (record.status === 'current') {
+    const audit = record.audit;
+    if (audit?.unit === '節' && Number.isSafeInteger(audit.accepted) && Number.isSafeInteger(audit.total) &&
+        audit.accepted >= 0 && audit.total > 0 && audit.accepted <= audit.total) {
+      const facts = node('dl', 'properties');
+      metric(facts, '対象範囲で受入済み', audit.accepted + ' / ' + audit.total + audit.unit);
+      section.append(facts);
+    }
+    const first = record.firstUsable;
+    if (first) {
+      const facts = node('dl', 'properties');
+      const minutes = new Intl.NumberFormat('ja-JP', {maximumFractionDigits: 1});
+      const assumptions = [['最短', first.baselineMinutes?.optimistic], ['標準', first.baselineMinutes?.standard],
+        ['慎重', first.baselineMinutes?.cautious]]
+        .filter(([, value]) => Number.isFinite(value) && value >= 0)
+        .map(([label, value]) => label + ' ' + minutes.format(value) + '分');
+      if (Number.isFinite(Date.parse(first.baselineRecordedAt))) metric(facts, '当初見込みの記録時刻', time(first.baselineRecordedAt));
+      if (assumptions.length) metric(facts, '当初の所要時間', assumptions.join(' ／ '));
+      if (Number.isFinite(Date.parse(first.actualAt))) metric(facts, '初回利用の確認時刻', time(first.actualAt));
+      if (Number.isSafeInteger(first.elapsedSeconds) && first.elapsedSeconds >= 0) {
+        metric(facts, '実際の経過時間', deliveryDuration(first.elapsedSeconds));
+      }
+      if (Number.isSafeInteger(first.varianceSeconds)) {
+        const sign = first.varianceSeconds > 0 ? '+' : first.varianceSeconds < 0 ? '−' : '±';
+        metric(facts, '標準見込みとの差', sign + deliveryDuration(Math.abs(first.varianceSeconds)));
+      }
+      if (facts.children.length) section.append(node('h3', '', '初回利用まで'), facts);
+    }
+    if (record.originalFullForecast) section.append(node('h3', '', '当初の全要求完成見込み（条件付き）'),
+      node('p', 'small', record.originalFullForecast));
+    if (record.nextAction) section.append(node('h3', '', '記録済みの次工程'), node('p', '', record.nextAction));
+  } else section.append(node('p', 'small muted', '原本記録を取得できません。'));
+  sourceSection(section, record.links);
+  return section;
+}
+
+function deliveryDuration(seconds) {
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor(seconds % 3600 / 60);
+  const remainder = seconds % 60;
+  return (hours ? hours + '時間' : '') + (minutes ? minutes + '分' : '') +
+    (remainder || seconds === 0 ? remainder + '秒' : '');
+}
+
 function projectDetail() {
   const project = selectedProject();
   const detail = panel(project ? text(project.name) : 'プロジェクト詳細');
@@ -650,20 +701,29 @@ function projectDetail() {
     return detail.root;
   }
   const m = project.measurements ?? {};
-  metric(facts, '実装完成率', m.implementationCompletion, true);
-  metric(facts, '正式な要求達成率', m.formalCompletion, true);
-  metric(facts, '動作検証済み割合', m.verifiedCompletion, true);
-  metric(facts, '実用完成率', m.usableCompletion, true);
-  metric(facts, '完成予定', time(m.estimateFinish));
+  const record = project.deliveryRecord;
+  const wholeProgress = ['implementationCompletion', 'formalCompletion', 'verifiedCompletion', 'usableCompletion']
+    .some(key => Number.isFinite(m[key]));
+  if (record && !wholeProgress) metric(facts, '案件全体の完成率', '不明');
+  else {
+    metric(facts, '実装完成率', m.implementationCompletion, true);
+    metric(facts, '正式な要求達成率', m.formalCompletion, true);
+    metric(facts, '動作検証済み割合', m.verifiedCompletion, true);
+    metric(facts, '実用完成率', m.usableCompletion, true);
+  }
+  if (!record || m.estimateFinish || record.firstUsable) metric(facts, '完成予定', time(m.estimateFinish));
   if (project.schedule?.originalDueAt) metric(facts, '当初の完成予定', time(project.schedule.originalDueAt));
   const remaining = project.schedule?.remainingMinutes;
   if (Number.isFinite(remaining?.standard)) {
     const minutes = new Intl.NumberFormat('ja-JP', {maximumFractionDigits: 1});
     metric(facts, '残りの目安', `${minutes.format(remaining.optimistic)}〜${minutes.format(remaining.cautious)}分（標準 ${minutes.format(remaining.standard)}分）`);
   }
-  metric(facts, '累計実作業時間', Number.isFinite(m.activeMinutes) ? m.activeMinutes + '分' : null);
+  if (!record || Number.isFinite(m.activeMinutes)) {
+    metric(facts, '累計実作業時間', Number.isFinite(m.activeMinutes) ? m.activeMinutes + '分' : null);
+  }
   metric(facts, '情報の取得時刻', time(project.observedAt ?? ui.portfolio?.observedAt));
   detail.body.append(facts);
+  if (record) detail.body.append(deliveryRecordDetails(record));
   if (project.schedule?.delayed === true) detail.body.append(node('p', 'notice-chip chip', '当初予定に対して遅延しています'));
   if (ui.capabilities.executionActivity === true) detail.body.append(activityPanel());
   if (asArray(project.remaining).length) {

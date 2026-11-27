@@ -10,6 +10,8 @@ Node.js 24とサインイン済みのCodex CLIを利用します。最初に `np
 
 既存のGitHub CLI認証で所有リポジトリを一覧に表示するには、起動時に `HQ_GITHUB_PORTFOLIO_OWNER` にそのアカウント名を設定します。ダッシュボードを表示している間に取得し、取得時刻と通信できない間の最終確認結果を表示します。リポジトリを改名しても登録の照合に安定したIDを使います。既存の案件は `portfolio.json` を優先し、取得した案件の作業先と実行権限も同じファイルで管理します。
 
+既存の証跡を案件詳細に表示するには、本人用の `portfolio.json` の対象案件に `deliverySource` を指定します。`checkout` は正本を含むGit作業ツリー、`repository` はそのGitHubリポジトリのHTTPS URL、`ref` はコミット済みのブランチ参照です。統合アプリの初回提供記録には `kind: "integration-milestone"` と `baselineCommit`・`observationCommit`、共通開発環境の初期監査には `kind: "environment-audit"` と `requirementsCommit` を使います。照合する各コミットは完全なSHAを指定します。今の確認対象は実際の初回提供と原要求12節の監査範囲です。
+
 ## Windowsで起動
 
 Node.js 24以降とCodex Desktopを使います。`npm ci --ignore-scripts` の後、`start-windows.cmd` を開くと、URLと本人用のサインインファイルが表示されます。ファイルをブラウザーで開いてサインインします。Windowsの標準保存先は `%LOCALAPPDATA%\PersonalAIHQ\integration` です。起動時に既存のWindowsアクセス権を確認し、新しく作った実行ディレクトリだけを本人・SYSTEM・管理者に限定します。変更前後の権限はそのディレクトリに保存します。既存ディレクトリの権限を変更して起動を通すことはありません。

@@ -2,6 +2,7 @@ import {lstatSync, readFileSync} from 'node:fs';
 import {lstat, realpath} from 'node:fs/promises';
 import {isAbsolute, join, resolve} from 'node:path';
 import {deliveryProgress} from './progress.mjs';
+import {readDeliveryRecord} from './delivery-records.mjs';
 
 export const projectKey = /^[a-z0-9][a-z0-9_.-]{0,79}$/i;
 const states = new Set(['unknown', 'developing', 'researching', 'designing', 'verifying', 'fixing', 'integrating',
@@ -60,7 +61,7 @@ function normalizeProject(row, observedAt) {
       usableCompletion: computed?.usableCompletion ?? rate(metrics.usableCompletion), implementationCompletion: computed?.implementationCompletion ?? rate(metrics.implementationCompletion),
       estimateFinish: delivery?.estimateFinish ?? date(metrics.estimateFinish), activeMinutes: delivery?.time?.activeMinutes ?? count(metrics.activeMinutes),
     },
-    schedule: delivery && {originalDueAt: delivery.originalDueAt, remainingMinutes: delivery.durations,
+    schedule: delivery && {originalDueAt: delivery.originalDueAt, estimatedFinish: delivery.estimateFinish, remainingMinutes: delivery.durations,
       forecastDeltaMinutes: delivery.forecastDeltaMinutes, delayed: delivery.delayed},
   };
 }
@@ -110,6 +111,9 @@ export async function readPortfolio(directory, githubProjects, refreshGithub = f
   if (projects.length !== byId.size) throw new Error('Duplicate project');
   const github = githubProjects?.view(projects, refreshGithub);
   const discovered = (github?.projects ?? []).map(row => ({...normalizeProject(row, observedAt), registration: 'github'}));
+  const related = raw.projects.filter(row => row.deliverySource).slice(0,8);
+  const deliveryRecords = new Map(refreshGithub ? await Promise.all(related.map(async row =>
+    [row.id, await readDeliveryRecord(row.deliverySource)])) : []);
   const rawArtifacts = Array.isArray(raw.artifacts) ? raw.artifacts.slice(0, 150) : [];
   const artifacts = (await Promise.all(rawArtifacts.map(row => normalizeArtifact(row, byId, observedAt)))).filter(Boolean);
   if (new Set(artifacts.map(row => row.id)).size !== artifacts.length) throw new Error('Duplicate artifact');
@@ -123,7 +127,16 @@ export async function readPortfolio(directory, githubProjects, refreshGithub = f
     artifacts: new Map(artifacts.map(row => [row.id, row])),
     view: {observedAt, limits: scope, devices, apiCreditObservation: apiCreditObservation(raw.apiCreditObservation),
       ...(github && {githubRegistration: {status:github.status, observedAt:github.observedAt, count:github.count}}),
-      projects: [...projects, ...discovered].map(({cwd, handoverRequirements, nativeHandover, ...project}) => project),
+      projects: [...projects, ...discovered].map(({cwd, handoverRequirements, nativeHandover, ...project}) => {
+        const deliveryRecord = deliveryRecords.get(project.id);
+        if (deliveryRecord) {
+          project.deliveryRecord = deliveryRecord;
+          if (deliveryRecord.scope === '統合アプリの初回提供') {
+            project.measurements = {...project.measurements, estimateFinish:project.schedule?.estimatedFinish ?? null};
+          }
+        }
+        return project;
+      }),
       artifacts: artifacts.map(({file, ...artifact}) => artifact)},
   };
 }
