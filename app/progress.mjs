@@ -369,7 +369,9 @@ function forecastBaseline(value) {
     basis:forecastString(value.basis),reason:forecastString(value.reason),assumptions:forecastList(value.assumptions)};
 }
 
-export function developmentForecast(delivery = {}, {now=Date.now(),status='active',goal=null,nextAction=null,verifiedTaskIds=null} = {}) {
+export function developmentForecast(delivery = {}, {
+  now=Date.now(), status='active', goal=null, nextAction=null, verifiedTaskIds=null, workspaceUnconfirmed=false,
+} = {}) {
   delivery = delivery && typeof delivery==='object' ? delivery : {};
   const asOf = timestamp(delivery.observationAt);
   const paused = forecastProjectHolds.has(status);
@@ -399,7 +401,7 @@ export function developmentForecast(delivery = {}, {now=Date.now(),status='activ
   const unresolved = outstanding.filter(waits);
   const ownerAction = forecastString(delivery.ownerAction);
   const ownerHold = ownerAction && delivery.ownerActionAppliesTo!=='release';
-  const canDate = !paused && !ownerAction && calendar && asOf!==null && asOf<=now;
+  const canDate = !paused && !ownerAction && !workspaceUnconfirmed && calendar && asOf!==null && asOf<=now;
   function calendarDates(selected) {
     if (!canDate || !selected || selected.some(task=>waits(task) || task.unconfirmedCompletion || (!task.verified &&
       (!task.estimate.basis || !task.estimate.confidence)))) return null;
@@ -409,7 +411,7 @@ export function developmentForecast(delivery = {}, {now=Date.now(),status='activ
     return Object.values(dates).every(Boolean) ? dates : null;
   }
   const total = ordered && tasks.every(task=>task.remainingMinutes) ? forecastSum(tasks) : null;
-  const readyTaskIds = paused || ownerHold || !ordered ? [] : outstanding.filter(task=>task.actionable && !task.unconfirmedCompletion && !waits(task) && !forecastTaskHolds.has(task.status) &&
+  const readyTaskIds = paused || ownerHold || workspaceUnconfirmed || !ordered ? [] : outstanding.filter(task=>task.actionable && !task.unconfirmedCompletion && !waits(task) && !forecastTaskHolds.has(task.status) &&
     task.dependencies.every(id=>tasks.find(other=>other.id===id)?.verified) &&
     (task.availableAt===null || task.availableAt<=now)).map(task=>task.id);
   const original = forecastBaseline(Array.isArray(delivery.estimates) ? delivery.estimates.find(row=>row?.kind==='original') : null);
@@ -448,6 +450,8 @@ export function developmentForecast(delivery = {}, {now=Date.now(),status='activ
     unresolved.find(task=>task.resolution)?.resolution??'止まっている入力・承認・端末の状態を確認し、解消時に更新する。',
     unresolved.map(task=>task.id));
   if (ownerAction) missing('owner-action','利用者の対応が残っています。',ownerAction);
+  if (workspaceUnconfirmed) missing('workspace-observation','この端末の作業先で進行状態を確認できていません。',
+    '保存済みの進行状態と作業先を照合してから着手する。');
   if (!calendar) missing('calendar','稼働を予定できる時間帯が未確認です。','担当と利用枠、稼働時間帯を確認し、経過時間から完成日時を計算する。');
   if (!original) missing('baseline','保存された開始前の見積もりがありません。','既存の履歴を照合し、復元した見込みには事後推定と記録する。');
   const start = timestamp(delivery.startedAt);

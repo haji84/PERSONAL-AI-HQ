@@ -1,9 +1,9 @@
 import {execFile} from 'node:child_process';
 import {createHash} from 'node:crypto';
 import {lstat, realpath} from 'node:fs/promises';
-import {isAbsolute, join, normalize} from 'node:path';
+import {dirname, isAbsolute, join, normalize} from 'node:path';
 import {promisify} from 'node:util';
-import {readOnlyGitInvocation} from './api-workspace.mjs';
+import {readBoundedWorkspaceFile, readOnlyGitInvocation} from './api-workspace.mjs';
 
 const cli = promisify(execFile);
 const initiative = 'docs/initiatives/chatgpt-codex-integration';
@@ -36,16 +36,23 @@ function link(repository, revision, file, label) {
   return {label, url:'https://github.com/' + repository + '/blob/' + revision + '/' + file};
 }
 
-async function openSource(source, {allowHead=false, localOnly=false} = {}) {
-  const {checkout, ref} = source;
-  const repository = gitHubRepository(source.repository);
-  if ((!repository && !localOnly) || typeof checkout !== 'string' || !isAbsolute(checkout) || normalize(checkout) !== checkout ||
-      typeof ref !== 'string' || (!(allowHead && ref==='HEAD') && !sourceRef.test(ref)) || ref.includes('..') || ref.endsWith('/')) throw new Error('Invalid delivery source');
+async function checkCheckout(checkout) {
+  if (typeof checkout !== 'string' || !isAbsolute(checkout) || normalize(checkout) !== checkout) {
+    throw new Error('Invalid delivery checkout');
+  }
   const owner = process.getuid?.();
   const info = await lstat(checkout);
   if (!info.isDirectory() || (owner !== undefined && info.uid !== owner) || normalize(await realpath(checkout)) !== checkout) {
     throw new Error('Invalid delivery checkout');
   }
+}
+
+async function openSource(source, {allowHead=false, localOnly=false} = {}) {
+  const {checkout, ref} = source;
+  const repository = gitHubRepository(source.repository);
+  if ((!repository && !localOnly) || typeof ref !== 'string' ||
+      (!(allowHead && ref==='HEAD') && !sourceRef.test(ref)) || ref.includes('..') || ref.endsWith('/')) throw new Error('Invalid delivery source');
+  await checkCheckout(checkout);
   const signal = AbortSignal.timeout(4000);
   async function git(...arguments_) {
     const command = readOnlyGitInvocation(checkout, arguments_);
@@ -203,12 +210,19 @@ export async function readPortfolioTaskRecords(source) {
     const observation = JSON.parse(file).taskProgress;
     const observedAt = iso(observation?.observedAt);
     const records = observation?.projects;
-    if (!observedAt || !Array.isArray(records) || records.length > 250) return null;
+    const localRecords = observation?.localProjects ?? [];
+    if (!observedAt || !Array.isArray(records) || !Array.isArray(localRecords) || records.length + localRecords.length > 250) return null;
     const projects = new Map();
     for (const record of records) {
       const repository = gitHubRepository(record?.repository)?.toLowerCase();
-      if (!repository || projects.has(repository) || !Array.isArray(record.tasks)) return null;
+      if (!repository || record.localProjectId !== undefined || projects.has(repository) || !Array.isArray(record.tasks)) return null;
       projects.set(repository, {...record, observationAt: iso(record.observationAt) ?? observedAt});
+    }
+    for (const record of localRecords) {
+      const id = record?.localProjectId;
+      if (typeof id !== 'string' || !lifecycleId.test(id) || id.length > 80 || record.repository !== undefined ||
+          projects.has(id) || !Array.isArray(record.tasks)) return null;
+      projects.set(id, {...record, observationAt: iso(record.observationAt) ?? observedAt});
     }
     return {observedAt, projects, source: link(reader.repository, reader.revision, portfolioObservationPath, '案件の観測記録')};
   } catch { return null; }
@@ -218,10 +232,26 @@ const lifecycleStateFile = '.codex/autonomy-state.json';
 const lifecycleStates = new Set(['active','paused','cancelled','awaiting_approval','resource_limited','blocked','complete']);
 const lifecycleTaskStates = new Set(['pending','running','verified','failed','blocked']);
 const lifecycleId = /^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/;
+const lifecycleStateLimit = 128 * 1024;
+const lifecycleEvidenceLimit = 256 * 1024;
 
 function lifecyclePathValid(file) {
   return typeof file==='string' && file.length<=240 && file.split('/').every(part=>
-    part!=='.' && part!=='..' && /^[A-Za-z0-9._-]+$/.test(part) && !/^\.env(?:\.|$)|\.(?:key|pem|pfx|p12)$/i.test(part));
+    part!=='.' && part!=='..' && /^[A-Za-z0-9._-]+$/.test(part) &&
+    !/^(?:\.git$|\.env(?:\.|$))|\.(?:key|pem|pfx|p12)$/i.test(part));
+}
+
+async function isUnversionedWorkspace(checkout) {
+  await checkCheckout(checkout);
+  for (let directory = checkout; ; directory = dirname(directory)) {
+    try {
+      await lstat(join(directory,'.git'));
+      return false;
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+    if (dirname(directory) === directory) return true;
+  }
 }
 
 export async function readProjectForecastState(checkout, repository) {
@@ -231,10 +261,19 @@ export async function readProjectForecastState(checkout, repository) {
     const folder = await lstat(join(checkout,'.codex'));
     if (!folder.isDirectory() || folder.isSymbolicLink()) return null;
     const file = await lstat(join(checkout,lifecycleStateFile));
-    if (!file.isFile() || file.size>128*1024) return null;
-    const reader = await openSource({checkout,repository,ref:'HEAD'},{allowHead:true,localOnly});
-    const [bytes] = await reader.files(reader.revision,[lifecycleStateFile]);
-    if (bytes.length>128*1024) return null;
+    if (!file.isFile() || file.size>lifecycleStateLimit) return null;
+    const unversioned = localOnly && await isUnversionedWorkspace(checkout);
+    const reader = unversioned ? null : await openSource({checkout,repository,ref:'HEAD'},{allowHead:true,localOnly});
+    async function read(name, maxBytes = lifecycleEvidenceLimit) {
+      if (unversioned) {
+        if (!await isUnversionedWorkspace(dirname(join(checkout,name)))) throw new Error('Workspace evidence crosses a Git boundary');
+        return readBoundedWorkspaceFile(checkout,name,maxBytes);
+      }
+      const [content] = await reader.files(reader.revision,[name]);
+      if (content.length > maxBytes) throw new Error('Workspace evidence exceeds its size limit');
+      return content;
+    }
+    const bytes = await read(lifecycleStateFile,lifecycleStateLimit);
     const state = JSON.parse(bytes);
     if (state?.version!==1 || !lifecycleStates.has(state.status) || typeof state.goal?.title!=='string' ||
         !Array.isArray(state.tasks) || state.tasks.length>64 || state.tasks.some(task=>!lifecycleId.test(task?.id??'') ||
@@ -242,7 +281,7 @@ export async function readProjectForecastState(checkout, repository) {
           !Array.isArray(task.depends_on) || task.depends_on.length>64)) return null;
     if (state.source) {
       if (!lifecyclePathValid(state.source.path) || !contentDigest.test(state.source.sha256??'')) return null;
-      const [canonical] = await reader.files(reader.revision,[state.source.path]);
+      const canonical = await read(state.source.path);
       if (createHash('sha256').update(canonical).digest('hex')!==state.source.sha256) return null;
     }
     const validEvidence = task=>Array.isArray(task.evidence) && task.evidence.length>0 && task.evidence.length<=8 &&
@@ -251,7 +290,7 @@ export async function readProjectForecastState(checkout, repository) {
     const names = [...new Set(verification.flatMap(task=>task.evidence.map(item=>item.path)))].slice(0,24);
     const proof = new Map(await Promise.all(names.map(async name=>{
       try {
-        const [content] = await reader.files(reader.revision,[name]);
+        const content = await read(name);
         return [name,createHash('sha256').update(content).digest('hex')];
       } catch { return [name,null]; }
     })));
@@ -264,15 +303,18 @@ export async function readProjectForecastState(checkout, repository) {
     }
     const tasks = state.tasks.map(({evidence,depends_on,...task})=>({...byId.get(task.id),...task,
       status:task.status==='running'?'active':task.status,dependencies:depends_on}));
+    if (unversioned && !bytes.equals(await read(lifecycleStateFile,lifecycleStateLimit))) return null;
     return {delivery:{...state.delivery,tasks,goal:state.goal.title,goalId:state.goal.id,
       observationAt:iso(state.delivery?.observationAt)},
       nextAction:state.next_action,status:state.status,verifiedTaskIds,
-      source:localOnly ? {label:'作業先の保存済み進行状態',revision:reader.revision} :
+      source:localOnly ? {label:unversioned ? '作業先に保存した進行状態の照合値' : '作業先の保存済み進行状態',
+        revision:reader?.revision ?? createHash('sha256').update(bytes).digest('hex')} :
         link(reader.repository,reader.revision,lifecycleStateFile,'案件の保存済み進行状態')};
   } catch { return null; }
 }
-export function tasksForRepository(observation, repository) {
-  return observation?.projects.get(gitHubRepository(repository)?.toLowerCase()) ?? null;
+export function tasksForProject(observation, projectId, repository) {
+  const key = repository == null ? projectId : gitHubRepository(repository)?.toLowerCase();
+  return observation?.projects.get(key) ?? null;
 }
 
 function isSourceReference(text) {

@@ -1,10 +1,10 @@
 import {createHash, randomUUID} from 'node:crypto';
 import {closeSync, fsyncSync, lstatSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync} from 'node:fs';
 import {lstat, realpath} from 'node:fs/promises';
-import {isAbsolute, join, resolve} from 'node:path';
+import {isAbsolute, join, resolve, sep} from 'node:path';
 import {isDeepStrictEqual} from 'node:util';
 import {deliveryProgress, developmentForecast, remainingEstimate, requirementProgress, taskHasOpenWork, taskIsVerified} from './progress.mjs';
-import {readDeliveryRecord, readPortfolioTaskRecords, readProjectForecastState, tasksForRepository} from './delivery-records.mjs';
+import {readDeliveryRecord, readPortfolioTaskRecords, readProjectForecastState, tasksForProject} from './delivery-records.mjs';
 import {normalizeSettings} from './execution-policy.mjs';
 
 export const projectKey = /^[a-z0-9][a-z0-9_.-]{0,79}$/i;
@@ -24,6 +24,10 @@ const date = value => typeof value === 'string' && Number.isFinite(Date.parse(va
 const strings = (value, limit = 20) => Array.isArray(value) ? value.slice(0, limit).map(item => text(item)).filter(Boolean) : [];
 const count = value => Number.isFinite(value) && value >= 0 ? value : null;
 const rate = value => count(value) !== null && value <= 100 ? value : null;
+function workspacePrefix(checkout) {
+  const key = process.platform === 'win32' ? checkout.toLowerCase() : checkout;
+  return key.endsWith(sep) ? key : key + sep;
+}
 
 function https(value) {
   if (typeof value !== 'string' || value.length > 2048) return null;
@@ -354,16 +358,27 @@ export async function readPortfolio(directory, githubProjects, refreshGithub = f
   const definitions = new Map(raw.projects.map(row => [row.id, row]));
   const visible = [...projects, ...discovered];
   const taskMatches = new Map();
+  const trackingById = new Map();
   for (const row of projects) {
-    const record = tasksForRepository(taskRecords, row.repository);
-    if (record) taskMatches.set(record, (taskMatches.get(record) ?? 0) + 1);
+    const record = tasksForProject(taskRecords,row.id,row.repository ?? definitions.get(row.id).repository);
+    if (record) {
+      trackingById.set(row.id,record);
+      taskMatches.set(record, (taskMatches.get(record) ?? 0) + 1);
+    }
   }
   const unmatchedTaskRecords = [...(taskRecords?.projects.values() ?? [])].filter(record => taskMatches.get(record) !== 1).length;
+  const workspaceScopes = projects.flatMap(({id,cwd}) => cwd.map(checkout => ({id,prefix:workspacePrefix(checkout)})));
   const scopedStates = new Map(refreshGithub ? await Promise.all(projects.filter(project => {
     const delivery = definitions.get(project.id).delivery;
     return project.cwd.length === 1 && (!delivery || registrationIntake(delivery));
-  }).map(async project => [project.id, await readProjectForecastState(project.cwd[0],
-    project.repository ?? definitions.get(project.id).repository)])) : []);
+  }).map(async project => {
+    const [checkout] = project.cwd;
+    const repository = project.repository ?? definitions.get(project.id).repository;
+    const prefix = workspacePrefix(checkout);
+    const ambiguous = repository == null && workspaceScopes.some(scope => scope.id !== project.id &&
+      (prefix.startsWith(scope.prefix) || scope.prefix.startsWith(prefix)));
+    return [project.id, ambiguous ? null : await readProjectForecastState(checkout,repository)];
+  })) : []);
   const rawArtifacts = Array.isArray(raw.artifacts) ? raw.artifacts.slice(0, 150) : [];
   const artifacts = (await Promise.all(rawArtifacts.map(row => normalizeArtifact(row, byId, observedAt)))).filter(Boolean);
   if (new Set(artifacts.map(row => row.id)).size !== artifacts.length) throw new Error('Duplicate artifact');
@@ -381,7 +396,7 @@ export async function readPortfolio(directory, githubProjects, refreshGithub = f
         {status: 'current', observedAt: taskRecords.observedAt, evidence: taskRecords.source, unmatched: unmatchedTaskRecords} :
         {status: 'unavailable'}}),
       projects: visible.map(({cwd, handoverRequirements, nativeHandover, ...project}) => {
-        const tracking = byId.has(project.id) && tasksForRepository(taskRecords, project.repository);
+        const tracking = trackingById.get(project.id);
         const matched = tracking && taskMatches.get(tracking) === 1 ? tracking : null;
         const local = definitions.get(project.id)?.delivery;
         const isIntake = registrationIntake(local);
@@ -396,7 +411,8 @@ export async function readPortfolio(directory, githubProjects, refreshGithub = f
         }
         const forecast = developmentForecast(input,
           {goal:project.goal,status:projectHeld?project.state:scoped?.status??project.state,
-            nextAction:scoped?.nextAction??input.nextAction??deliveryRecord?.nextAction,verifiedTaskIds:scoped?.verifiedTaskIds});
+            nextAction:scoped?.nextAction??input.nextAction??deliveryRecord?.nextAction,verifiedTaskIds:scoped?.verifiedTaskIds,
+            workspaceUnconfirmed:Boolean(shared?.localProjectId && !scoped)});
         if (isIntake && (scoped || shared)) {
           forecast.baseline.intake = developmentForecast({estimates:local.estimates}).baseline.original;
         }
