@@ -53,6 +53,9 @@ export function createOperations(directory, native, execution, {prepareHandover}
     AND phase IN ('reserved','sending','running','interrupting','unconfirmed') LIMIT 1`);
   const knownNativeWork = db.prepare(`SELECT 1 FROM codex_operations WHERE project=? AND threadId IS NOT NULL AND turnId IS NOT NULL
     AND workspace IN (SELECT value FROM json_each(?)) LIMIT 1`);
+  const latestAccepted = db.prepare(`SELECT id, workspace, threadId, turnId, updatedAt, phase, handoverReceipt FROM codex_operations
+    WHERE project=? AND workspace=? AND threadId IS NOT NULL AND turnId IS NOT NULL
+    ORDER BY createdAt DESC, rowid DESC LIMIT 1`);
   const launchedHandover = db.prepare(`SELECT 1 FROM codex_operations WHERE project=? AND handoverReceipt=?
     AND handoverReview IS NOT NULL AND threadId IS NOT NULL LIMIT 1`);
   const byClientId = db.prepare(`SELECT * FROM codex_operations WHERE threadId=? AND id=? AND turnId IS NULL
@@ -170,6 +173,11 @@ export function createOperations(directory, native, execution, {prepareHandover}
     hasActiveWork(project, exceptId = null) { return Boolean(activeRun.get(project.id, exceptId)); },
     hasNativeWork(project) {
       return Boolean(knownNativeWork.get(project.id, JSON.stringify(project.cwd)));
+    },
+    completedSource(project, checkout, threadId) {
+      if (activeRun.get(project.id, null) || !project.cwd.includes(checkout)) return null;
+      const row = latestAccepted.get(project.id, checkout);
+      return row?.phase === 'completed' && row.threadId === threadId ? row : null;
     },
     updateExecution(project, update) {
       db.exec('BEGIN IMMEDIATE');

@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {execFileSync} from 'node:child_process';
+import {createHash} from 'node:crypto';
 import {copyFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile} from 'node:fs/promises';
-import {join} from 'node:path';
+import {dirname, join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {setTimeout as wait} from 'node:timers/promises';
 import {startOwnerApp} from '../app/server.mjs';
@@ -373,6 +374,141 @@ test('a verified API receipt starts one linked Codex thread and fences stale evi
     assert.equal((await call('/api/execution/api', {data: {...instruction, id: 'reverse-without-handoff'}})).status, 409);
     assert.equal(providerCalls, 1);
   } finally { release(); }
+});
+
+test('Codex-to-API handover verifies an approved checkpoint, then sends exact context once', {skip: process.platform !== 'darwin'}, async t => {
+  const request = {id: 'reverse-proof-operation', prompt: '元の指示を渡し、変更の検証を保存する'};
+  const threadId = 'reverse-proof-thread', turnId = 'native-completed-turn';
+  const messages = [{id: 'native-input', role: 'user', text: request.prompt},
+    {id: 'native-output', role: 'assistant', text: '  検証した候補。\n'}];
+  let returnedMessages = messages;
+  let nativeReads = 0;
+  let lateMismatch = -1;
+  const providerInputs = [];
+  const codex = {canWrite: true, subscriptionReady: async () => true, onEvent: () => () => {},
+    models: async () => ({accountType: 'chatgpt', data: [{id: 'fixture-native', isDefault: true, reasoningEfforts: []}]}),
+    usage: async () => ({ordinaryUsageAllowed: true, windows: [{usedPercent: 20}]}),
+    async submit(options) {
+      assert.equal(options.beforeThread(), true);
+      await options.beforeTurn?.();
+      assert.equal(options.onThread(threadId), true);
+      return {turn: {id: turnId, status: 'completed'}};
+    },
+    async readHandoverTurn(_worktree, thread, turn, operation) {
+      assert.deepEqual([thread, turn, operation], [threadId, turnId, request.id]);
+      if (++nativeReads === lateMismatch) return {threadId, turnId: 'different-latest-turn', messages};
+      return {threadId, turnId, messages: returnedMessages};
+    }};
+  const {call, directory, source, requirements, portfolio, ledgerFile, commitFiles, open, store} = await fixture(t, async (_url, request) => {
+    const payload = JSON.parse(request.body);
+    assert.equal(payload.text.format.name, 'project_advice');
+    providerInputs.push(JSON.parse(payload.input[1].content));
+    return Response.json({model: modelId, service_tier: 'default', status: 'completed', usage: {input_tokens: 100, output_tokens: 25},
+      output: [{type: 'message', role: 'assistant', content: [{type: 'output_text', text: '{"answer":"次の設計確認を保存する。"}'}]}]});
+  }, {handover: true, codex});
+  const checkout = dirname(source);
+  assert.equal((await call('/api/execution/settings', {data: {revision: 0, settings: {mode: 'subscription-only'}}})).status, 200);
+  assert.equal((await call('/api/codex/run', {data: request})).status, 202);
+  let row;
+  for (let index = 0; index < 40 && row?.phase !== 'completed'; index++) {
+    row = (await (await call('/api/codex/run', {query: {id: request.id}})).json()).operation;
+    if (row?.phase !== 'completed') await wait(25);
+  }
+  assert.equal(row?.phase, 'completed');
+  assert.equal((await call('/api/execution/settings', {data: {revision: 1, settings: {mode: 'api-only', apiBudgetUsd: 1}}})).status, 200);
+  const proof = (project = id) => call('/api/execution/handover', {query: {thread: threadId}, project});
+  assert.equal((await proof()).status, 409);
+  const commit = [{path: 'source.mjs', text: 'export const answer = 2;\n'},
+    {path: 'verification.md', text: 'Independent fixture observation: 1 test completed.\n'}];
+  await commitFiles(commit);
+  const sha = bytes => createHash('sha256').update(bytes).digest('hex');
+  const head = execFileSync('/usr/bin/git', ['-C', checkout, 'rev-parse', 'HEAD'], {encoding: 'utf8'}).trim();
+  const checkpoint = {version: 1, operationId: request.id, threadId, turnId, checkoutHead: head,
+    requirementsSha256: sha(await readFile(requirements)), transcriptSha256: sha(JSON.stringify(messages)),
+    artifacts: [{path: commit[0].path, sha256: sha(commit[0].text)}],
+    verification: {path: commit[1].path, sha256: sha(commit[1].text)}, effectsReconciled: true, shareConversation: true};
+  const definition = JSON.parse(await readFile(portfolio, 'utf8'));
+  const useCheckpoint = async value => {
+    definition.projects[0].nativeHandover = value;
+    await writeFile(portfolio, JSON.stringify(definition));
+  };
+  await useCheckpoint(checkpoint);
+  const ledger = await readFile(ledgerFile);
+  const approved = await proof();
+  const result = await approved.json();
+  assert.equal(approved.status, 200, JSON.stringify(result));
+  assert.deepEqual(result, {verified: true, source: 'subscription', destination: 'api',
+    receipt: request.id, review: result.review, checkoutHead: head,
+    requirements: {path: 'GOAL.md', sha256: checkpoint.requirementsSha256}, artifacts: checkpoint.artifacts,
+    verification: checkpoint.verification, transcript: {sha256: checkpoint.transcriptSha256, messages: 2}});
+  assert.match(result.review, /^[a-f0-9]{64}$/);
+  assert.deepEqual(await (await proof()).json(), result);
+  assert.notEqual((await proof('other-fixture')).status, 200);
+  returnedMessages = [messages[0], {...messages[1], text: messages[1].text.trim()}];
+  assert.equal((await proof()).status, 409);
+  returnedMessages = messages;
+  await writeFile(source, 'export const answer = 99;\n');
+  assert.equal((await proof()).status, 409);
+  await writeFile(source, commit[0].text);
+  const indexFlag = (...args) => execFileSync('/usr/bin/git', ['-C', checkout, 'update-index', ...args, 'check.test.mjs']);
+  for (const flag of ['assume-unchanged', 'skip-worktree']) {
+    indexFlag('--' + flag);
+    assert.equal((await proof()).status, 409);
+    indexFlag('--no-' + flag);
+  }
+  await useCheckpoint({...checkpoint, shareConversation: false});
+  assert.equal((await proof()).status, 409);
+  assert.deepEqual(await readFile(ledgerFile), ledger);
+  assert.equal(providerInputs.length, 0);
+  const nativeOrigin = {threadId, operationId: request.id, review: result.review};
+  const advice = {id: 'review-then-advise', stage: 'consultation', prompt: '検証結果を踏まえて次の設計を相談する', nativeOrigin};
+  assert.equal((await call('/api/execution/api', {data: advice})).status, 409);
+  await useCheckpoint(checkpoint);
+  assert.equal((await call('/api/execution/api', {data: {...advice, stage: 'implementation'}})).status, 400);
+  assert.equal((await call('/api/execution/api', {data: {...advice, nativeOrigin: undefined}})).status, 409);
+  const unenrolled = {...advice, id: 'unenrolled-reverse-proof'};
+  assert.equal((await call('/api/execution/api', {data: unenrolled})).status, 202);
+  assert.equal((await waitFor(call, 'interrupted', unenrolled.id)).result, 'NATIVE_HANDOVER_ENROLLMENT_REQUIRED');
+  assert.equal(providerInputs.length, 0);
+  const authorityPath = join(directory, apiAuthorityFile);
+  const authority = JSON.parse(await readFile(authorityPath, 'utf8'));
+  authority.projects[id].files.push({path: 'GOAL.md', writable: false}, {path: 'verification.md', writable: false});
+  await writeFile(authorityPath, JSON.stringify(authority));
+  lateMismatch = nativeReads + 2;
+  const stale = {...advice, id: 'late-stale-native-source'};
+  assert.equal((await call('/api/execution/api', {data: stale})).status, 202);
+  assert.equal((await waitFor(call, 'interrupted', stale.id)).result, 'HANDOVER_CONVERSATION_UNVERIFIED');
+  assert.equal(providerInputs.length, 0);
+  const submitted = await Promise.all([call('/api/execution/api', {data: advice}), call('/api/execution/api', {data: advice})]);
+  assert.deepEqual(submitted.map(response => response.status), [202, 202]);
+  const completed = await waitFor(call, 'completed', advice.id);
+  assert.deepEqual(completed.nativeOrigin, nativeOrigin);
+  assert.equal(completed.advice, '次の設計確認を保存する。');
+  assert.equal(providerInputs.length, 1);
+  const {work, context} = providerInputs[0];
+  assert.equal(work, advice.prompt);
+  assert.deepEqual(context.handover.messages, messages);
+  assert.equal(context.handover.checkoutHead, head);
+  assert.equal(context.handover.settingsRevision, 2);
+  assert.equal(context.handover.apiBudgetUsd, 1);
+  assert.ok(context.files.every(file => !file.writable));
+  assert.ok(context.files.some(file => file.path === 'GOAL.md' && /既存機能を維持/.test(file.text)));
+  assert.equal(await readFile(source, 'utf8'), commit[0].text);
+  assert.equal((await call('/api/execution/api', {data: {...advice, prompt: '無関係な変更'}})).status, 409);
+  const refreshed = await (await proof()).json();
+  assert.notEqual(refreshed.review, result.review);
+  assert.equal((await call('/api/execution/api', {data: {...advice, id: 'advice-duplicate-id',
+    nativeOrigin: {...nativeOrigin, review: refreshed.review}}})).status, 409);
+  await open(false);
+  const saved = store.getWork(id, advice.id).operation;
+  assert.deepEqual(saved.nativeOrigin, nativeOrigin);
+  const history = await (await call('/api/chat', {query: {id: 'api/' + saved.executionId}})).json();
+  assert.deepEqual(history.conversation.messages.map(message => message.text), [advice.prompt, completed.advice]);
+  assert.equal((await call('/api/execution/settings', {data: {revision: 2, settings: {mode: 'subscription-only'}}})).status, 200);
+  const forwardsAgain = await call('/api/execution/handover', {query: {receipt: saved.executionId}});
+  assert.equal(forwardsAgain.status, 200);
+  assert.deepEqual((await forwardsAgain.json()).artifacts, checkpoint.artifacts);
+  assert.equal(providerInputs.length, 1);
 });
 
 test('readback preserves more retained files than a single API enrollment', {skip: process.platform !== 'darwin'}, async t => {

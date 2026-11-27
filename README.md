@@ -52,6 +52,10 @@ MacとNode.js 24の検証版です。Codex画面で通常APIの工程を選び�
 
 案件定義の `handoverRequirements` に、分離したGit作業先の追跡済み要求正本を指定できます。通常APIの確定履歴にある「Codexへの引継ぎを照合」は、作業時の正本、会話、現在のGitに反映した成果物を確認する操作です。照合では実行経路や予算を変更せず、モデル呼び出しも行いません。
 
+Codexから通常APIへ戻るときは、完了したCodex会話を選び「通常APIへの引継ぎを照合」を使います。案件の既存の非公開定義にある `nativeHandover` を、承認済みの完了記録から設定します。`version: 1`、`operationId`、`threadId`、`turnId`、`checkoutHead`、`requirementsSha256`、`transcriptSha256`、`verification`、`artifacts`、`effectsReconciled: true` と `shareConversation: true` が必要です。検証と成果物は作業先を基準とした `{path, sha256}` で記録します。会話のハッシュは確定ターンの表示可能な発言配列 `[{id, role, text}]` のJSONを使います。
+
+照合時にAPIは呼びません。送信は相談・設計に限り、案件でAPIへの送信を許可した追跡済みファイル、照合した発言、現在の予算・停止条件を使います。検証記録の採否と外部副作用の確認は案件の既存の承認手順に従ってください。同じ分離作業先を別のCodexセッションから同時に操作するときは、その作業を確定してから引き継ぎます。
+
 案件で契約内のCodexを許可し、照合が通った会話から、次の指示を入力して「引継いでCodexを開始」を選べます。送信直前に要求正本と作業結果、設定、契約内利用枠を再確認します。開始後は同じ会話画面で実行状態を確認し、元のCodexスレッドで続きを実行できます。
 
 通常起動ではAPI実行は無効です。試験起動は `HQ_API_EXECUTION=1`、サーバープロセスの認証情報、所有者専用の `api-execution-authority.json` を使います。登録には、単一の組織予約先に対する照合値、公式の最新付与残高と有効期限、支払・自動チャージ状況、検証済みモデル単価、案件ごとの送信・編集範囲と保護したテストを指定します。本人確認と追加費用ゼロの条件が揃い、組織予約先が一致した場合にのみAPIを呼びます。現在の実行試験は模擬プロバイダーを使い、Mac上の実編集とテストを検証しています。 [Responses API](https://developers.openai.com/api/reference/resources/responses/methods/create)

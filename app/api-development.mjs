@@ -11,6 +11,8 @@ import {ensurePrivateDirectory} from './private-directory.mjs';
 
 const taskKey = /^[A-Za-z0-9][A-Za-z0-9_-]{7,79}$/;
 const receiptKey = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
+const evidenceHash = /^[a-f0-9]{64}$/;
+const gitRevision = /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/;
 const held = new Set(['paused', 'approval', 'limit', 'blocked', 'offline', 'waiting', 'completed']);
 const sha = value => createHash('sha256').update(value).digest('hex');
 const digest = value => sha(JSON.stringify(value));
@@ -37,6 +39,7 @@ function latestApiActivity(store, projectId, localJob) {
 }
 
 export function createApiDevelopment({directory, store, conversations, withProjectWorkLock, hasNativeWork, hasActiveWork,
+  completedNativeSource, readHandoverTurn,
   getKey = () => process.env.OPENAI_API_KEY, fetchImpl, readAuthority = readApiAuthority}) {
   const jobs = new Map();
   const artifacts = join(directory, 'api-work');
@@ -125,6 +128,7 @@ export function createApiDevelopment({directory, store, conversations, withProje
       const report = completedReport(projectId, work);
       if (!report) throw problem(409, 'API_CANDIDATE_HANDOVER_REQUIRED');
       for (const change of report.changes) changes.set(change.path, change);
+      for (const artifact of report.nativeHandover?.artifacts ?? []) changes.set(artifact.path, artifact);
     }
     return [...changes.values()];
   }
@@ -136,6 +140,7 @@ export function createApiDevelopment({directory, store, conversations, withProje
     const changes = work.status === 'completed' ? output?.changes ?? [] : [];
     return {operation: {id: work.taskId, project, route: 'api', stage: work.task?.stage, model: work.model, phase,
       createdAt: work.createdAt, startedAt: work.dispatchedAt ?? null, updatedAt: observedAt(work),
+      ...(work.nativeOrigin ? {nativeOrigin: work.nativeOrigin} : {}),
       result: output?.reason ?? work.reason ?? (phase === 'unconfirmed' ? 'API_SETTLEMENT_UNKNOWN' : null),
       ...(work.status === 'completed' && output?.kind === 'advice' ? {advice: output.summary} : {}),
       verification: output?.verification ?? null, artifactCount: changes.length,
@@ -151,7 +156,8 @@ export function createApiDevelopment({directory, store, conversations, withProje
       preserveSummary: report?.kind === 'advice', updatedAt: observedAt(work)});
   }
 
-  async function run({projectId, operation, prior, scope, model, prompt, controller}) {
+  async function run({project, operation, prior, scope, model, prompt, controller, approvedArtifacts}) {
+    const projectId = project.id;
     const {executionId, taskId} = operation;
     const stage = operation.task?.stage;
     const advice = isAdvisoryStage(stage);
@@ -167,6 +173,7 @@ export function createApiDevelopment({directory, store, conversations, withProje
     let requirements = null;
     let summary = '';
     let conversationSaved = false;
+    let handover;
     let reason = advice ? 'API_OUTPUT_UNUSABLE' : 'API_VERIFICATION_FAILED';
     const fingerprint = binding(scope, model);
     const reauthorize = (forDispatch = true) => {
@@ -181,10 +188,14 @@ export function createApiDevelopment({directory, store, conversations, withProje
       conversationSaved = true;
       await ensurePrivateDirectory(artifacts);
       reauthorize();
-      const previousChanges = retainedChanges(projectId, prior.verifiedApiOperations);
+      let previousChanges = retainedChanges(projectId, prior.verifiedApiOperations);
       const requirementsPath = scope.current.handoverRequirements;
       if (requirementsPath && scope.enrollment.files.some(file => file.path === requirementsPath && file.writable)) {
         throw problem(409, 'HANDOVER_REQUIREMENTS_CHANGED');
+      }
+      if (approvedArtifacts) {
+        const changed = new Map(approvedArtifacts.map(file => [file.path, file]));
+        previousChanges = previousChanges.map(change => changed.get(change.path) ?? change);
       }
       const workspace = {checkout: scope.checkout, jobRoot, files: scope.enrollment.files,
         testPaths: scope.enrollment.testPaths, priorChanges: previousChanges, signal};
@@ -197,15 +208,27 @@ export function createApiDevelopment({directory, store, conversations, withProje
         if (source.head !== baseSha) throw problem(409, 'HANDOVER_REQUIREMENTS_CHANGED');
         [requirements] = source.files;
       }
+      if (operation.nativeOrigin) {
+        handover = await approvedNativeOrigin(project, operation.nativeOrigin, operation);
+        const supplied = new Map(advisoryContext.files.map(file => [file.path, file.text]));
+        if (handover.proof.checkoutHead !== baseSha || handover.files.some(file =>
+          typeof supplied.get(file.path) !== 'string' || sha(supplied.get(file.path)) !== file.sha256)) {
+          throw problem(409, 'NATIVE_HANDOVER_ENROLLMENT_REQUIRED');
+        }
+      }
       const client = createApiResponseClient({key: getKey(), organization: scope.authority.organization,
         project: scope.authority.providerProject, fetchImpl});
       const respond = advice ? client.advise : client.propose;
       for (let round = 0; round < (advice ? 1 : apiJobRounds); round++) {
         const answer = await respond({model, effort: operation.reasoningEffort, prompt,
-          context: advice ? {...advisoryContext, requirements} : candidate.context(),
+          context: advice ? {...advisoryContext, requirements, ...(handover ? {handover: handover.context} : {})} : candidate.context(),
           feedback: verification?.output, signal, beforeSend: () => {
             const fresh = reauthorize();
             const policy = context(fresh.authority, model, stage);
+            if (handover) {
+              handover.assertCurrent();
+              policy.nativeOrigin = operation.nativeOrigin;
+            }
             const decision = dispatched ? store.recheckDispatched(projectId, taskId, executionId, policy)
               : store.markDispatched(projectId, taskId, executionId, policy);
             if (!decision.dispatchable) throw problem(409, decision.code);
@@ -256,6 +279,7 @@ export function createApiDevelopment({directory, store, conversations, withProje
           if (source.head !== baseSha || source.files[0].sha256 !== requirements.sha256) throw problem(409, 'HANDOVER_REQUIREMENTS_CHANGED');
         }
         reauthorize(false);
+        handover?.assertCurrent();
       } catch (cause) {
         finished = null;
         completed = false;
@@ -264,13 +288,15 @@ export function createApiDevelopment({directory, store, conversations, withProje
     }
     const report = {executionId, projectId, baseSha, reason, verification, kind: advice ? 'advice' : 'development',
       summary: completed ? summary : '', requirements,
+      ...(handover ? {nativeHandover: {...handover.proof, threadId: handover.context.threadId, turnId: handover.context.turnId}} : {}),
       candidate: finished ? basename(finished.candidatePath) : null,
       changes: finished?.changes ?? []};
     const bytes = JSON.stringify(report);
     writeFileSync(join(jobRoot, 'result.json'), bytes, {flag: 'wx', mode: 0o600});
     const checkpoint = {id: executionId, version: (prior.checkpoint?.version ?? 0) + 1, goalId: projectId,
       requirementsHash: digest({goal: scope.current.goal, baseSha, files: scope.enrollment.files, requirements}),
-      conversationHash: digest({prior: prior.checkpoint?.conversationHash ?? null, instruction: operation.instructionDigest}),
+      conversationHash: digest({prior: prior.checkpoint?.conversationHash ?? null, instruction: operation.instructionDigest,
+        ...(handover ? {native: handover.proof.transcript.sha256} : {})}),
       stopHash: digest({scope: fingerprint, phase: signal.aborted ? 'interrupted' : 'settled'}),
       budgetHash: digest({organization: scope.authority.organization, reservedMicros: operation.reservedMicros, spentMicros}),
       artifactsHash: sha(bytes)};
@@ -344,8 +370,74 @@ export function createApiDevelopment({directory, store, conversations, withProje
       settledApiMicros: work.settledApiMicros}};
   }
 
+  function nativeHandoverState(project, threadId, exceptOperation) {
+    const owned = ownedProject(project.id);
+    const work = store.getWork(project.id);
+    const {settings, revision} = store.getSettings(project.id);
+    if ((work.busy && work.operation?.executionId !== exceptOperation?.executionId) ||
+        hasActiveWork(project) || conversations.hasActiveLive(project.id)) throw problem(409, 'PROJECT_BUSY');
+    if (!settings.allowedRoutes.includes('api')) throw problem(409, 'ROUTE_NOT_ALLOWED');
+    const source = completedNativeSource(project, owned.checkout, threadId);
+    if (!source) throw problem(409, 'HANDOVER_RECEIPT_STALE');
+    const checkpoint = owned.current.nativeHandover;
+    const fileEvidence = file => typeof file?.path === 'string' && evidenceHash.test(file.sha256 ?? '');
+    if (checkpoint?.version !== 1 || checkpoint.operationId !== source.id || checkpoint.threadId !== source.threadId ||
+        checkpoint.turnId !== source.turnId || !gitRevision.test(checkpoint.checkoutHead ?? '') ||
+        !evidenceHash.test(checkpoint.requirementsSha256 ?? '') || !evidenceHash.test(checkpoint.transcriptSha256 ?? '') ||
+        checkpoint.shareConversation !== true || checkpoint.effectsReconciled !== true ||
+        !owned.current.handoverRequirements || !fileEvidence(checkpoint.verification) || !Array.isArray(checkpoint.artifacts) ||
+        checkpoint.artifacts.length > 22 || !checkpoint.artifacts.every(fileEvidence)) {
+      throw problem(409, 'NATIVE_HANDOVER_CHECKPOINT_REQUIRED');
+    }
+    const requirements = {path: owned.current.handoverRequirements, sha256: checkpoint.requirementsSha256};
+    const verification = {path: checkpoint.verification.path, sha256: checkpoint.verification.sha256};
+    const artifacts = checkpoint.artifacts.map(({path, sha256}) => ({path, sha256}));
+    const stamp = digest({source, checkpoint, requirements, goal: owned.current.goal, status: owned.current.state,
+      revision, settings, apiCheckpoint: work.checkpoint, settledApiMicros: work.settledApiMicros});
+    return {owned, source, checkpoint, requirements, verification, artifacts, stamp, settings, revision,
+      settledApiMicros: work.settledApiMicros};
+  }
+
+  async function inspectNativeHandover(project, threadId, exceptOperation) {
+    if (typeof threadId !== 'string' || !taskKey.test(threadId)) throw problem(404, 'API_TASK_NOT_FOUND');
+    const {owned, source, checkpoint, requirements, verification, artifacts, stamp, settings, revision, settledApiMicros} =
+      nativeHandoverState(project, threadId, exceptOperation);
+    const files = [requirements, verification, ...artifacts];
+    const git = await checkedEvidence(owned.checkout, files.map(file => file.path), AbortSignal.timeout(12000), 'NATIVE_HANDOVER_GIT_CHANGED');
+    if (git.head !== checkpoint.checkoutHead || git.files.some((file, index) => file.sha256 !== files[index].sha256)) {
+      throw problem(409, 'NATIVE_HANDOVER_GIT_CHANGED');
+    }
+    const turn = await readHandoverTurn(owned.checkout, threadId, source.turnId, source.id);
+    if (turn?.threadId !== threadId || turn.turnId !== source.turnId || !Array.isArray(turn.messages) ||
+        digest(turn.messages) !== checkpoint.transcriptSha256) throw problem(409, 'HANDOVER_CONVERSATION_UNVERIFIED');
+    function assertCurrent() {
+      if (nativeHandoverState(project, threadId, exceptOperation).stamp !== stamp ||
+          !checkedEvidenceIsCurrent({checkout: owned.checkout, head: git.head, files, requireClean: true})) {
+        throw problem(409, 'NATIVE_HANDOVER_GIT_CHANGED');
+      }
+    }
+    assertCurrent();
+    const proof = {verified: true, source: 'subscription', destination: 'api', receipt: source.id, review: stamp,
+      checkoutHead: git.head, requirements, artifacts, verification,
+      transcript: {sha256: checkpoint.transcriptSha256, messages: turn.messages.length}};
+    const context = {project: project.id, goal: owned.current.goal, operationId: source.id, threadId, turnId: source.turnId,
+      previousApiReceipt: source.handoverReceipt, checkoutHead: git.head, requirements, artifacts, verification,
+      stopState: owned.current.state, settingsRevision: revision, apiBudgetUsd: settings.apiBudgetUsd ?? null,
+      settledApiMicros, messages: turn.messages};
+    return {proof, assertCurrent, files, context};
+  }
+
+  async function approvedNativeOrigin(project, origin, exceptOperation) {
+    const checked = await inspectNativeHandover(project, origin.threadId, exceptOperation);
+    if (origin.operationId !== checked.proof.receipt || origin.review !== checked.proof.review) {
+      throw problem(409, 'HANDOVER_RECEIPT_STALE');
+    }
+    return checked;
+  }
+
   return {
     async previewHandover(project, receipt) { return (await inspectHandover(project, receipt)).proof; },
+    async previewNativeHandover(project, threadId) { return (await inspectNativeHandover(project, threadId)).proof; },
     async prepareNativeHandover(project, {receipt, review}, workspace, exceptOperation) {
       const state = await inspectHandover(project, receipt, exceptOperation);
       if (state.checkout !== workspace || state.proof.review !== review) throw problem(409, 'HANDOVER_RECEIPT_STALE');
@@ -396,7 +488,7 @@ export function createApiDevelopment({directory, store, conversations, withProje
       if (id !== undefined && !taskKey.test(id)) throw problem(400, 'API_TASK_INVALID');
       return view(project.id, store.getWork(project.id, id).operation);
     },
-    start(project, input) {
+    async start(project, input) {
       if (!taskKey.test(input?.id ?? '') || typeof input.prompt !== 'string' || !input.prompt.trim() || input.prompt.length > 12000 ||
           !STAGES.includes(input.stage ?? 'implementation') || input.model !== undefined && typeof input.model !== 'string' ||
           input.effort !== undefined && typeof input.effort !== 'string') throw problem(400, 'API_TASK_INVALID');
@@ -404,24 +496,44 @@ export function createApiDevelopment({directory, store, conversations, withProje
       const inputDigest = sha(input.prompt);
       const task = {stage: input.stage ?? 'implementation', route: 'api', ...(input.model ? {model: input.model} : {}),
         ...(input.effort ? {reasoningEffort: input.effort} : {})};
-      return withProjectWorkLock(project, () => {
+      const {nativeOrigin} = input;
+      if (nativeOrigin !== undefined && (!isAdvisoryStage(task.stage) || !nativeOrigin ||
+          Object.keys(nativeOrigin).length !== 3 || ![nativeOrigin.threadId, nativeOrigin.operationId].every(value =>
+            typeof value === 'string' && taskKey.test(value)) || typeof nativeOrigin.review !== 'string' ||
+          !evidenceHash.test(nativeOrigin.review))) throw problem(400, 'API_TASK_INVALID');
+      const replay = () => {
         const duplicate = store.getWork(projectId, input.id).operation;
-        if (duplicate) {
-          if (duplicate.instructionDigest !== inputDigest || digest(duplicate.task) !== digest(task)) throw problem(409, 'TASK_ID_CONFLICT');
-          return view(projectId, duplicate);
+        if (!duplicate) return null;
+        if (duplicate.instructionDigest !== inputDigest || digest(duplicate.task) !== digest(task) ||
+            ['threadId', 'operationId', 'review'].some(key => duplicate.nativeOrigin?.[key] !== nativeOrigin?.[key])) {
+          throw problem(409, 'TASK_ID_CONFLICT');
         }
-        if (hasNativeWork(project)) throw problem(409, 'HANDOVER_REQUIRED');
+        return view(projectId, duplicate);
+      };
+      const duplicate = replay();
+      if (duplicate) return duplicate;
+      let handover;
+      if (nativeOrigin) {
+        try { handover = await approvedNativeOrigin(project, nativeOrigin); }
+        catch (cause) { const concurrent = replay(); if (concurrent) return concurrent; throw cause; }
+      }
+      return withProjectWorkLock(project, () => {
+        const concurrent = replay();
+        if (concurrent) return concurrent;
+        if (handover) handover.assertCurrent();
+        else if (hasNativeWork(project)) throw problem(409, 'HANDOVER_REQUIRED');
         const scope = authorized(projectId);
         const prior = store.getWork(projectId);
         const {settings, revision} = store.getSettings(projectId);
         const model = scope.authority.models.find(item => item.id === (input.model ?? settings.model ?? scope.authority.defaultModel));
         if (!model) throw problem(409, 'MODEL_UNAVAILABLE');
-        const receipt = store.prepareDispatch({projectId, taskId: input.id, instructionDigest: inputDigest, expectedRevision: revision, task},
+        const receipt = store.prepareDispatch({projectId, taskId: input.id, instructionDigest: inputDigest, expectedRevision: revision, task, nativeOrigin},
           context(scope.authority, model, task.stage));
         if (!receipt.dispatchable) throw problem(409, receipt.code);
         const operation = receipt.operation;
         const controller = new AbortController();
-        const worker = Promise.resolve().then(() => run({projectId, operation, prior, scope, model, prompt: input.prompt, controller})).catch(() => {
+        const worker = Promise.resolve().then(() => run({project, operation, prior, scope, model, prompt: input.prompt, controller,
+          approvedArtifacts: handover?.proof.artifacts})).catch(() => {
           // Ambiguous persistence or provider state holds the reservation. Never restart on its own.
         }).finally(() => jobs.delete(operation.executionId));
         jobs.set(operation.executionId, {worker, controller});

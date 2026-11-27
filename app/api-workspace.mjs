@@ -201,7 +201,7 @@ export async function readCommittedEvidence({ checkout, paths, signal }) {
 }
 
 // The Git blobs were already checked. At dispatch, make sure the same revision and working bytes are still present.
-export function checkedEvidenceIsCurrent({ checkout, head, files }) {
+export function checkedEvidenceIsCurrent({ checkout, head, files, requireClean = false }) {
   try {
     const owner = process.getuid?.();
     if (owner === undefined || realpathSync(absolute(checkout)) !== checkout || checkoutHead(checkout) !== head) return false;
@@ -218,6 +218,13 @@ export function checkedEvidenceIsCurrent({ checkout, head, files }) {
         if (BigInt(length) !== before.size || before.ctimeNs !== after.ctimeNs || before.mtimeNs !== after.mtimeNs ||
             hash(buffer.subarray(0, length)) !== file.sha256) return false;
       } finally { closeSync(fd); }
+    }
+    if (requireClean) {
+      const index = git(checkout, ['ls-files', '-v', '-z']).toString('utf8').split('\0');
+      if (index.some(entry => entry && !entry.startsWith('H '))) return false;
+      const status = git(checkout, ['--no-optional-locks', '-c', 'core.fsmonitor=false', 'status',
+        '--porcelain=v1', '-z', '--untracked-files=all', '--ignore-submodules=none']).toString('utf8');
+      if (status !== '' && status !== '?? .hq-owned-workspace\0') return false;
     }
     return checkoutHead(checkout) === head;
   } catch { return false; }

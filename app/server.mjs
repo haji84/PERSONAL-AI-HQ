@@ -42,6 +42,10 @@ const apiMessages = {
   HANDOVER_REQUIREMENTS_MISSING: '作業時に記録した要求の正本がありません。',
   HANDOVER_REQUIREMENTS_CHANGED: '要求の正本を作業時の記録と照合できません。',
   HANDOVER_CONVERSATION_UNVERIFIED: '保存した作業指示と実行結果を受付記録に照合できません。',
+  NATIVE_HANDOVER_CHECKPOINT_REQUIRED: '案件の確定済み検証記録と、会話の引継ぎ許可を確認してください。',
+  NATIVE_HANDOVER_GIT_CHANGED: '要求、成果物、検証記録を確定済みのGit作業先と照合できません。',
+  NATIVE_HANDOVER_ENROLLMENT_REQUIRED: 'この案件で通常APIへの送信を許可した資料と引継ぎ資料が一致しません。',
+  NATIVE_HANDOVER_ALREADY_SENT: 'このCodex作業から同じ依頼を送信済みです。',
   API_CANDIDATE_HANDOVER_REQUIRED: '以前の検証済み成果物を現在のGit作業コピーで確認できません。',
   PROJECT_BUSY: '実行中または結果を照合中の作業があります。',
   PROJECT_BUDGET_REQUIRED: 'この案件のAPI作業上限を設定してください。',
@@ -141,6 +145,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
   const apiEnabled = Boolean(apiDevelopment);
   const apiWork = createApiDevelopment({...(!apiEnabled || apiDevelopment === true ? {} : apiDevelopment),
     directory, store: execution.store, conversations: chats, hasNativeWork: operations.hasNativeWork, hasActiveWork: operations.hasActiveWork,
+    completedNativeSource: operations.completedSource, readHandoverTurn: (...args) => native.readHandoverTurn?.(...args),
     withProjectWorkLock: (project, act) => operations.updateExecution(project, () => {
       if (chats.hasActiveLive(project.id)) throw error(409, 'ChatGPTの応答が終わるまで開始できません。');
       return act();
@@ -316,10 +321,13 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       return send(response, 200, {activity});
     }
     if (get && route === '/api/execution/handover') {
-      if (target.searchParams.getAll('project').length !== 1 || target.searchParams.getAll('receipt').length !== 1) {
+      const scopes = [...target.searchParams.getAll('receipt'), ...target.searchParams.getAll('thread')];
+      if (target.searchParams.getAll('project').length !== 1 || scopes.length !== 1) {
         throw error(404, '案件と対象の作業を指定してください。');
       }
-      return send(response, 200, await apiWork.previewHandover(project, target.searchParams.get('receipt')));
+      const proof = await (target.searchParams.has('thread') ? apiWork.previewNativeHandover(project, scopes[0])
+        : apiWork.previewHandover(project, scopes[0]));
+      return send(response, 200, proof);
     }
     if (route === '/api/execution/settings') {
       if (get) return send(response, 200, {...execution.settings(project), apiAvailable: apiEnabled && apiWork.capabilities(project).available});
@@ -347,7 +355,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       if (target.searchParams.getAll('project').length !== 1) throw error(404, '案件を見つけられませんでした。');
       if (get && route === '/api/execution/api/capabilities') return send(response, 200, apiWork.capabilities(project));
       if (get && route === '/api/execution/api') return send(response, 200, apiWork.read(project, target.searchParams.get('id') ?? undefined));
-      if (post && route === '/api/execution/api') return send(response, 202, apiWork.start(project, await jsonBody(request, 64000)));
+      if (post && route === '/api/execution/api') return send(response, 202, await apiWork.start(project, await jsonBody(request, 64000)));
       if (post && route === '/api/execution/api/interrupt') {
         const input = await jsonBody(request, 4096);
         return send(response, 202, apiWork.interrupt(project, input?.id));

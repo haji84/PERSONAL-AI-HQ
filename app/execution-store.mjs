@@ -21,6 +21,10 @@ function canonical(value) {
 }
 const digest = value => createHash('sha256').update(JSON.stringify(canonical(value))).digest('hex');
 const denial = code => ({ allowed: false, dispatchable: false, code });
+const validNativeOrigin = origin => origin !== null && typeof origin === 'object' && Object.keys(origin).length === 3 &&
+  typeof origin.threadId === 'string' && /^[A-Za-z0-9_-]{8,80}$/.test(origin.threadId) &&
+  typeof origin.operationId === 'string' && /^[A-Za-z0-9_-]{8,80}$/.test(origin.operationId) &&
+  typeof origin.review === 'string' && hashPattern.test(origin.review);
 const settingFields = Object.keys(normalizeSettings());
 const emptyProject = () => ({ revision: 0, settings: normalizeSettings(), history: [], operations: {}, spentMicros: 0, lastRoute: null, lastExecution: null, checkpoint: null });
 
@@ -88,6 +92,7 @@ export class ExecutionStore {
     for (const operation of Object.values(project.operations)) {
       if (!operation || !['api', 'subscription'].includes(operation.route) || (!active.has(operation.status) && !terminals.has(operation.status)) || !Number.isSafeInteger(operation.reservedMicros) || operation.reservedMicros < 0 || !Number.isSafeInteger(operation.costMicros) || operation.costMicros < 0) error('STATE_INVALID');
       if (typeof operation.model !== 'string' || !operation.model || typeof operation.executorId !== 'string' || !operation.executorId || typeof operation.executionId !== 'string' || !hashPattern.test(operation.fingerprint ?? '') || !hashPattern.test(operation.instructionDigest ?? '') || !Number.isSafeInteger(operation.settingsRevision) || operation.settingsRevision < 0) error('STATE_INVALID');
+      if (operation.nativeOrigin !== undefined && (operation.route !== 'api' || !validNativeOrigin(operation.nativeOrigin))) error('STATE_INVALID');
       if (operation.route === 'api') { try { id(operation.organizationId); } catch { error('STATE_INVALID'); } }
     }
     return project;
@@ -200,7 +205,10 @@ export class ExecutionStore {
   prepareDispatch(request, context) {
     id(request.projectId); id(request.taskId);
     if (!hashPattern.test(request.instructionDigest ?? '')) error('INVALID_INSTRUCTION_DIGEST');
-    const fingerprint = digest({ instructionDigest: request.instructionDigest, task: request.task ?? {} });
+    const {nativeOrigin} = request;
+    if (nativeOrigin !== undefined && (!validNativeOrigin(nativeOrigin) || request.task?.route !== 'api' ||
+        !['consultation', 'design'].includes(request.task.stage))) error('INVALID_NATIVE_ORIGIN');
+    const fingerprint = digest({ instructionDigest: request.instructionDigest, task: request.task ?? {}, nativeOrigin });
     return this.#change(data => {
       const project = this.#project(data, request.projectId, true);
       const prior = project.operations[request.taskId];
@@ -210,6 +218,10 @@ export class ExecutionStore {
       }
       if (project.revision !== request.expectedRevision) return denial('REVISION_CONFLICT');
       if (Object.values(project.operations).some(operation => active.has(operation.status))) return denial('PROJECT_BUSY');
+      if (nativeOrigin && Object.values(project.operations).some(operation => operation.dispatchedAt &&
+          operation.nativeOrigin?.operationId === nativeOrigin.operationId && operation.instructionDigest === request.instructionDigest)) {
+        return denial('NATIVE_HANDOVER_ALREADY_SENT');
+      }
       const decision = this.#resolve(data, project, request.task ?? {}, context);
       if (!decision.allowed) return { ...decision, dispatchable: false };
       const executorId = context.capabilities?.[decision.route]?.executorId;
@@ -226,6 +238,7 @@ export class ExecutionStore {
         executionId: randomUUID(), taskId: request.taskId, fingerprint, settingsRevision: project.revision,
         ...identity,
         task: clone(request.task ?? {}), instructionDigest: request.instructionDigest,
+        ...(nativeOrigin ? {nativeOrigin: clone(nativeOrigin)} : {}),
         organizationId: decision.route === 'api' ? context.safety.api.organizationId : null,
         reservedMicros: moneyMicros(decision.maxCostUsd, 'ceil'), costMicros: 0,
         status: 'reserved', createdAt: new Date(context.now ?? Date.now()).toISOString(), handover,
@@ -251,6 +264,7 @@ export class ExecutionStore {
 
   #checkDispatch(data, project, operation, context) {
     if (project.revision !== operation.settingsRevision) return denial('REVISION_CONFLICT');
+    if (operation.nativeOrigin && digest(context.nativeOrigin ?? null) !== digest(operation.nativeOrigin)) return denial('HANDOVER_REQUIRED');
     if (operation.handover && (operation.handover.checkpointVersion !== project.checkpoint?.version ||
         operation.handover.sourceRoute !== project.lastRoute || !verifyHandover(project.checkpoint, context.handoverReadback).ok)) {
       return denial('HANDOVER_REQUIRED');

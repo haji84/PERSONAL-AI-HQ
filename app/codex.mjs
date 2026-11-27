@@ -4,7 +4,15 @@ import WebSocket from 'ws';
 
 const unavailable = message => Object.assign(new Error(message), {status: 503});
 const missing = message => Object.assign(new Error(message), {status: 404});
+const unverified = () => Object.assign(new Error('Codexの確定した会話を照合できませんでした。'),
+  {status: 409, code: 'HANDOVER_CONVERSATION_UNVERIFIED'});
 const threadId = /^[a-z0-9_-]{1,160}$/i;
+const handoverItemId = /^[a-z0-9_.:-]{1,160}$/i;
+const steeringClientId = /^hq:steer:[a-z0-9_-]{8,80}$/i;
+const turnItemPageLimit = 12;
+const turnItemPageCount = 4;
+const handoverMessageLimit = 24000;
+const handoverByteLimit = 64 * 1024;
 const maxFrame = 2 * 1024 ** 2;
 const clean = (value, limit = 500) => typeof value === 'string' ? value.slice(0, limit) : '';
 const items = value => Array.isArray(value) ? value : [];
@@ -131,6 +139,67 @@ function plainMessages(content) {
   });
 }
 
+function canReadHandover(thread) {
+  return !thread.ephemeral && ['idle', 'notLoaded'].includes(thread.status?.type);
+}
+
+async function latestCompletedTurn(rpc, id, turnId) {
+  const result = await rpc.call('thread/turns/list', {threadId: id, cursor: null,
+    limit: 1, itemsView: 'notLoaded', sortDirection: 'desc'});
+  const [latest] = items(result?.data);
+  if (result?.data?.length !== 1 || latest?.id !== turnId || latest.status !== 'completed' || latest.error != null) throw unverified();
+  return latest;
+}
+
+async function handoverMessages(rpc, threadId, turnId, clientId) {
+  const messages = [];
+  const itemIds = new Set();
+  const userIds = new Set();
+  const cursors = new Set();
+  let bytes = 0;
+  let cursor = null;
+  let lastPhase;
+
+  for (let page = 0; page < turnItemPageCount; page++) {
+    const result = await rpc.call('thread/items/list', {threadId, turnId, cursor, limit: turnItemPageLimit, sortDirection: 'asc'});
+    if (!Array.isArray(result?.data) || !result.data.length || result.data.length > turnItemPageLimit) throw unverified();
+    for (const entry of result.data) {
+      const item = entry?.item;
+      if (entry?.turnId !== turnId || typeof item?.id !== 'string' || !handoverItemId.test(item.id) ||
+          typeof item.type !== 'string' || itemIds.has(item.id)) throw unverified();
+      itemIds.add(item.id);
+      if (item.type !== 'userMessage' && item.type !== 'agentMessage') continue;
+      const user = item.type === 'userMessage';
+      if (entry.outputDeferred === true || (!messages.length && !user)) throw unverified();
+
+      let text = item.text;
+      if (user) {
+        if (!Array.isArray(item.content) || item.content.length !== 1 || item.content[0]?.type !== 'text' ||
+            userIds.has(item.clientId) || (messages.length ? typeof item.clientId !== 'string' ||
+              !steeringClientId.test(item.clientId) : item.clientId !== clientId)) throw unverified();
+        userIds.add(item.clientId);
+        text = item.content[0].text;
+      } else if (item.moderation?.moderated === true || (item.moderation?.display && item.moderation.display.mode !== 'show')) {
+        throw unverified();
+      }
+
+      if (typeof text !== 'string' || !text.trim() || text.length > handoverMessageLimit) throw unverified();
+      bytes += Buffer.byteLength(text, 'utf8');
+      if (bytes > handoverByteLimit) throw unverified();
+      messages.push({id: item.id, role: user ? 'user' : 'assistant', text});
+      lastPhase = item.phase;
+    }
+    if (result.nextCursor === null) {
+      if (messages.at(-1)?.role !== 'assistant' || (lastPhase != null && lastPhase !== 'final_answer')) throw unverified();
+      return messages;
+    }
+    cursor = cursorText(result.nextCursor);
+    if (!cursor || cursors.has(cursor)) throw unverified();
+    cursors.add(cursor);
+  }
+  throw unverified();
+}
+
 function usageView(result) {
   const historical = result?.rateLimits;
   const bucket = result?.rateLimitsByLimitId?.codex ??
@@ -244,6 +313,20 @@ export function createCodexClient({command = binary(), socket} = {}) {
         messages: plainMessages(turn.items), itemCount: items(turn.items).length})).reverse();
       return {thread: threadView(thread), turns, nextCursor: cursorText(result.nextCursor)};
     },
+    async readHandoverTurn(workspace, id, turnId, clientId) {
+      if (typeof workspace !== 'string' || !workspace || typeof turnId !== 'string' || !threadId.test(turnId) ||
+          typeof clientId !== 'string' || !threadId.test(clientId)) throw unverified();
+      const {rpc, thread} = await scopedThread([workspace], id);
+      if (!canReadHandover(thread)) throw unverified();
+      const latest = await latestCompletedTurn(rpc, id, turnId);
+      const messages = await handoverMessages(rpc, id, turnId, clientId);
+      const reread = await scopedThread([workspace], id);
+      if (reread.rpc !== rpc || !canReadHandover(reread.thread) || reread.thread.updatedAt !== thread.updatedAt) throw unverified();
+      const confirmed = await latestCompletedTurn(rpc, id, turnId);
+      if (confirmed.startedAt !== latest.startedAt || confirmed.completedAt !== latest.completedAt ||
+          confirmed.durationMs !== latest.durationMs) throw unverified();
+      return {threadId: id, turnId, messages};
+    },
     async findSubmission(workspace, id, clientId, turnId) {
       const {rpc} = await scopedThread([workspace], id);
       let cursor = null;
@@ -260,8 +343,8 @@ export function createCodexClient({command = binary(), socket} = {}) {
     async hasTurnMessage(workspace, id, turnId, clientId) {
       const {rpc} = await scopedThread([workspace], id);
       let cursor = null;
-      for (let page = 0; page < 4; page++) {
-        const result = await rpc.call('thread/items/list', {threadId: id, turnId, cursor, limit: 12, sortDirection: 'desc'});
+      for (let page = 0; page < turnItemPageCount; page++) {
+        const result = await rpc.call('thread/items/list', {threadId: id, turnId, cursor, limit: turnItemPageLimit, sortDirection: 'desc'});
         if (items(result.data).some(entry => entry.turnId === turnId && entry.item?.type === 'userMessage' &&
             entry.item.clientId === clientId)) return true;
         cursor = cursorText(result.nextCursor);
