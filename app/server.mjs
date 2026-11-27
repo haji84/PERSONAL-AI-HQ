@@ -2,7 +2,7 @@ import http from 'node:http';
 import {spawn} from 'node:child_process';
 import {randomBytes, timingSafeEqual} from 'node:crypto';
 import {constants} from 'node:fs';
-import {lstat, mkdir, open, readFile, realpath, unlink, writeFile} from 'node:fs/promises';
+import {lstat, open, readFile, realpath, unlink, writeFile} from 'node:fs/promises';
 import {homedir} from 'node:os';
 import {basename, dirname, isAbsolute, join, resolve} from 'node:path';
 import {fileURLToPath, pathToFileURL} from 'node:url';
@@ -11,11 +11,14 @@ import {readPortfolio} from './portfolio.mjs';
 import {createChatStore} from './chat-store.mjs';
 import {createCodexClient} from './codex.mjs';
 import {createOperations} from './operations.mjs';
+import {ensurePrivateDirectory} from './private-directory.mjs';
 
 const root = fileURLToPath(new URL('../public/', import.meta.url));
 const assets = new Map([['/', ['index.html', 'text/html']], ['/app.mjs', ['app.mjs', 'text/javascript']],
   ['/app.css', ['app.css', 'text/css']]]);
-const defaultRuntime = join(homedir(), 'Library', 'Application Support', 'Personal AI HQ', 'integration');
+const defaultRuntime = process.platform === 'win32'
+  ? join(process.env.LOCALAPPDATA ?? join(homedir(), 'AppData', 'Local'), 'PersonalAIHQ', 'integration')
+  : join(homedir(), 'Library', 'Application Support', 'Personal AI HQ', 'integration');
 const browserPolicy = "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 const sessionAge = 8 * 60 * 60;
 const error = (status, message) => Object.assign(new Error(message), {status});
@@ -97,10 +100,7 @@ async function checkedSocket(socket) {
 
 export async function startOwnerApp({directory = defaultRuntime, port = 4328, socket, codex} = {}) {
   directory = resolve(directory);
-  await mkdir(directory, {recursive: true, mode: 0o700});
-  const stat = await lstat(directory);
-  if (!stat.isDirectory() || (stat.mode & 0o077) !== 0 ||
-      (process.getuid && stat.uid !== process.getuid())) throw new Error('A private runtime directory is required');
+  await ensurePrivateDirectory(directory);
   const native = codex ?? createCodexClient({socket: await checkedSocket(socket)});
   const chats = createChatStore(directory);
   const operations = createOperations(directory, native);

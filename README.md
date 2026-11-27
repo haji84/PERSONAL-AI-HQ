@@ -8,6 +8,12 @@ Node.js 24とサインイン済みのCodex CLIを利用します。最初に `np
 
 案件の読み取り元は、プライベートな実行ディレクトリの `portfolio.json` です。Macの標準ディレクトリは `~/Library/Application Support/Personal AI HQ/integration` です。`HQ_PRIVATE_DIRECTORY` と `HQ_PORT` で動作確認用ディレクトリとポートを選べます。サインイン用ファイルと会話データは本人の実行ディレクトリに保存されます。
 
+## Windowsで起動
+
+Node.js 24以降とCodex Desktopを使います。`npm ci --ignore-scripts` の後、`start-windows.cmd` を開くと、URLと本人用のサインインファイルが表示されます。ファイルをブラウザーで開いてサインインします。Windowsの標準保存先は `%LOCALAPPDATA%\PersonalAIHQ\integration` です。起動時に既存のWindowsアクセス権を確認し、新しく作った実行ディレクトリだけを本人・SYSTEM・管理者に限定します。変更前後の権限はそのディレクトリに保存します。既存ディレクトリの権限を変更して起動を通すことはありません。
+
+Windows版は、Desktop同梱の公式App Serverから実履歴と対応モデルを読み取ります。現在は閲覧用です。Macで確認済みの独立実行接続を、Windowsの実行確認と同じ扱いにはしません。
+
 ## 接続と確認範囲
 
 - ダッシュボードに出典、観測日時、確認済みの成果と残作業を表示します。進捗の出典がなければ不明と表示します。
