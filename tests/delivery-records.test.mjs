@@ -281,3 +281,34 @@ test('owner requirement coverage exposes exact source lines and committed eviden
     evidenceRevision:replacement,rows:rows.slice(0,2)})});
   assert.deepEqual(await read(),{status:'unavailable'});
 });
+
+test('a scoped existing checkout contributes committed lifecycle state without importing another repository or dirty edits', async t => {
+  const {directory,checkout,commit,configure}=await fixture(t);
+  const source='.codex/autonomy-state.json';
+  const observedAt=new Date().toISOString();
+  const state={version:1,goal:{id:'managed',title:'Committed GOAL',acceptance:['Checked SHA']},
+    status:'active',next_action:'Finish the accepted artifact',tasks:[
+      {id:'verified',status:'verified',actionable:false,depends_on:[],evidence:[{path:'proof.txt',sha256:hash('pass')}]},
+      {id:'open',status:'pending',actionable:true,depends_on:['verified'],evidence:[]},
+    ],delivery:{observationAt:observedAt,stage:'開発中',scopeComplete:true,capacity:{parallelism:1,calendar:'continuous'},
+      tasks:[{id:'open',remainingMinutes:{optimistic:5,standard:8,cautious:12},
+        estimate:{basis:'Current source comparison',confidence:'medium'}}]}};
+  await commit({[source]:JSON.stringify(state),'proof.txt':'pass'});
+  await configure([{id:'existing',name:'Existing',cwd:[checkout],repository},
+    {id:'foreign',name:'Foreign',cwd:[checkout],repository:repository+'-other'}]);
+  async function views(){ return (await readPortfolio(directory,undefined,true)).view.projects; }
+  const [active,foreign]=await views();
+  assert.equal(active.forecast.goal,'Committed GOAL');
+  assert.equal(active.forecast.schedule.workMinutes.standard,8);
+  assert.deepEqual(active.forecast.schedule.readyTaskIds,['open']);
+  assert.equal(foreign.forecast.goal,null);
+  assert.ok(!JSON.stringify(active).includes(checkout));
+  state.status='paused';
+  await writeFile(join(checkout,source),JSON.stringify(state));
+  assert.deepEqual((await views())[0].forecast.schedule.readyTaskIds,['open']);
+  await commit({[source]:JSON.stringify(state),'proof.txt':'changed'});
+  const [held]=await views();
+  assert.equal(held.forecast.status,'paused');
+  assert.equal(held.forecast.schedule.workMinutes,null);
+  assert.deepEqual(held.forecast.schedule.readyTaskIds,[]);
+});

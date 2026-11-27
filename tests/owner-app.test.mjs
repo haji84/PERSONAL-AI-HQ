@@ -1070,3 +1070,38 @@ test('a scoped ChatGPT plan stream preserves text and never repeats the provider
   assert.equal((await send(app.url, {...data, id: 'turn-after-pause'})).status, 409);
   assert.equal(runs, 1);
 });
+
+test('one canonical forecast survives every execution mode and a new owner-app process', async t => {
+  const {start} = await runtimeFixture(t);
+  let runtime=await start({codex:{}});
+  let cookie=await login(runtime);
+  const post=(url,body)=>fetch(runtime.url+url,{method:'POST',
+    headers:{cookie,Origin:runtime.url,'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const registration=await post('/api/portfolio/projects',{requestId:randomUUID(),name:'Forecast persistence',goal:'Scope the first deliverable'});
+  assert.equal(registration.status,201);
+  const {id}=await registration.json();
+  const read=async ()=>{
+    const response=await fetch(runtime.url+'/api/portfolio',{headers:{cookie}});
+    assert.equal(response.status,200);
+    return (await response.json()).projects.find(row=>row.id===id).forecast;
+  };
+  const before=await read();
+  assert.ok(before.tasks[0].remainingMinutes.standard>0);
+  const path='/api/execution/settings?project='+id;
+  const switches=[
+    {mode:'api-only',allowedRoutes:['api']},
+    {mode:'auto',allowedRoutes:['api','subscription'],preference:'subscription-first'},
+    {mode:'hybrid',allowedRoutes:['api','subscription'],stageRoutes:{design:'subscription',implementation:'api'}},
+    {mode:'subscription-only',allowedRoutes:['subscription'],stageRoutes:{}},
+  ];
+  for (const [revision,settings] of switches.entries()) {
+    const result=await post(path,{revision,settings});
+    assert.equal(result.status,200,await result.clone().text());
+    assert.equal((await result.json()).settings.mode,settings.mode);
+    assert.deepEqual(await read(),before);
+  }
+  await runtime.close();
+  runtime=await start({codex:{}});
+  cookie=await login(runtime);
+  assert.deepEqual(await read(),before);
+});

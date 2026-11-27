@@ -1,7 +1,7 @@
 import {execFile} from 'node:child_process';
 import {createHash} from 'node:crypto';
 import {lstat, realpath} from 'node:fs/promises';
-import {isAbsolute, normalize} from 'node:path';
+import {isAbsolute, join, normalize} from 'node:path';
 import {promisify} from 'node:util';
 import {readOnlyGitInvocation} from './api-workspace.mjs';
 
@@ -36,11 +36,11 @@ function link(repository, revision, file, label) {
   return {label, url:'https://github.com/' + repository + '/blob/' + revision + '/' + file};
 }
 
-async function openSource(source) {
+async function openSource(source, {allowHead=false} = {}) {
   const {checkout, ref} = source;
   const repository = gitHubRepository(source.repository);
   if (!repository || typeof checkout !== 'string' || !isAbsolute(checkout) || normalize(checkout) !== checkout ||
-      typeof ref !== 'string' || !sourceRef.test(ref) || ref.includes('..') || ref.endsWith('/')) throw new Error('Invalid delivery source');
+      typeof ref !== 'string' || (!(allowHead && ref==='HEAD') && !sourceRef.test(ref)) || ref.includes('..') || ref.endsWith('/')) throw new Error('Invalid delivery source');
   const owner = process.getuid?.();
   const info = await lstat(checkout);
   if (!info.isDirectory() || (owner !== undefined && info.uid !== owner) || normalize(await realpath(checkout)) !== checkout) {
@@ -213,6 +213,59 @@ export async function readPortfolioTaskRecords(source) {
   } catch { return null; }
 }
 
+const lifecycleStateFile = '.codex/autonomy-state.json';
+const lifecycleStates = new Set(['active','paused','cancelled','awaiting_approval','resource_limited','blocked','complete']);
+const lifecycleTaskStates = new Set(['pending','running','verified','failed','blocked']);
+const lifecycleId = /^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/;
+
+function lifecyclePathValid(file) {
+  return typeof file==='string' && file.length<=240 && file.split('/').every(part=>
+    part!=='.' && part!=='..' && /^[A-Za-z0-9._-]+$/.test(part) && !/^\.env(?:\.|$)|\.(?:key|pem|pfx|p12)$/i.test(part));
+}
+
+export async function readProjectForecastState(checkout, repository) {
+  if (!checkout || !repository) return null;
+  try {
+    const folder = await lstat(join(checkout,'.codex'));
+    if (!folder.isDirectory() || folder.isSymbolicLink()) return null;
+    const file = await lstat(join(checkout,lifecycleStateFile));
+    if (!file.isFile() || file.size>128*1024) return null;
+    const reader = await openSource({checkout,repository,ref:'HEAD'},{allowHead:true});
+    const [bytes] = await reader.files(reader.revision,[lifecycleStateFile]);
+    if (bytes.length>128*1024) return null;
+    const state = JSON.parse(bytes);
+    if (state?.version!==1 || !lifecycleStates.has(state.status) || typeof state.goal?.title!=='string' ||
+        !Array.isArray(state.tasks) || state.tasks.length>64 || state.tasks.some(task=>!lifecycleId.test(task?.id??'') ||
+          !lifecycleTaskStates.has(task.status) || typeof task.actionable!=='boolean' ||
+          !Array.isArray(task.depends_on) || task.depends_on.length>64)) return null;
+    if (state.source) {
+      if (!lifecyclePathValid(state.source.path) || !contentDigest.test(state.source.sha256??'')) return null;
+      const [canonical] = await reader.files(reader.revision,[state.source.path]);
+      if (createHash('sha256').update(canonical).digest('hex')!==state.source.sha256) return null;
+    }
+    const validEvidence = task=>Array.isArray(task.evidence) && task.evidence.length>0 && task.evidence.length<=8 &&
+      task.evidence.every(item=>lifecyclePathValid(item?.path) && contentDigest.test(item?.sha256??''));
+    const verification = state.tasks.filter(task=>task.status==='verified' && validEvidence(task));
+    const names = [...new Set(verification.flatMap(task=>task.evidence.map(item=>item.path)))].slice(0,24);
+    const proof = new Map(await Promise.all(names.map(async name=>{
+      try {
+        const [content] = await reader.files(reader.revision,[name]);
+        return [name,createHash('sha256').update(content).digest('hex')];
+      } catch { return [name,null]; }
+    })));
+    const verifiedTaskIds = new Set(verification.filter(task=>task.evidence.every(item=>
+      proof.get(item.path)===item.sha256)).map(task=>task.id));
+    const planning = Array.isArray(state.delivery?.tasks) ? state.delivery.tasks.slice(0,64) : [];
+    const byId = new Map(planning.filter(task=>lifecycleId.test(task?.id??'')).map(task=>[task.id,task]));
+    const tasks = state.tasks.map(task=>({...byId.get(task.id),id:task.id,title:byId.get(task.id)?.title??task.title,
+      status:task.status==='running'?'active':task.status,actionable:task.actionable,dependencies:task.depends_on}));
+    const [committedAt] = await Promise.all([reader.git('show','-s','--format=%cI',reader.revision)]);
+    return {delivery:{...state.delivery,tasks,goal:state.goal.title,goalId:state.goal.id,
+      observationAt:iso(state.delivery?.observationAt)??iso(committedAt.toString().trim())},
+      nextAction:state.next_action,status:state.status,verifiedTaskIds,
+      source:link(reader.repository,reader.revision,lifecycleStateFile,'案件の保存済み進行状態')};
+  } catch { return null; }
+}
 export function tasksForRepository(observation, repository) {
   return observation?.projects.get(gitHubRepository(repository)?.toLowerCase()) ?? null;
 }
