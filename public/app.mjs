@@ -1,4 +1,5 @@
 import {abortLocalDictation, createLocalDictation} from './dictation.mjs';
+import {createCodexCamera} from './codex-camera.mjs';
 
 const pages = {
   dashboard: 'ダッシュボード',
@@ -2325,7 +2326,16 @@ function imageBase64(bytes) {
   return btoa(characters.join(''));
 }
 
-function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {handoff, advice, imageModel, target} = {}) {
+function codexCameraRouteAllowed(settings, stage, route) {
+  if (!asArray(settings?.allowedRoutes).includes('subscription')) return false;
+  if (route) return route === 'subscription';
+  if (settings.mode === 'hybrid') return settings.stageRoutes?.[stage] === 'subscription';
+  if (settings.mode === 'auto') return settings.preference === 'subscription-first' ||
+    (settings.preference === 'api-first' && settings.allowFallback === true);
+  return settings.mode === 'subscription-only';
+}
+
+function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {handoff, advice, imageModel, cameraSettings, target} = {}) {
   const apiMode = Boolean(apiReady);
   const runKey = apiMode ? memoryKey('api-work', project) : project;
   const native = advice?.native;
@@ -2406,6 +2416,73 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
   let attachmentSequence = 0;
   let attachmentMessage = '';
   let readingAttachment = false;
+  let captureGeneration = 0;
+  let cameraContext = null;
+  const camera = imageModel ? createCodexCamera({maxBytes: codexImageLimit, onCapture: file => stageAttachment(file, true),
+    onActiveChange: () => queueMicrotask(paint)}) : null;
+  function invalidatePhoto() { captureGeneration++; }
+  function updateCameraVisibility() {
+    if (document.hidden) invalidatePhoto();
+    paint();
+  }
+  if (camera) {
+    document.addEventListener('visibilitychange', updateCameraVisibility);
+    window.addEventListener('pagehide', invalidatePhoto);
+  }
+  function cameraContextKey() {
+    const model = imageModel?.();
+    if (!isCurrent() || document.hidden || !model || run.busy || ui.runIntents.has(runKey)) return null;
+    const selected = choices();
+    const existing = target ? run.operation : null;
+    const route = selected.route ?? existing?.explicitRoute;
+    const stage = selected.stage ?? existing?.stage ?? 'implementation';
+    return codexCameraRouteAllowed(cameraSettings?.(), stage, route) ? JSON.stringify([model, stage, route]) : null;
+  }
+  function syncCamera() {
+    if (!camera) return;
+    const context = cameraContextKey();
+    if (context !== cameraContext) {
+      cameraContext = context;
+      invalidatePhoto();
+      camera.close();
+    }
+    camera.setAvailable(Boolean(context) && !readingAttachment);
+  }
+  async function stageAttachment(file, captured = false) {
+    const context = captured ? cameraContextKey() : null;
+    const generation = captureGeneration;
+    if (!file || !isCurrent() || (captured && !context)) return;
+    const sequence = ++attachmentSequence;
+    const extension = file.name.slice(file.name.lastIndexOf('.')).toLowerCase();
+    const kind = codexImageTypes.includes(file.type) ? 'image' : textDocumentExtensions.includes(extension) ? 'document' : null;
+    readingAttachment = false;
+    if (kind === 'image' && !imageModel() && !currentIntent()?.imageSha256) {
+      attachmentMessage = '画像入力に対応するモデルを選んでください。';
+    } else if (!file.size || !kind || file.size > (kind === 'image' ? codexImageLimit : textDocumentLimit)) {
+      attachmentMessage = '画像は512 KiB、UTF-8のテキスト資料は16 KiBまでです。';
+    } else {
+      readingAttachment = true;
+      attachmentMessage = '添付を照合しています。';
+    }
+    paint();
+    if (!readingAttachment) return;
+    try {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      if (kind === 'document') documentDecoder.decode(bytes);
+      const digest = await attachmentDigest(bytes, kind === 'document' ? file.name : '');
+      if (sequence !== attachmentSequence || !isCurrent()) return;
+      if (captured && (generation !== captureGeneration || context !== cameraContextKey())) {
+        attachmentMessage = '';
+        return;
+      }
+      ui.attachmentDrafts.set(draftKey, {kind, file, digest});
+      attachmentMessage = '';
+    } catch {
+      if (sequence === attachmentSequence) attachmentMessage = '添付を読み取れませんでした。';
+    } finally {
+      if (sequence === attachmentSequence) { readingAttachment = false; paint(); }
+    }
+  }
   if (imageModel) {
     const attachmentControls = node('div', 'stack');
     const attachmentLabel = node('label', 'picker');
@@ -2421,38 +2498,16 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
       attachmentMessage = '';
       paint();
     });
-    attachmentInput.addEventListener('change', async () => {
+    attachmentInput.addEventListener('click', () => camera?.close());
+    attachmentInput.addEventListener('change', () => {
       const file = attachmentInput.files?.[0];
-      if (!file) return;
       attachmentInput.value = '';
-      const sequence = ++attachmentSequence;
-      const extension = file.name.slice(file.name.lastIndexOf('.')).toLowerCase();
-      const kind = codexImageTypes.includes(file.type) ? 'image' : textDocumentExtensions.includes(extension) ? 'document' : null;
-      readingAttachment = false;
-      if (kind === 'image' && !imageModel() && !currentIntent()?.imageSha256) {
-        attachmentMessage = '画像入力に対応するモデルを選んでください。';
-      } else if (!file.size || !kind || file.size > (kind === 'image' ? codexImageLimit : textDocumentLimit)) {
-        attachmentMessage = '画像は512 KiB、UTF-8のテキスト資料は16 KiBまでです。';
-      } else {
-        readingAttachment = true;
-        attachmentMessage = '添付を照合しています。';
-      }
-      paint();
-      if (!readingAttachment) return;
-      try {
-        const bytes = new Uint8Array(await file.arrayBuffer());
-        if (kind === 'document') documentDecoder.decode(bytes);
-        const digest = await attachmentDigest(bytes, kind === 'document' ? file.name : '');
-        if (sequence !== attachmentSequence || !isCurrent()) return;
-        ui.attachmentDrafts.set(draftKey, {kind, file, digest});
-        attachmentMessage = '';
-      } catch {
-        if (sequence === attachmentSequence) attachmentMessage = '添付を読み取れませんでした。';
-      } finally {
-        if (sequence === attachmentSequence) { readingAttachment = false; paint(); }
-      }
+      camera?.close();
+      void stageAttachment(file);
     });
-    attachmentControls.append(attachmentLabel, attachmentInfo, removeAttachment);
+    attachmentControls.append(attachmentLabel);
+    if (camera) attachmentControls.append(camera.root);
+    attachmentControls.append(attachmentInfo, removeAttachment);
     section.append(attachmentControls);
   }
   section.append(status, details, warning, steeringStatus, actions, output, artifacts);
@@ -2496,6 +2551,7 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
       attachmentInfo.textContent = attachmentMessage || (attachment ?
         `${attachment.file.name} · ${Math.ceil(attachment.file.size / 1024)} KiB` : retryMessage);
       removeAttachment.hidden = !attachment;
+      syncCamera();
     }
     const foreignIntent = pendingElsewhere();
     const relevantOperation = !foreignIntent && matchesStage(run.operation) && (!intention || intention.id === run.operation?.id)
@@ -2536,9 +2592,8 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
     checkSteer.hidden = !pendingSteering;
     closeSteer.hidden = !pendingSteering || !run.known || !finishedPhases.has(phase);
     recover.hidden = !intention || !reviewMatches(intention) || (run.known && run.operation?.id === intention.id);
-    for (const action of [send, resume, steer, interrupt, cancel, recover, check, checkSteer, closeSteer]) {
-      action.disabled = run.busy || run.checking;
-    }
+    for (const action of [send, resume, steer, recover]) action.disabled = run.busy || run.checking || camera?.active === true;
+    for (const action of [interrupt, cancel, check, checkSteer, closeSteer]) action.disabled = run.busy || run.checking;
     const body = text(advice ? relevantOperation?.advice :
       apiMode ? relevantOperation?.verification?.output : relevantOperation?.output, '');
     if (output.textContent !== body) {
@@ -2706,6 +2761,11 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
 
   function sendSteering() {
     if (steer.hidden || run.busy || run.checking || !isCurrent() || ui.steerIntents.has(project)) return;
+    if (camera?.active || readingAttachment) {
+      run.steerMessage = '撮影・添付を終えてから送信してください。';
+      paint();
+      return;
+    }
     if (ui.attachmentDrafts.has(draftKey)) {
       run.steerMessage = '添付は、このスレッドの次のターンに送れます。';
       paint();
@@ -2729,6 +2789,11 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
 
   function submitNew(previous) {
     if (run.busy || run.checking || !hasRoom() || !isCurrent() || previous?.phase === 'cancelled') return;
+    if (camera?.active) {
+      run.message = '撮影を完了するか、カメラを閉じてから送信してください。';
+      paint();
+      return;
+    }
     if (target && previous?.threadId !== target.id) return;
     const review = handoff?.review();
     if (handoff && !previous && (!review || (run.operation?.threadId && run.operation?.turnId))) return;
@@ -2774,6 +2839,11 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
   const cleanup = () => {
     abortLocalDictation(draft);
     disposed = true;
+    camera?.dispose();
+    if (camera) {
+      document.removeEventListener('visibilitychange', updateCameraVisibility);
+      window.removeEventListener('pagehide', invalidatePhoto);
+    }
     clearTimeout(timer);
     if (run.onChange === paint) run.onChange = null;
     runViewCleanups.delete(cleanup);
@@ -2922,7 +2992,9 @@ function modelSettings(target, back) {
     if (ui.capabilities.executionSettings === true) area.body.append(details);
     nativeRun = mountCodexRun(area, project, draft, draftKey, () => ({...runChoices,
       ...(route.input.value ? {route: route.input.value} : {}), ...(stage.input.value ? {stage: stage.input.value} : {})}),
-    null, {imageModel: () => imageModel, target});
+    null, {imageModel: () => imageModel, cameraSettings: () => projectSettings?.value?.settings, target});
+    route.input.addEventListener('change', nativeRun.paint);
+    stage.input.addEventListener('change', nativeRun.paint);
   }
   else if (target || ui.capabilities.apiDevelopment !== true) {
     area.body.append(node('p', 'small muted draft-hint', '現在の接続では履歴を閲覧できます。下書きはこのタブに保存されます。'));
