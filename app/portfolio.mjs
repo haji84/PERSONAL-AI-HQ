@@ -406,7 +406,7 @@ export async function readPortfolio(directory, githubProjects, refreshGithub = f
         const workspaceUnconfirmed = Boolean(shared?.localProjectId && !scoped);
         const projectHeld = ['paused','completed','blocked','approval','limit','offline'].includes(project.state);
         const input = scoped?.delivery ?? forecastInput(project,local,shared,deliveryRecord);
-        if (project.scopeRequired) {
+        if (project.scopeRequired && !workspaceUnconfirmed) {
           input.ownerAction = ['ホスト側でこの案件の作業先と実行権限を設定する。',text(input.ownerAction,360)].filter(Boolean).join(' ');
           delete input.ownerActionAppliesTo;
         }

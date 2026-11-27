@@ -550,7 +550,7 @@ test('the existing shared observation can carry a local project across devices b
   const task={id:'compare',status:'pending',actionable:true,remainingMinutes:{optimistic:4,standard:6,cautious:10},
     estimate:{basis:'The saved evidence narrows the remaining check',confidence:'medium'}};
   const localRecord={localProjectId:id,tasks:[task],delivery:{
-    stage:'Evidence check',scopeComplete:true,capacity:{calendar:'continuous'}}};
+    stage:'Evidence check',scopeComplete:true,capacity:{calendar:'continuous'},nextAction:'Start the recorded work'}};
   const path=initiative+'/portfolio-observation.json';
   const saved=await commit({[path]:JSON.stringify({taskProgress:{observedAt,projects:[],localProjects:[localRecord]}})});
   const registeredWorkspace=join(directory,'local-workspace');
@@ -570,6 +570,7 @@ test('the existing shared observation can carry a local project across devices b
   assert.equal(matched.forecast.schedule.completionDates,null);
   assert.equal(matched.forecast.ownerAction,null);
   assert.ok(matched.forecast.gaps.some(({code})=>code==='workspace-observation'));
+  assert.equal(matched.forecast.nextAction,'保存済みの進行状態と作業先を照合する。');
   assert.equal(other.forecast.source,null);
   assert.equal(portfolio.taskProgressSource.unmatched,0);
 
@@ -584,6 +585,14 @@ test('the existing shared observation can carry a local project across devices b
   assert.equal(matched.tasks[0].status,'unknown');
   assert.equal(matched.tasks[0].progress,null);
   assert.equal(matched.tasks[0].remainingMinutes.standard,6);
+
+  settings.projects[0].registrationRequestId=randomUUID();
+  delete settings.projects[0].cwd;
+  await writeFile(portfolioPath,JSON.stringify(settings));
+  const withoutWorkspace=(await view()).projects[0];
+  assert.equal(withoutWorkspace.scopeRequired,true);
+  assert.equal(withoutWorkspace.forecast.ownerAction,null);
+  assert.equal(withoutWorkspace.forecast.nextAction,'保存済みの進行状態と作業先を照合する。');
 
   settings.projects[0].repository='http://github.com/fixture-owner/unrelated';
   await writeFile(portfolioPath,JSON.stringify(settings));

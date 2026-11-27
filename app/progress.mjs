@@ -402,6 +402,7 @@ export function developmentForecast(delivery = {}, {
   const unresolved = outstanding.filter(waits);
   const ownerAction = forecastString(delivery.ownerAction);
   const ownerHold = ownerAction && delivery.ownerActionAppliesTo!=='release';
+  const workspaceReviewAction = '保存済みの進行状態と作業先を照合する。';
   const canDate = !paused && !ownerAction && !workspaceUnconfirmed && calendar && asOf!==null && asOf<=now;
   function calendarDates(selected) {
     if (!canDate || !selected || selected.some(task=>waits(task) || task.unconfirmedCompletion || (!task.verified &&
@@ -452,13 +453,14 @@ export function developmentForecast(delivery = {}, {
     unresolved.map(task=>task.id));
   if (ownerAction) missing('owner-action','利用者の対応が残っています。',ownerAction);
   if (workspaceUnconfirmed) missing('workspace-observation','この端末の作業先で進行状態を確認できていません。',
-    '保存済みの進行状態と作業先を照合してから着手する。');
+    workspaceReviewAction);
   if (!calendar) missing('calendar','稼働を予定できる時間帯が未確認です。','担当と利用枠、稼働時間帯を確認し、経過時間から完成日時を計算する。');
   if (!original) missing('baseline','保存された開始前の見積もりがありません。','既存の履歴を照合し、復元した見込みには事後推定と記録する。');
   const start = timestamp(delivery.startedAt);
   const end = timestamp(delivery.completedAt)??(asOf!==null && asOf<=now ? asOf : null);
   const observed = observedTime(delivery.intervals);
-  const action = forecastString(nextAction)??forecastString(delivery.nextAction) ??
+  const action = workspaceUnconfirmed ? workspaceReviewAction :
+    forecastString(nextAction)??forecastString(delivery.nextAction) ??
     outstanding.find(task=>readyTaskIds.includes(task.id))?.nextAction ?? gaps[0]?.action ?? null;
   return {goal:target,stage:forecastString(delivery.stage),status,observedAt:forecastJst(asOf),progress,
     checkpoints:checkTotal ? {accepted:checkAccepted,total:checkTotal,percent:progressPercent(checkAccepted,checkTotal)} : null,
