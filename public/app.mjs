@@ -1206,6 +1206,7 @@ function projectDetail() {
   }
   const m = project.measurements ?? {};
   const record = project.deliveryRecord;
+  const completed = m.formalCompletion === 100 && project.schedule?.remainingMinutes?.cautious === 0;
   const wholeProgress = ['implementationCompletion', 'formalCompletion', 'verifiedCompletion', 'usableCompletion']
     .some(key => Number.isFinite(m[key]));
   if (record && !wholeProgress) metric(facts, '案件全体の完成率', '不明');
@@ -1216,11 +1217,12 @@ function projectDetail() {
     metric(facts, '実用完成率', m.usableCompletion, true);
   }
   if (!record || m.estimateFinish || record.firstUsable) {
-    markEstimateExpiry(metric(facts, '完成予定', time(m.estimateFinish)), Date.parse(m.estimateFinish));
+    const finish = metric(facts, '完成予定', time(m.estimateFinish));
+    if (!completed) markEstimateExpiry(finish, Date.parse(m.estimateFinish));
   }
   if (project.schedule?.originalDueAt) metric(facts, '当初の完成予定', time(project.schedule.originalDueAt));
-  markEstimateExpiry(metric(facts, '案件全体の残り作業時間', estimateLabel(project.schedule?.remainingMinutes)),
-    Date.parse(project.schedule?.estimatedFinish));
+  const wholeTime = metric(facts, '案件全体の残り作業時間', estimateLabel(project.schedule?.remainingMinutes));
+  if (!completed) markEstimateExpiry(wholeTime, Date.parse(project.schedule?.estimatedFinish));
   if (!record || Number.isFinite(m.activeMinutes)) {
     metric(facts, '累計実作業時間', Number.isFinite(m.activeMinutes) ? m.activeMinutes + '分' : null);
   }
