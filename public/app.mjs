@@ -64,7 +64,8 @@ const activityLabels = {
   reserved: '受付済み', sending: 'Codexへの送信を確認中', running: '実行中', interrupting: '中断を要求中',
   unconfirmed: '状態未確認', completed: 'ターン完了', interrupted: '中断済み', failed: '実行失敗',
 };
-const chatSourceLabels = {'chatgpt-export': 'ChatGPTの書き出し', 'chatgpt-live': 'ChatGPTプラン', 'api-development': '通常APIの開発'};
+const chatSourceLabels = {'chatgpt-export': 'ChatGPTの書き出し', 'chatgpt-live': 'ChatGPTプラン',
+  'api-development': '通常APIの開発', 'codex-history': 'Codex'};
 let requestSequence = 0;
 let mounted = 0;
 let pendingScroll;
@@ -824,8 +825,8 @@ function planComposer(project, onConversation) {
       return;
     }
     const conversationId = reference.checked ? ui.chatIds.get(project) : undefined;
-    if (conversationId?.startsWith('api/')) {
-      status.textContent = '通常APIの記録をChatGPTプランに引き継ぐには、作業の照合が必要です。';
+    if (conversationId && /^(?:api|codex)\//.test(conversationId)) {
+      status.textContent = '別の経路の記録をChatGPTプランに引き継ぐには、作業の照合が必要です。';
       return;
     }
     const id = crypto.randomUUID();
@@ -959,17 +960,23 @@ function chat() {
   const readContainer = thread.body;
   const items = node('div');
   const searchWrap = node('div', 'search-wrap');
+  const codexStatus = node('div', 'small muted');
+  const codexThreads = new Map();
   let debounce;
+  let nextThreadPage = null;
+  let explicitSelection = Boolean(ui.chatIds.get(project));
   function showChatDetails() {
     const id = ui.chatIds.get(project);
     if (!id) {
       readContainer.replaceChildren(node('p', 'muted', '履歴から会話を選んでください。'));
       return;
     }
-    const query = apiPath('/api/chat', {project, id, offset: 0});
+    const nativeId = id.startsWith('codex/') ? id.slice('codex/'.length) : null;
+    const detail = (offset, cursor) => nativeId ? apiPath('/api/codex/thread', {project, id: nativeId, cursor}) : apiPath('/api/chat', {project, id, offset});
     const key = memoryKey('chat-detail', project, id);
-    fetchView(key, query, readContainer, (result, destination) => {
-      const conversation = result?.conversation;
+    fetchView(key, detail(0), readContainer, (result, destination) => {
+      const conversation = nativeId ? {title: result?.thread?.title, source: 'codex-history', importedAt: result?.thread?.updatedAt,
+        messages: asArray(result?.turns).flatMap(turn => asArray(turn.messages))} : result?.conversation;
       if (!conversation) {
         destination.append(node('p', 'empty', '会話を読み込めませんでした。'));
         return;
@@ -985,35 +992,47 @@ function chat() {
       }
       const messages = node('div', 'messages messages-embedded');
       destination.append(messages);
-      if (!messagesInto(messages, conversation.messages)) {
-        messages.append(node('p', 'muted', '表示できる発言がありません。'));
-      }
+      const empty = node('p', 'muted', '表示できる発言がありません。');
+      if (!messagesInto(messages, conversation.messages)) messages.append(empty);
       let offset = result.nextOffset;
+      let cursor = result.nextCursor;
+      const detailIsCurrent = () => messages.isConnected && ui.project === project && ui.chatIds.get(project) === id;
       const transfer = button('表示中のAI回答をCodexの下書きに追加', () => {
         const recent = asArray(conversation.messages).findLast(message => message.role === 'assistant');
         moveToDraft(project, 'codex', recent, 'この案件でのChatGPTの回答');
       });
       function updateTransfer() {
-        transfer.hidden = apiArchive || !asArray(conversation.messages).some(message => message.role === 'assistant' && message.text);
+        transfer.hidden = Boolean(nativeId) || apiArchive || !asArray(conversation.messages).some(message => message.role === 'assistant' && message.text);
       }
-      const load = button('続きの発言を表示', async () => {
+      const canLoad = () => nativeId ? Boolean(cursor) : Number.isSafeInteger(offset);
+      const load = button(nativeId ? '以前のターンを表示' : '続きの発言を表示', async () => {
         load.disabled = true;
         try {
-          const page = await api(apiPath('/api/chat', {project, id, offset}));
-          if (!destination.isConnected || ui.chatIds.get(project) !== id) return;
-          const added = asArray(page.conversation?.messages);
-          messagesInto(messages, added);
-          conversation.messages = [...asArray(conversation.messages), ...added];
-          updateTransfer();
-          result.nextOffset = page.nextOffset;
-          offset = page.nextOffset;
-          load.hidden = !Number.isSafeInteger(offset);
-          if (!load.hidden) messages.append(load);
-        } catch (error) { setNotice(error.message, true); }
+          const page = await api(detail(offset, cursor));
+          if (!detailIsCurrent()) return;
+          if (nativeId) {
+            const turns = asArray(page.turns);
+            if (messagesInto(messages, turns.flatMap(turn => asArray(turn.messages)), true)) empty.remove();
+            result.turns = [...turns, ...asArray(result.turns)];
+            result.nextCursor = page.nextCursor !== cursor ? page.nextCursor : null;
+            cursor = result.nextCursor;
+            messages.prepend(load);
+          } else {
+            const added = asArray(page.conversation?.messages);
+            if (messagesInto(messages, added)) empty.remove();
+            conversation.messages = [...asArray(conversation.messages), ...added];
+            updateTransfer();
+            result.nextOffset = page.nextOffset;
+            offset = page.nextOffset;
+            messages.append(load);
+          }
+          load.hidden = !canLoad();
+        } catch (error) { if (detailIsCurrent()) setNotice(error.message, true); }
         finally { load.disabled = false; }
       });
-      load.hidden = !Number.isSafeInteger(offset);
-      messages.append(load);
+      load.hidden = !canLoad();
+      if (nativeId) messages.prepend(load);
+      else messages.append(load);
       updateTransfer();
       destination.append(transfer);
     }, () => ui.chatIds.get(project) === id);
@@ -1022,13 +1041,16 @@ function chat() {
     const key = memoryKey('chat-index', project, query);
     const path = apiPath('/api/chat', {project, q: query});
     fetchView(key, path, items, (result, destination) => {
-      const conversations = asArray(result?.conversations);
+      const needle = query.trim().toLowerCase();
+      const conversations = [...asArray(result?.conversations),
+        ...[...codexThreads.values()].filter(thread => !needle || (thread.title ?? '').toLowerCase().includes(needle))]
+        .sort((a, b) => (Date.parse(b.importedAt) || 0) - (Date.parse(a.importedAt) || 0));
       if (!conversations.length) {
         destination.append(node('p', 'empty', query ? '一致する会話がありません。' : 'このプロジェクトの会話履歴はありません。'));
         if (!ui.chatIds.get(project)) showChatDetails();
         return;
       }
-      if (!ui.chatIds.get(project) && !query) {
+      if (!explicitSelection && !needle && ui.chatIds.get(project) !== conversations[0].id) {
         ui.chatIds.set(project, conversations[0].id);
         storeTab();
         showChatDetails();
@@ -1038,6 +1060,7 @@ function chat() {
         rows.append(listItem(rowButton(text(conversation.title, '無題の会話'),
           `${chatSourceLabels[conversation.source] ?? '取得元未確認'} · ${time(conversation.importedAt)}`,
           ui.chatIds.get(project) === conversation.id, event => {
+            explicitSelection = true;
             ui.chatIds.set(project, conversation.id);
             storeTab();
             for (const row of rows.querySelectorAll('button')) row.setAttribute('aria-pressed', String(row === event.currentTarget));
@@ -1045,20 +1068,41 @@ function chat() {
           })));
       }
       destination.append(rows);
+      if (needle && codexThreads.size) destination.append(node('p', 'small muted', 'Codexは取得済みのスレッド名を検索します。'));
     }, () => search.value === query);
   }
   const search = queryInput(routeKey(), '会話を検索', 'タイトル・本文を検索', query => {
     clearTimeout(debounce);
     debounce = setTimeout(() => { if (items.isConnected) searchChats(query); }, 180);
   });
+  const nextCodex = button('以前のCodexスレッドを取得', async () => {
+    nextCodex.disabled = true;
+    try {
+      const page = await api(apiPath('/api/codex/threads', {project, cursor: nextThreadPage}));
+      if (layout.isConnected) recordCodexPage(page);
+    } catch (error) { setNotice(error.message, true); }
+    finally { nextCodex.disabled = false; }
+  });
+  function recordCodexPage(page) {
+    for (const row of asArray(page.data)) {
+      if (typeof row.id !== 'string' || !row.id) continue;
+      const id = `codex/${row.id}`;
+      codexThreads.set(id, {id, title: row.title, importedAt: row.updatedAt, source: 'codex-history'});
+    }
+    nextThreadPage = page.nextCursor !== nextThreadPage ? page.nextCursor : null;
+    nextCodex.hidden = !nextThreadPage;
+    codexStatus.append(nextCodex);
+    searchChats(search.value);
+  }
   searchWrap.append(search);
   collection.body.remove();
-  collection.root.append(searchWrap, items);
+  collection.root.append(searchWrap, items, codexStatus);
   if (ui.capabilities.chatImport === true) collection.root.append(importSection(project));
   const current = node('div', 'stack');
   current.append(thread.root);
   if (ui.capabilities.chatgptPlan === true) current.append(planComposer(project, id => {
     if (ui.view !== 'chat' || ui.project !== project || !layout.isConnected) return;
+    explicitSelection = true;
     ui.chatIds.set(project, id);
     storeTab();
     evictChats(project);
@@ -1069,6 +1113,9 @@ function chat() {
   dom.content.append(layout);
   showChatDetails();
   searchChats(search.value);
+  if (selectedProject()?.codexScopes) {
+    fetchView(memoryKey('codex-index', project), apiPath('/api/codex/threads', {project}), codexStatus, recordCodexPage);
+  }
 }
 const effortLabels = {
   minimal: '最小', low: '低', medium: '標準', high: '高', xhigh: '非常に高い', max: '最大', ultra: '最高',
