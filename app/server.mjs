@@ -8,7 +8,8 @@ import {homedir} from 'node:os';
 import {basename, dirname, isAbsolute, join, resolve} from 'node:path';
 import {fileURLToPath, pathToFileURL} from 'node:url';
 import {pipeline} from 'node:stream/promises';
-import {readCurrentProject, readPortfolio} from './portfolio.mjs';
+import {readCurrentProject, readPortfolio, readProjectDeliverySource} from './portfolio.mjs';
+import {readOwnerRequirementCoverage} from './delivery-records.mjs';
 import {createChatStore} from './chat-store.mjs';
 import {createCodexClient, emptyNativeActivity, isCodexLoopbackUrl, validEvidenceCursor, validEvidenceTarget} from './codex.mjs';
 import {createOperations} from './operations.mjs';
@@ -413,6 +414,18 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
         if (cause.code === 'CHATGPT_PLAN_AUTH_REQUIRED') throw error(403, 'ChatGPTプランを再認証してください。');
         throw error(503, 'このChatGPTプランのモデルを読み取れませんでした。');
       }
+    }
+    if (get && route === '/api/portfolio/requirements') {
+      const ids = target.searchParams.getAll('project');
+      const projectId = ids[0];
+      const source = ids.length === 1 && readProjectDeliverySource(directory,projectId);
+      if (source?.kind !== 'integration-milestone') throw error(404, '案件の要求照合を見つけられませんでした。');
+      const coverage = await readOwnerRequirementCoverage(source);
+      if (!signedIn()) throw error(401, 'サインインが必要です。');
+      if (JSON.stringify(readProjectDeliverySource(directory,projectId)) !== JSON.stringify(source)) {
+        throw error(404, '案件の要求照合を見つけられませんでした。');
+      }
+      return send(response, 200, coverage);
     }
     const portfolioRequest = get && route === '/api/portfolio';
     const portfolio = await readPortfolio(directory, github, portfolioRequest);

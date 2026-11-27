@@ -103,6 +103,12 @@ export function readCurrentProject(directory, id) {
   return rows.length === 1 ? normalizeProject(rows[0], date(raw.observedAt)) : null;
 }
 
+export function readProjectDeliverySource(directory, id) {
+  if (typeof id !== 'string' || !projectKey.test(id)) return null;
+  const rows = readDefinition(directory).projects.filter(row => row?.id === id);
+  return rows.length === 1 ? rows[0].deliverySource ?? null : null;
+}
+
 export async function readPortfolio(directory, githubProjects, refreshGithub = false) {
   const raw = readDefinition(directory);
   const observedAt = date(raw.observedAt);

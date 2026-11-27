@@ -6,6 +6,8 @@ import {tmpdir} from 'node:os';
 import {dirname, join} from 'node:path';
 import test from 'node:test';
 import {readCurrentProject, readPortfolio} from '../app/portfolio.mjs';
+import * as deliveryRecords from '../app/delivery-records.mjs';
+import {startOwnerApp} from '../app/server.mjs';
 
 const initiative = 'docs/initiatives/chatgpt-codex-integration';
 const repository = 'https://github.com/fixture-owner/delivery-records';
@@ -132,4 +134,65 @@ test('a scoped environment audit requires the untouched owner requirement bytes 
   await commit({'OWNER_REQUIREMENTS.md':changed, [reportPath]:JSON.stringify({...report,
     original_requirements:{sha256:hash(changed),verbatim_body_match:true}})});
   assert.equal((await read()).deliveryRecord.status,'unavailable');
+});
+
+test('owner requirement coverage exposes exact source lines and committed evidence only to the selected signed-in project', async t => {
+  const {directory, checkout, commit, configure} = await fixture(t);
+  const ownerPath = initiative + '/OWNER_REQUEST_20261127.txt';
+  const coveragePath = initiative + '/owner-requirement-coverage.json';
+  const owner = '# Owner request\n\n## First section\nKeep authorized state.\nhttps://example.org/reference\n\n## Second section\nVerify the real device.\n';
+  const evidenceFile = 'mac-fixture-observation.json';
+  const baseline = await commit({[ownerPath]:owner,[initiative+'/'+evidenceFile]:'{"fixture":true}\n'});
+  const rows = [
+    {line:4,status:'verified',note:'Fixture checked the existing state.',evidence:[evidenceFile]},
+    {line:5,status:'reference',note:'Source reference.',evidence:[]},
+    {line:8,status:'blocked',note:'Device has not been tested.',evidence:[]},
+  ];
+  const document = {schemaVersion:1, ownerRevision:baseline, ownerSha256:hash(owner), evidenceRevision:baseline, rows};
+  await commit({[coveragePath]:JSON.stringify(document)});
+  const binding = {kind:'integration-milestone', checkout, repository, ref,
+    ownerRequestRevision:baseline, ownerRequestSha256:hash(owner)};
+  await configure([
+    {id:'integration',name:'Integration',state:'paused',deliverySource:binding},
+    {id:'unrelated',name:'Other project'},
+  ]);
+  const read = () => deliveryRecords.readOwnerRequirementCoverage(binding);
+  assert.deepEqual(await deliveryRecords.readOwnerRequirementCoverage({...binding, ownerRequestSha256:undefined}),{status:'unavailable'});
+  const projection = await read();
+  assert.equal(projection.status,'current');
+  assert.deepEqual(projection.counts,{total:3,verified:1,partial:0,open:0,blocked:1,reference:1});
+  assert.deepEqual(projection.sections.map(section=>section.title),['First section','Second section']);
+  assert.match(projection.sections[0].rows[0].sourceUrl,/#L4$/);
+  assert.ok(projection.sections[0].rows[0].evidence[0].url.includes(baseline));
+  assert.equal(projection.sections[1].rows[0].status,'blocked');
+  assert.ok(!JSON.stringify(projection).includes(checkout));
+
+  const portal=await startOwnerApp({directory,port:0,codex:{}});
+  try {
+    const route=portal.url+'/api/portfolio/requirements?project=';
+    assert.equal((await fetch(route+'integration')).status,401);
+    const html=await readFile(portal.signInFile,'utf8');
+    const key=/name="key" value="([a-f0-9]{64})"/.exec(html)[1];
+    const login=await fetch(portal.url+'/api/session',{method:'POST',redirect:'manual',
+      headers:{Origin:'null'},body:new URLSearchParams({key})});
+    assert.equal(login.status,303);
+    const headers={cookie:login.headers.get('set-cookie').split(';')[0]};
+    assert.equal((await fetch(route+'unrelated',{headers})).status,404);
+    assert.equal((await fetch(route+'integration&project=unrelated',{headers})).status,404);
+    assert.deepEqual(await (await fetch(route+'integration',{headers})).json(),projection);
+  } finally {
+    await portal.close();
+  }
+
+  await commit({[coveragePath]:JSON.stringify({...document,rows:rows.slice(0,2)})});
+  assert.deepEqual(await read(),{status:'unavailable'});
+  await commit({[coveragePath]:JSON.stringify({...document,rows:[...rows.slice(0,2),{...rows[2],status:'reference'}]})});
+  assert.deepEqual(await read(),{status:'unavailable'});
+  await commit({[coveragePath]:JSON.stringify({...document,rows:[{...rows[0],evidence:['mac-missing-observation.json']},...rows.slice(1)]})});
+  assert.deepEqual(await read(),{status:'unavailable'});
+  const shortened = owner.split('\n').slice(0,6).join('\n') + '\n';
+  const replacement = await commit({[ownerPath]:shortened});
+  await commit({[coveragePath]:JSON.stringify({...document,ownerRevision:replacement,ownerSha256:hash(shortened),
+    evidenceRevision:replacement,rows:rows.slice(0,2)})});
+  assert.deepEqual(await read(),{status:'unavailable'});
 });

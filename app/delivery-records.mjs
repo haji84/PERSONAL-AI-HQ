@@ -9,13 +9,18 @@ const cli = promisify(execFile);
 const initiative = 'docs/initiatives/chatgpt-codex-integration';
 const timelinePath = initiative + '/DELIVERY.md';
 const firstReleasePath = initiative + '/mac-first-release-observation.json';
+const ownerRequestPath = initiative + '/OWNER_REQUEST_20261127.txt';
+const ownerCoveragePath = initiative + '/owner-requirement-coverage.json';
 const ownerPath = 'OWNER_REQUIREMENTS.md';
 const auditPath = 'verification/final-shared-goal-audit.json';
 const commitId = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
+const contentDigest = /^[a-f0-9]{64}$/;
 const sourceRef = /^refs\/(?:heads|remotes\/origin)\/[A-Za-z0-9][A-Za-z0-9/_.-]{0,179}$/;
 const accepted = new Set(['ACCEPTED_RUNTIME_BOTH_HOSTS', 'PROVEN_WITH_LIMITS', 'PROVEN', 'PROVEN_WITH_SCOPE',
   'ACCEPTED', 'PROVEN_FOR_SCOPED_ARTIFACTS']);
 const recordScope = {'integration-milestone':'統合アプリの初回提供', 'environment-audit':'共通開発環境の初期構築'};
+const coverageStatuses = ['verified','partial','open','blocked','reference'];
+const evidenceName = /^(?:[a-z0-9.-]+-observation\.json|DELIVERY\.md|EXECUTION_MODES\.md)$/;
 
 function gitHubRepository(value) {
   return typeof value === 'string' ?
@@ -51,15 +56,18 @@ async function openSource(source) {
   const revision = selected.toString().trim();
   if (normalize(root.toString().trim()) !== checkout || gitHubRepository(origin.toString().trim())?.toLowerCase() !== repository.toLowerCase() ||
       !commitId.test(revision)) throw new Error('Delivery source identity did not match');
-  async function files(version, names) {
+  async function objects(version, names) {
     const tree = (await git('ls-tree','-z',version,'--',...names)).toString().split('\0');
-    return Promise.all(names.map(name => {
+    return names.map(name => {
       const object = tree.find(line => line.endsWith('\t' + name))?.split('\t')[0];
       if (!/^100(?:644|755) blob (?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(object ?? '')) throw new Error('Delivery record is not a file');
-      return git('cat-file','blob',object.split(' ')[2]);
-    }));
+      return object.split(' ')[2];
+    });
   }
-  return {repository, revision, git, files};
+  async function files(version, names) {
+    return Promise.all((await objects(version,names)).map(object => git('cat-file','blob',object)));
+  }
+  return {repository, revision, git, files, objects};
 }
 
 function originalPlan(text) {
@@ -139,15 +147,85 @@ async function environmentRecord(source, reader) {
     links:[link(repository,requirementsCommit,ownerPath,'所有者の原要求'), link(repository,revision,auditPath,'独立最終監査')]};
 }
 
+function hasOwnerRequestAnchor(source) {
+  return typeof source.ownerRequestRevision === 'string' && commitId.test(source.ownerRequestRevision) &&
+    typeof source.ownerRequestSha256 === 'string' && contentDigest.test(source.ownerRequestSha256);
+}
+
 export async function readDeliveryRecord(source) {
   const kind = source?.kind;
   const scope = typeof kind === 'string' && Object.hasOwn(recordScope,kind) ? recordScope[kind] : null;
   if (!scope) return null;
+  const integration = kind === 'integration-milestone';
+  const requirementsReview = integration && hasOwnerRequestAnchor(source);
   try {
     const reader = await openSource(source);
-    const record = kind === 'integration-milestone' ? await integrationRecord(source,reader) : await environmentRecord(source,reader);
-    return {status:'current', scope, ...record};
+    const record = integration ? await integrationRecord(source,reader) : await environmentRecord(source,reader);
+    return {status:'current', scope, ...(requirementsReview && {requirementsReview, requirementsRevision:reader.revision}), ...record};
   } catch {
-    return {status:'unavailable', scope, observedAt:null, links:[]};
+    return {status:'unavailable', scope, ...(requirementsReview && {requirementsReview}), observedAt:null, links:[]};
+  }
+}
+
+function isSourceReference(text) {
+  return /^https:\/\/\S+$/.test(text) || /^(?:一次資料|参考一次資料)（.+）：$/.test(text) ||
+    /^(?:共通開発環境|GORIQ|統合管理構想)：https:\/\/\S+$/.test(text);
+}
+
+async function requirementSections(reader, report, owner) {
+  let section = {id:'source-intro',title:'所有者の指示',rows:[]};
+  const sections = [section];
+  const counts = {total:0,verified:0,partial:0,open:0,blocked:0,reference:0};
+  const evidencePaths = new Set();
+  const source = link(reader.repository,report.ownerRevision,ownerRequestPath,'所有者の原文');
+  for (const [index,raw] of owner.toString('utf8').split(/\r?\n/).entries()) {
+    const text = raw.trim();
+    if (!text) continue;
+    const line = index + 1;
+    const heading = /^#{1,6}\s+(.+)$/.exec(text);
+    if (heading) {
+      section = {id:'source-' + line,title:heading[1],rows:[]};
+      sections.push(section);
+      continue;
+    }
+    const row = report.rows[counts.total];
+    if (row?.line !== line || !coverageStatuses.includes(row.status) ||
+        (row.status === 'reference') !== isSourceReference(text) ||
+        typeof row.note !== 'string' || row.note.trim().length < 2 || row.note.length > 220 ||
+        !Array.isArray(row.evidence) || row.evidence.length > 8 || new Set(row.evidence).size !== row.evidence.length ||
+        row.evidence.some(name => typeof name !== 'string' || !evidenceName.test(name)) ||
+        (['verified','partial'].includes(row.status) && !row.evidence.length)) throw new Error('Missing or invalid requirement evidence');
+    const evidence = row.evidence.map(name => {
+      const file = initiative + '/' + name;
+      evidencePaths.add(file);
+      return link(reader.repository,report.evidenceRevision,file,name);
+    });
+    section.rows.push({line,status:row.status,note:row.note,sourceUrl:source.url + '#L' + line,evidence});
+    counts.total++;
+    counts[row.status]++;
+  }
+  if (!counts.total || counts.total !== report.rows.length) throw new Error('Incomplete requirement coverage');
+  if (evidencePaths.size) await reader.objects(report.evidenceRevision,[...evidencePaths]);
+  return {status:'current', ownerUrl:source.url, counts, sections:sections.filter(item=>item.rows.length)};
+}
+
+export async function readOwnerRequirementCoverage(source) {
+  if (source?.kind !== 'integration-milestone' || !hasOwnerRequestAnchor(source)) return {status:'unavailable'};
+  try {
+    const reader = await openSource(source);
+    const [owner, bytes] = await reader.files(reader.revision,[ownerRequestPath,ownerCoveragePath]);
+    const report = JSON.parse(bytes);
+    if (report.schemaVersion !== 1 || report.ownerRevision !== source.ownerRequestRevision ||
+        report.ownerSha256 !== source.ownerRequestSha256 ||
+        typeof report.evidenceRevision !== 'string' || !commitId.test(report.evidenceRevision) ||
+        report.ownerSha256 !== createHash('sha256').update(owner).digest('hex') ||
+        !Array.isArray(report.rows) || report.rows.length > 400) throw new Error('Invalid owner coverage record');
+    const [[original]] = await Promise.all([reader.files(report.ownerRevision,[ownerRequestPath]),
+      reader.git('merge-base','--is-ancestor',report.ownerRevision,report.evidenceRevision),
+      reader.git('merge-base','--is-ancestor',report.evidenceRevision,reader.revision)]);
+    if (!original.equals(owner)) throw new Error('The owner request changed since its recorded audit');
+    return await requirementSections(reader,report,owner);
+  } catch {
+    return {status:'unavailable'};
   }
 }

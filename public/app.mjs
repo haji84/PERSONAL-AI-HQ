@@ -681,6 +681,88 @@ function deliveryDuration(seconds) {
     (remainder || seconds === 0 ? remainder + '秒' : '');
 }
 
+const reviewStatuses = {
+  verified: ['確認済み', 'completed'], partial: ['一部確認', 'approval'],
+  open: ['未確認', 'unknown'], blocked: ['保留', 'blocked'], reference: ['参照', 'unknown'],
+};
+
+function requirementsReview(project) {
+  const details = node('details', 'scope-info');
+  const content = node('div', 'stack');
+  details.append(node('summary', '', '要求ごとの照合'), content);
+  const current = () => ui.view === 'dashboard' && ui.project === project.id && details.isConnected;
+  const path = apiPath('/api/portfolio/requirements', {project: project.id});
+  const key = memoryKey('requirements-review', project.id, project.deliveryRecord.requirementsRevision);
+  let started = false;
+
+  function paint(result, destination) {
+    const source = link('利用者の要求原文', result?.ownerUrl);
+    if (source) destination.append(source);
+    if (result?.status !== 'current') {
+      destination.append(node('p', 'muted', '現在の要求照合記録を取得できません。'));
+      return;
+    }
+    const counts = result.counts;
+    if (Number.isSafeInteger(counts?.total) && counts.total >= 0) {
+      destination.append(node('p', 'strong', '原文の照合行 ' + counts.total + '件'));
+      const breakdown = ['verified', 'partial', 'open', 'blocked']
+        .filter(status => Number.isSafeInteger(counts[status]) && counts[status] >= 0)
+        .map(status => reviewStatuses[status][0] + ' ' + counts[status] + '件');
+      if (breakdown.length) destination.append(node('p', '', breakdown.join(' · ')));
+      if (Number.isSafeInteger(counts.reference) && counts.reference >= 0) {
+        destination.append(node('p', 'muted', '参照 ' + counts.reference + '件'));
+      }
+    }
+    const label = node('label', 'speech-control');
+    const filter = node('input');
+    filter.type = 'checkbox';
+    label.append(filter, node('span', '', '確認が残る行だけ表示'));
+    const sections = node('div', 'stack');
+    function showRows() {
+      sections.replaceChildren();
+      for (const group of asArray(result.sections)) {
+        const rows = node('ul', 'marked-list');
+        for (const row of asArray(group?.rows)) {
+          if (!Object.hasOwn(reviewStatuses, row?.status) ||
+              (filter.checked && ['verified', 'reference'].includes(row.status))) continue;
+          const item = node('div');
+          const [statusLabel, statusStyle] = reviewStatuses[row.status];
+          const heading = node('p', 'run-actions');
+          heading.append(chip(statusStyle, statusLabel));
+          const line = Number.isSafeInteger(row.line) && row.line > 0 ? '原文 ' + row.line + '行' : '';
+          if (line) heading.append(link(line, row.sourceUrl) ?? node('span', '', line));
+          item.append(heading);
+          if (row.note) item.append(node('p', '', row.note));
+          const evidence = asArray(row.evidence).flatMap(entry => {
+            const label = text(entry?.label, '');
+            const source = label && link(label, entry?.url);
+            return source ? [listItem(source)] : [];
+          });
+          if (evidence.length) {
+            const links = node('ul', 'marked-list');
+            links.append(...evidence);
+            item.append(links);
+          }
+          rows.append(listItem(item));
+        }
+        if (rows.children.length) sections.append(node('h4', '', text(group.title)), rows);
+      }
+      if (!sections.children.length) sections.append(node('p', 'muted',
+        filter.checked ? '確認が残る行はありません。' : '表示できる照合行がありません。'));
+    }
+    filter.addEventListener('change', showRows);
+    destination.append(label, sections);
+    showRows();
+  }
+
+  details.addEventListener('toggle', () => {
+    if (!details.open || !current() || started) return;
+    started = true;
+    fetchView(key, path, content, paint, current);
+  });
+  return details;
+}
+
 function projectDetail() {
   const project = selectedProject();
   const detail = panel(project ? text(project.name) : 'プロジェクト詳細');
@@ -724,6 +806,7 @@ function projectDetail() {
   metric(facts, '情報の取得時刻', time(project.observedAt ?? ui.portfolio?.observedAt));
   detail.body.append(facts);
   if (record) detail.body.append(deliveryRecordDetails(record));
+  if (record?.requirementsReview === true) detail.body.append(requirementsReview(project));
   if (project.schedule?.delayed === true) detail.body.append(node('p', 'notice-chip chip', '当初予定に対して遅延しています'));
   if (ui.capabilities.executionActivity === true) detail.body.append(activityPanel());
   if (asArray(project.remaining).length) {

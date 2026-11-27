@@ -12,6 +12,8 @@ Node.js 24とサインイン済みのCodex CLIを利用します。最初に `np
 
 既存の証跡を案件詳細に表示するには、本人用の `portfolio.json` の対象案件に `deliverySource` を指定します。`checkout` は正本を含むGit作業ツリー、`repository` はそのGitHubリポジトリのHTTPS URL、`ref` はコミット済みのブランチ参照です。統合アプリの初回提供記録には `kind: "integration-milestone"` と `baselineCommit`・`observationCommit`、共通開発環境の初期監査には `kind: "environment-audit"` と `requirementsCommit` を使います。照合する各コミットは完全なSHAを指定します。今の確認対象は実際の初回提供と原要求12節の監査範囲です。
 
+統合アプリの要求照合も表示する場合は、同じ設定に正本原文の固定コミット `ownerRequestRevision` とファイルの `ownerRequestSha256` を指定します。「要求ごとの照合」を開いたときだけ、原文行と根拠を取得します。
+
 ## Windowsで起動
 
 Node.js 24以降とCodex Desktopを使います。`npm ci --ignore-scripts` の後、`start-windows.cmd` を開くと、URLと本人用のサインインファイルが表示されます。ファイルをブラウザーで開いてサインインします。Windowsの標準保存先は `%LOCALAPPDATA%\PersonalAIHQ\integration` です。起動時に既存のWindowsアクセス権を確認し、新しく作った実行ディレクトリだけを本人・SYSTEM・管理者に限定します。変更前後の権限はそのディレクトリに保存します。既存ディレクトリの権限を変更して起動を通すことはありません。
