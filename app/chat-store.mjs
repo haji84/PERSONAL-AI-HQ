@@ -5,6 +5,7 @@ import {DatabaseSync} from 'node:sqlite';
 import {chatInputLimit, chatMessageLimit, chatModelPattern, chatOutputLimit} from './chatgpt-responses.mjs';
 import {validatedImage} from './image-attachment.mjs';
 import {apiAdviceMaxLength} from './api-response.mjs';
+import {realtimeArchiveId, realtimeArchiveReview, realtimeReceiptId, validRealtimeContinuation} from './realtime-history.mjs';
 
 const date = value => Number.isFinite(value) && value >= 0 && value < 253402300800 ? new Date(value * 1000).toISOString() : null;
 const title = value => typeof value === 'string' && value.trim() ? value.trim().slice(0, 240) : '無題の会話';
@@ -65,6 +66,40 @@ function archiveView(row, offset = 0) {
   const {model, outcome, messages} = structured ? parsed : {messages: parsed};
   return {conversation: {...details, ...(structured ? {model, outcome} : {}), messages: messages.slice(offset, offset + 40)},
     nextOffset: offset + 40 < messages.length ? offset + 40 : null};
+}
+
+function readRealtimeArchive(row) {
+  if (row?.source !== voiceSource) return null;
+  const invalid = () => storeError(409, 'REALTIME_VOICE_HISTORY_UNVERIFIED', '保存済みの音声会話を照合できません。');
+  try {
+    const {id, importedAt, title} = row;
+    const {model, outcome, messages: stored} = JSON.parse(row.messages);
+    if (!realtimeArchiveId.test(id) || typeof model !== 'string' || !chatModelPattern.test(model) || outcome !== 'completed' ||
+        !Array.isArray(stored) || !stored.length || stored.length > 42) throw invalid();
+    isoTime(importedAt);
+    const first = id.slice('realtime/'.length);
+    const legacy = stored.every(message => !Object.hasOwn(message, 'turnId'));
+    const groups = [];
+    const verifiedIds = new Set();
+    const messages = stored.map(({role, text, createdAt, turnId = legacy ? first : undefined}) => {
+      if (!['user', 'assistant'].includes(role) || typeof text !== 'string' || !text.trim() || !text.isWellFormed() ||
+          text.length > 12000 || !realtimeReceiptId.test(turnId) || isoTime(createdAt) > isoTime(importedAt)) throw invalid();
+      const message = {role, text, createdAt, turnId};
+      let group = groups.at(-1);
+      if (group?.id !== turnId) {
+        if (verifiedIds.has(turnId) || (!groups.length && turnId !== first)) throw invalid();
+        group = {id: turnId, messages: []};
+        verifiedIds.add(turnId);
+        groups.push(group);
+      }
+      if (group.messages.length && (group.messages.length !== 1 || group.messages[0].role !== 'user' || role !== 'assistant')) {
+        throw invalid();
+      }
+      group.messages.push(message);
+      return message;
+    });
+    return {id, title, model, importedAt, messages, groups, review: realtimeArchiveReview(id, importedAt, messages)};
+  } catch { throw invalid(); }
 }
 
 const documentText = ({name, text}) => '添付資料（' + name + '）\n' + text;
@@ -151,6 +186,8 @@ export function createChatStore(directory, {now = Date.now} = {}) {
     VALUES (?,?,?,?,?,?,'api-development')`);
   const insertVoice = db.prepare(`INSERT INTO conversations (project,id,title,imported_at,modified,messages,source)
     VALUES (?,?,?,?,?,?,'openai-realtime')`);
+  const appendVoice = db.prepare(`UPDATE conversations SET imported_at=?,modified=?,messages=?
+    WHERE project=? AND id=? AND source='openai-realtime'`);
   const finalizeDevelopment = db.prepare(`UPDATE conversations SET imported_at=?,modified=?,messages=?
     WHERE project=? AND id=? AND source='api-development'`);
   const list = db.prepare(`SELECT id,title,importedAt,source FROM (
@@ -307,23 +344,36 @@ export function createChatStore(directory, {now = Date.now} = {}) {
         return archiveView(get.get(project, archive));
       });
     },
-    saveRealtime(project, {id, model, inputTranscript, outputTranscript, startedAt, completedAt}) {
+    readRealtime(project, id) {
+      if (typeof id !== 'string' || !realtimeArchiveId.test(id)) return null;
+      return readRealtimeArchive(get.get(project, id));
+    },
+    saveRealtime(project, {id, model, inputTranscript, outputTranscript, startedAt, completedAt, continuation}) {
       const time = isoTime(completedAt);
-      if (typeof id !== 'string' || !receiptIdPattern.test(id) || typeof model !== 'string' || !chatModelPattern.test(model) ||
-          ![inputTranscript, outputTranscript].every(value => typeof value === 'string' && value.length <= 12000) ||
-          isoTime(startedAt) > time) throw storeError(400, 'INVALID_REALTIME_VOICE_ARCHIVE', '音声の文字起こしを確認できません。');
-      const messages = [{role: 'user', text: inputTranscript, createdAt: startedAt},
-        {role: 'assistant', text: outputTranscript, createdAt: completedAt}].filter(message => message.text.trim());
-      if (!messages.length) return null;
-      const archive = `realtime/${id}`;
-      const encoded = JSON.stringify({model, outcome: 'completed', messages});
+      if (typeof id !== 'string' || !realtimeReceiptId.test(id) || typeof model !== 'string' || !chatModelPattern.test(model) ||
+          ![inputTranscript, outputTranscript].every(value => typeof value === 'string' && value.isWellFormed() && value.length <= 12000) ||
+          isoTime(startedAt) > time || (continuation !== undefined && !validRealtimeContinuation(continuation))) {
+        throw storeError(400, 'INVALID_REALTIME_VOICE_ARCHIVE', '音声の文字起こしを確認できません。');
+      }
+      const messages = [{role: 'user', text: inputTranscript, createdAt: startedAt, turnId: id},
+        {role: 'assistant', text: outputTranscript, createdAt: completedAt, turnId: id}].filter(message => message.text.trim());
+      if (messages.length !== 2) return null;
+      const archive = continuation?.id ?? `realtime/${id}`;
+      const encoded = entries => JSON.stringify({model, outcome: 'completed', messages: entries});
       return inTransaction(() => {
         const previous = get.get(project, archive);
-        if (previous) {
-          if (previous.source !== voiceSource || previous.messages !== encoded || previous.importedAt !== completedAt) {
-            throw storeError(409, 'REALTIME_VOICE_ARCHIVE_CONFLICT', '保存済みの音声履歴を照合できません。');
-          }
-        } else insertVoice.run(project, archive, title(messages[0].text), completedAt, time, encoded);
+        if (!previous && !continuation) {
+          insertVoice.run(project, archive, title(messages[0].text), completedAt, time, encoded(messages));
+          return archive;
+        }
+        const history = readRealtimeArchive(previous);
+        const existing = history?.groups.find(group => group.id === id);
+        if (existing && JSON.stringify(existing.messages) === JSON.stringify(messages)) return archive;
+        if (!continuation || history?.review !== continuation.review || history.model !== model ||
+            isoTime(history.importedAt) > isoTime(startedAt) || history.messages.length + messages.length > 42 || existing) {
+          throw storeError(409, 'REALTIME_VOICE_ARCHIVE_CONFLICT', '保存済みの音声履歴を照合できません。');
+        }
+        appendVoice.run(completedAt, time, encoded([...history.messages, ...messages]), project, archive);
         return archive;
       });
     },

@@ -3,7 +3,8 @@ import {readBoundApiAuthority, verifiedApiCredit} from './api-authority.mjs';
 import {executionHeld} from './execution-access.mjs';
 import {readCurrentProject} from './portfolio.mjs';
 import {hasPublishedRealtimeCeilings} from './realtime-cost.mjs';
-import {openRealtimeVoice} from './realtime-voice.mjs';
+import {realtimeArchiveId, realtimeArchiveReview, realtimeTranscriptDigest, validRealtimeContinuation} from './realtime-history.mjs';
+import {openRealtimeVoice, validateRealtimeHistory} from './realtime-voice.mjs';
 
 const kind = 'realtime-voice';
 const idPattern = /^[A-Za-z0-9][A-Za-z0-9_-]{7,79}$/;
@@ -18,21 +19,59 @@ const safeReason = cause => typeof cause?.code === 'string' && /^[A-Z0-9_]{1,64}
   ? cause.code : 'REALTIME_VOICE_UNAVAILABLE';
 
 function decodeInput(input) {
+  const continuation = input?.continuation;
+  if (continuation !== undefined && !validRealtimeContinuation(continuation)) throw problem(400, 'REALTIME_VOICE_TASK_INVALID');
   if (!taskId(input?.id) || !Number.isSafeInteger(input.revision) || input.revision < 0 ||
       typeof input.pcm !== 'string' || input.pcm.length > 4 * Math.ceil(maxAudioBytes / 3) ||
-      Object.keys(input).length !== 3) throw problem(400, 'REALTIME_VOICE_INVALID_AUDIO');
+      Object.keys(input).length !== (continuation === undefined ? 3 : 4)) throw problem(400, 'REALTIME_VOICE_INVALID_AUDIO');
   const audio = Buffer.from(input.pcm, 'base64');
   if (audio.length > maxAudioBytes || audio.length < bytesPerSecond / 10 || audio.length % 2 ||
       audio.toString('base64') !== input.pcm) throw problem(400, 'REALTIME_VOICE_INVALID_AUDIO');
   return audio;
 }
 
+const transcriptMessages = result => [{role: 'user', text: result.inputTranscript},
+  {role: 'assistant', text: result.outputTranscript}].filter(message => message.text.trim());
+
 export function createRealtimeExecution({directory, store, conversations, withProjectWorkLock, hasNativeWork,
   getKey = () => process.env.OPENAI_API_KEY, readAuthority, connect}) {
   const jobs = new Map();
   let closing = false;
 
-  function scope(project, signedIn) {
+  function verifiedHistory(projectId, reference, scopeDigest, model) {
+    const id = typeof reference === 'string' ? reference : reference.id;
+    if (!realtimeArchiveId.test(id)) throw problem(400, 'REALTIME_VOICE_TASK_INVALID');
+    const archived = conversations.readRealtime(projectId, id);
+    if (!archived) throw problem(404, 'REALTIME_VOICE_HISTORY_NOT_FOUND');
+    if (typeof reference !== 'string' && reference.review !== archived.review) throw problem(409, 'REALTIME_VOICE_HISTORY_CHANGED');
+    const invalid = () => problem(409, 'REALTIME_VOICE_HISTORY_UNVERIFIED');
+    const proof = store.getRealtimeArchive(projectId, id);
+    if (proof.turns.length !== archived.groups.length || archived.model !== model) throw invalid();
+    const byId = new Map(proof.turns.map(turn => [turn.id, turn]));
+    const prefix = [];
+    let previous;
+    for (const group of archived.groups) {
+      const turn = byId.get(group.id);
+      if (!turn?.transcriptDigest || turn.scopeDigest !== scopeDigest || turn.model !== model || group.messages.length !== 2) throw invalid();
+      if (group.messages.some(message => message.createdAt !== (message.role === 'user' ? turn.startedAt : turn.completedAt))) {
+        throw invalid();
+      }
+      if (previous) {
+        const expected = realtimeArchiveReview(id, previous.completedAt, prefix);
+        if (turn.continuation?.review !== expected || previous.completedAt > turn.startedAt) throw invalid();
+      } else if (turn.continuation) throw invalid();
+      if (turn.transcriptDigest !== realtimeTranscriptDigest(group.messages)) throw invalid();
+      prefix.push(...group.messages);
+      previous = turn;
+    }
+    if (archived.importedAt !== previous?.completedAt) throw invalid();
+    const history = validateRealtimeHistory(archived.messages.map(({role, text}) => ({role, text})));
+    if (!history) throw problem(409, 'REALTIME_VOICE_HISTORY_LIMIT');
+    return {continuation: {id, review: archived.review}, archiveLedgerReview: proof.review,
+      contextCount: history.length, history};
+  }
+
+  function scope(project, signedIn, reference) {
     if (!signedIn()) throw problem(401, 'REALTIME_VOICE_SIGN_IN_REQUIRED');
     if (process.platform !== 'darwin') throw problem(409, 'API_RUNTIME_UNSUPPORTED');
     const current = readCurrentProject(directory, project.id);
@@ -50,10 +89,12 @@ export function createRealtimeExecution({directory, store, conversations, withPr
     const task = {route: 'api', stage: 'consultation', model: config.model, reasoningEffort: 'none'};
     const scopeDigest = sha(JSON.stringify([project.id, current.cwd, current.goal, current.handoverRequirements,
       authority.organization, authority.providerProject, authority.ledgerBinding]));
-    const context = {now, realtimeVoice: {config, scopeDigest}, capabilities: {api: {available: true,
+    const archived = reference === undefined ? null : verifiedHistory(project.id, reference, scopeDigest, config.model);
+    const context = {now, realtimeVoice: {config, scopeDigest,
+      ...(archived ? {continuation: archived.continuation, archiveLedgerReview: archived.archiveLedgerReview} : {})}, capabilities: {api: {available: true,
       executorId: 'owner-mac-realtime-voice', defaultModel: config.model, models: [{id: config.model, reasoningEfforts: ['none']}]}},
     safety: {authorized: true, status: 'ready', allowedRoutes: ['api'], api: verifiedApiCredit(authority)}};
-    return {key, authority, config, task, context};
+    return {key, authority, config, task, context, archived};
   }
 
   function view(operation, projectId) {
@@ -65,16 +106,18 @@ export function createRealtimeExecution({directory, store, conversations, withPr
     const billing = operation.voiceSettlement;
     let conversationId = null;
     if (operation.status === 'completed') {
-      const archive = `realtime/${operation.executionId}`;
+      const archive = operation.realtimeVoice.continuation?.id ?? `realtime/${operation.executionId}`;
       try {
-        if (conversations.read(projectId, archive, 0)?.conversation.source === 'openai-realtime') conversationId = archive;
+        const group = conversations.readRealtime(projectId, archive)?.groups.find(group => group.id === operation.executionId);
+        if (group && (!billing?.transcriptDigest || billing.transcriptDigest === realtimeTranscriptDigest(group.messages))) conversationId = archive;
       } catch { /* The usage receipt remains usable when the transcript store is unavailable. */ }
     }
     return {id: operation.taskId, route: 'api', model: operation.model, phase, startedAt: operation.dispatchedAt ?? null,
       updatedAt: operation.completedAt ?? operation.settlementObservedAt ?? operation.createdAt,
       reason: operation.reason ?? (phase === 'unconfirmed' ? 'REALTIME_VOICE_SETTLEMENT_UNKNOWN' : null),
       accountedMicros: operation.completedAt ? operation.costMicros : null,
-      response: billing?.response ?? null, transcription: billing?.transcription ?? null, conversationId};
+      response: billing?.response ?? null, transcription: billing?.transcription ?? null, conversationId,
+      continuationAvailable: Boolean(conversationId && billing?.transcriptDigest)};
   }
 
   async function run(project, job, operation, initial, audio, signedIn, emit) {
@@ -85,8 +128,9 @@ export function createRealtimeExecution({directory, store, conversations, withPr
     let timer;
     let result;
     let outcome;
+    let confirmedTranscript = false;
     function fresh() {
-      const current = scope(project, signedIn);
+      const current = scope(project, signedIn, initial.archived?.continuation);
       if (current.key !== initial.key) throw problem(409, 'DISPATCH_CONTEXT_CHANGED');
       return current.context;
     }
@@ -115,7 +159,7 @@ export function createRealtimeExecution({directory, store, conversations, withPr
       const {organization, providerProject} = initial.authority;
       const {model, voice, transcriptionModel, maxOutputTokens, maxInputSeconds} = initial.config;
       job.voice = await openRealtimeVoice({key: initial.key, organization, project: providerProject, model, voice,
-        transcriptionModel, maxOutputTokens, maxInputSeconds, signal, connect,
+        transcriptionModel, maxOutputTokens, maxInputSeconds, signal, connect, history: initial.archived?.history,
         authorize(stage) {
           if (!check()) return false;
           if (stage === 'input') inputAdmitted = true;
@@ -131,8 +175,13 @@ export function createRealtimeExecution({directory, store, conversations, withPr
           if (!job.stopping && signedIn()) emit({type: 'transcript', text});
         },
       });
+      const messages = transcriptMessages(result);
+      const completed = result.status === 'completed' && !result.interrupted && !job.stopping;
+      confirmedTranscript = completed && result.outputTranscriptConfirmed === true && messages.length === 2;
       outcome = {phase: 'terminal', outcome: result.interrupted || job.stopping || result.status === 'cancelled'
-        ? 'interrupted' : result.status === 'completed' ? 'completed' : 'failed', reason: job.reason, receipts: {
+        ? 'interrupted' : completed ? 'completed' : 'failed',
+      ...(confirmedTranscript ? {transcriptDigest: realtimeTranscriptDigest(messages)} : {}),
+      reason: job.reason ?? (completed && !confirmedTranscript ? 'REALTIME_VOICE_TRANSCRIPT_UNAVAILABLE' : undefined), receipts: {
         responseRequested: result.responseRequested,
         response: result.responseRequested ? {id: result.responseId, status: result.status, usage: result.usage} : null,
         transcription: {itemId: result.inputItemId, usage: result.transcriptionUsage},
@@ -151,11 +200,12 @@ export function createRealtimeExecution({directory, store, conversations, withPr
       return {turn: view(cancelled, project.id)};
     }
     const settled = store.recordRealtimeOutcome({...identifiers, ...outcome}).operation;
-    const completed = result && settled.status === 'completed';
+    const completed = confirmedTranscript && settled.status === 'completed';
     if (completed) {
       try {
         conversations.saveRealtime(project.id, {id: settled.executionId, model: settled.model, inputTranscript: result.inputTranscript,
-          outputTranscript: result.outputTranscript, startedAt: settled.dispatchedAt, completedAt: settled.completedAt});
+          outputTranscript: result.outputTranscript, startedAt: settled.dispatchedAt, completedAt: settled.completedAt,
+          continuation: settled.realtimeVoice.continuation});
       } catch { /* A transcript failure does not settle or dispatch the usage a second time. */ }
     }
     return {turn: view(settled, project.id), ...(completed ?
@@ -170,14 +220,15 @@ export function createRealtimeExecution({directory, store, conversations, withPr
   }
 
   return {
-    available(project, signedIn) {
+    available(project, signedIn, continuationId) {
       try {
-        const {config, task, context} = scope(project, signedIn);
+        const {config, task, context, archived} = scope(project, signedIn, continuationId);
         const result = store.previewRealtime(project.id, task, context);
         if (!result.allowed) throw problem(409, result.code);
         return {available: true, route: 'api', model: config.model, maxInputSeconds: config.maxInputSeconds,
           reservedMicros: result.reservedMicros,
-          revision: store.getSettings(project.id).revision};
+          revision: store.getSettings(project.id).revision,
+          ...(archived ? {continuation: archived.continuation, contextCount: archived.contextCount} : {})};
       } catch (cause) { return {available: false, reason: safeReason(cause)}; }
     },
     read(project, id) { return {turn: view(read(project, id), project.id)}; },
@@ -188,12 +239,14 @@ export function createRealtimeExecution({directory, store, conversations, withPr
       const admission = withProjectWorkLock(project, () => {
         const previous = store.getWork(project.id, input.id).operation;
         if (previous) {
-          if (previous.kind !== kind || previous.instructionDigest !== instructionDigest || previous.settingsRevision !== input.revision) {
+          if (previous.kind !== kind || previous.instructionDigest !== instructionDigest || previous.settingsRevision !== input.revision ||
+              previous.realtimeVoice.continuation?.id !== input.continuation?.id ||
+              previous.realtimeVoice.continuation?.review !== input.continuation?.review) {
             throw problem(409, 'TASK_ID_CONFLICT');
           }
           return {replayed: true, turn: view(previous, project.id)};
         }
-        const current = scope(project, signedIn);
+        const current = scope(project, signedIn, input.continuation);
         if (audio.length > current.config.maxInputSeconds * bytesPerSecond) throw problem(400, 'REALTIME_VOICE_INVALID_AUDIO');
         const {task, context} = current;
         const prepared = store.prepareDispatch({projectId: project.id, taskId: input.id, expectedRevision: input.revision,

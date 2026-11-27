@@ -82,6 +82,12 @@ const apiMessages = {
   REALTIME_VOICE_INVALID_AUDIO: '音声の形式または長さを確認してください。',
   REALTIME_VOICE_TASK_INVALID: '対象の音声操作を確認してください。',
   REALTIME_VOICE_TASK_NOT_FOUND: 'この案件の音声の受付を確認できません。',
+  REALTIME_VOICE_HISTORY_NOT_FOUND: 'この案件の音声会話を確認できません。',
+  REALTIME_VOICE_HISTORY_CHANGED: '音声会話が更新されました。履歴を読み直してください。',
+  REALTIME_VOICE_HISTORY_UNVERIFIED: '音声の履歴と実行記録を照合できません。',
+  REALTIME_VOICE_HISTORY_LIMIT: 'この接続で会話全体を引き継げる上限に達しました。',
+  REALTIME_VOICE_CONTEXT_UNVERIFIED: '音声APIで会話の引き継ぎを確認できません。',
+  REALTIME_VOICE_TRANSCRIPT_UNAVAILABLE: '音声と応答の両方の確定字幕を確認できません。',
   REALTIME_VOICE_SIGN_IN_REQUIRED: 'サインインが必要です。',
   REALTIME_VOICE_SETTLEMENT_UNKNOWN: '音声APIの使用量を確認中です。',
 };
@@ -669,7 +675,9 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       if (post) return liveChat(project, await jsonBody(request, 768 * 1024), response);
     }
     if (route === '/api/chat/realtime' || route === '/api/chat/realtime/interrupt') {
-      if (target.searchParams.getAll('project').length !== 1 || target.searchParams.getAll('id').length > 1) {
+      const conversations = target.searchParams.getAll('conversation');
+      if (target.searchParams.getAll('project').length !== 1 || target.searchParams.getAll('id').length > 1 || conversations.length > 1 ||
+          (conversations.length && (route !== '/api/chat/realtime' || !get || target.searchParams.has('id')))) {
         throw error(400, '対象の音声操作を一件指定してください。');
       }
       if (!signedIn()) throw error(401, 'サインインが必要です。');
@@ -677,7 +685,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
         return send(response, 200, realtime.read(project, target.searchParams.get('id')));
       }
       if (!apiEnabled) throw error(409, apiMessages.API_AUTHORIZATION_REQUIRED);
-      if (get && route === '/api/chat/realtime') return send(response, 200, realtime.available(project, signedIn));
+      if (get && route === '/api/chat/realtime') return send(response, 200, realtime.available(project, signedIn, conversations[0]));
       if (post && route === '/api/chat/realtime' && !target.searchParams.has('id')) {
         return realtimeChat(project, await jsonBody(request, realtimeBodyLimit), response, signedIn);
       }

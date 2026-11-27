@@ -5,6 +5,7 @@ import {writeFileSync} from 'node:fs';
 import {mkdtemp, readFile, realpath, rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
+import {DatabaseSync} from 'node:sqlite';
 import test from 'node:test';
 import WebSocket, {WebSocketServer} from 'ws';
 import {apiAuthorityFile} from '../app/api-authority.mjs';
@@ -35,14 +36,32 @@ function transcript(socket, usage = {type: 'duration', seconds: 0.1}) {
   publish(socket, {type: 'conversation.item.input_audio_transcription.completed', item_id: inputItem, content_index: 0,
     transcript: '予算を確認してください', usage});
 }
-function audioResponse(socket) {
+function audioResponse(socket, {body = '使用量を確認しました', confirm = true} = {}) {
   publish(socket, {type: 'response.created', response: {id: responseId}});
-  publish(socket, {type: 'response.output_audio.delta', response_id: responseId, item_id: assistantItem, content_index: 0, delta: pcm});
+  publish(socket, {type: 'response.output_audio.delta', response_id: responseId, item_id: assistantItem,
+    output_index: 0, content_index: 0, delta: pcm});
   publish(socket, {type: 'response.output_audio_transcript.delta', response_id: responseId, item_id: assistantItem,
-    content_index: 0, delta: '使用量を確認しました'});
+    output_index: 0, content_index: 0, delta: body});
+  if (confirm) publish(socket, {type: 'response.output_audio_transcript.done', response_id: responseId, item_id: assistantItem,
+    output_index: 0, content_index: 0, transcript: body});
 }
 function done(socket, status = 'completed') {
   publish(socket, {type: 'response.done', response: {id: responseId, status, usage: rawUsage}});
+}
+
+function confirmContext(socket, event) {
+  publish(socket, {type: 'conversation.item.done', previous_item_id: event.previous_item_id ?? null,
+    item: {...event.item, status: 'completed'}});
+}
+
+function editArchive(fixture, id, edit) {
+  const db = new DatabaseSync(join(fixture.directory, 'conversations.sqlite'));
+  try {
+    const row = db.prepare('SELECT messages FROM conversations WHERE project=? AND id=?').get(project, id);
+    const value = JSON.parse(row.messages);
+    edit(value.messages);
+    db.prepare('UPDATE conversations SET messages=? WHERE project=? AND id=?').run(JSON.stringify(value), project, id);
+  } finally { db.close(); }
 }
 
 async function fixture(t, onWire) {
@@ -110,7 +129,7 @@ async function fixture(t, onWire) {
     cookie = login.headers.get('set-cookie').split(';')[0];
   }
   await open();
-  return {connections, wire, store, authority, writeAuthority, writePortfolio, ledger, open,
+  return {connections, wire, store, authority, writeAuthority, writePortfolio, ledger, directory, open,
     call(path = route, {id, data, auth = true, origin, forProject = project, query = {}} = {}) {
       return fetch(app.url + path + '?' + new URLSearchParams({project: forProject, ...(id ? {id} : {}), ...query}),
         {method: data ? 'POST' : 'GET', headers: {...(auth ? {cookie} : {}),
@@ -229,6 +248,152 @@ test('authorization withdrawal on input commit prevents response creation and re
   assert.deepEqual(eventTypes(f.wire), ['session.update', 'input_audio_buffer.append', 'input_audio_buffer.commit']);
   assert.equal(f.store.getWork(project).busy, false);
   assert.equal(f.store.getWork(project).settledApiMicros, 4500);
+});
+
+test('explicit continuation restores completed roles after restart and appends to the same archive exactly once', mac, async t => {
+  const f = await fixture(t, (socket, event) => {
+    if (event.type === 'conversation.item.create') confirmContext(socket, event);
+    if (event.type !== 'response.create') return;
+    audioResponse(socket);
+    transcript(socket);
+    done(socket);
+  });
+  const first = (await events(await f.call(route, {data: request}))).at(-1);
+  const {conversationId} = first.turn;
+  await f.open();
+  assert.equal((await f.call(route, {auth: false, query: {conversation: conversationId}})).status, 401);
+  assert.equal((await (await f.call(route, {forProject: second, query: {conversation: conversationId}})).json()).reason,
+    'REALTIME_VOICE_HISTORY_NOT_FOUND');
+  const preview = await (await f.call(route, {query: {conversation: conversationId}})).json();
+  assert.equal(preview.contextCount, 2);
+  assert.equal(preview.continuation.id, conversationId);
+  const firstWireLength = f.wire.length;
+  const data = {...request, id: 'continued-voice-fixture', continuation: preview.continuation};
+  const followup = (await events(await f.call(route, {data}))).at(-1);
+  assert.equal(followup.turn.phase, 'completed');
+  assert.equal(followup.turn.conversationId, conversationId);
+  const followupWire = f.wire.slice(firstWireLength);
+  assert.deepEqual(eventTypes(followupWire), ['session.update', 'conversation.item.create', 'conversation.item.create',
+    'input_audio_buffer.append', 'input_audio_buffer.commit', 'response.create']);
+  assert.equal(followupWire[0].session.truncation, 'disabled');
+  assert.deepEqual(followupWire.slice(1, 3).map(event => [event.item.role, ...event.item.content.map(content => [content.type, content.text])]),
+    [['user', ['input_text', first.inputTranscript]], ['assistant', ['output_text', first.outputTranscript]]]);
+  assert.equal(f.store.getWork(project).settledApiMicros, 9522);
+  const savedTurn = f.store.getWork(project, data.id).operation;
+  assert.equal(savedTurn.realtimeVoice.continuation.id, conversationId);
+  assert.match(savedTurn.voiceSettlement.transcriptDigest, /^[a-f0-9]{64}$/);
+  const cached = await (await f.call('/api/chat', {id: conversationId})).json();
+  assert.equal(cached.conversation.messages.length, 4);
+  assert.equal(new Set(cached.conversation.messages.map(message => message.turnId)).size, 2);
+  const next = await (await f.call(route, {query: {conversation: conversationId}})).json();
+  assert.equal(next.contextCount, 4);
+  assert.notEqual(next.continuation.review, preview.continuation.review);
+  const stale = await f.call(route, {data: {...data, id: 'stale-voice-fixture'}});
+  assert.equal(stale.status, 409);
+  assert.equal((await stale.json()).code, 'REALTIME_VOICE_HISTORY_CHANGED');
+  assert.deepEqual(await events(await f.call(route, {data})), [{type: 'done', replayed: true, turn: followup.turn}]);
+  assert.equal((await f.call(route, {data: {...data, continuation: next.continuation}})).status, 409);
+
+  editArchive(f, conversationId, messages => { messages[3].text = '他の発言に置き換え'; });
+  assert.equal((await (await f.call(route, {query: {conversation: conversationId}})).json()).reason, 'REALTIME_VOICE_HISTORY_UNVERIFIED');
+  editArchive(f, conversationId, messages => messages.splice(2));
+  assert.equal((await (await f.call(route, {query: {conversation: conversationId}})).json()).reason, 'REALTIME_VOICE_HISTORY_UNVERIFIED');
+  assert.equal(f.connections.length, 2);
+});
+
+test('legacy transcripts remain readable without replaying an archive that predates transcript receipts', mac, async t => {
+  const f = await fixture(t, (socket, event) => {
+    if (event.type === 'conversation.item.create') confirmContext(socket, event);
+    if (event.type !== 'response.create') return;
+    audioResponse(socket);
+    transcript(socket);
+    done(socket);
+  });
+  const first = (await events(await f.call(route, {data: request}))).at(-1);
+  const {conversationId} = first.turn;
+  editArchive(f, conversationId, messages => messages.forEach(message => { delete message.turnId; }));
+  const ledger = JSON.parse(await readFile(f.ledger, 'utf8'));
+  delete ledger.projects[project].operations[task].voiceSettlement.transcriptDigest;
+  writeFileSync(f.ledger, JSON.stringify(ledger));
+  await f.open();
+  const preview = await (await f.call(route, {query: {conversation: conversationId}})).json();
+  assert.equal(preview.reason, 'REALTIME_VOICE_HISTORY_UNVERIFIED');
+  const receipt = await (await f.call(route, {id: task})).json();
+  assert.equal(receipt.turn.conversationId, conversationId);
+  assert.equal(receipt.turn.continuationAvailable, false);
+  assert.equal((await f.call('/api/chat', {id: conversationId})).status, 200);
+  editArchive(f, conversationId, messages => { messages[0].text = '以前の受付と一致しない本文'; });
+  const next = await (await f.call(route, {query: {conversation: conversationId}})).json();
+  assert.equal(next.reason, 'REALTIME_VOICE_HISTORY_UNVERIFIED');
+  assert.equal(f.connections.length, 1);
+});
+
+test('a revoked allowance during transcript reconstruction sends neither another transcript item nor fresh microphone input', mac, async t => {
+  const f = await fixture(t, (socket, event, {writeAuthority, authority}) => {
+    if (event.type === 'conversation.item.create') {
+      const {realtimeVoice, ...textOnly} = authority;
+      writeAuthority(textOnly);
+      confirmContext(socket, event);
+    }
+    if (event.type !== 'response.create') return;
+    audioResponse(socket);
+    transcript(socket);
+    done(socket);
+  });
+  const first = (await events(await f.call(route, {data: request}))).at(-1);
+  const {conversationId} = first.turn;
+  const preview = await (await f.call(route, {query: {conversation: conversationId}})).json();
+  const firstWireLength = f.wire.length;
+  const data = {...request, id: 'revoked-voice-history', continuation: preview.continuation};
+  const declined = (await events(await f.call(route, {data}))).at(-1).turn;
+  assert.equal(declined.reason, 'REALTIME_VOICE_AUTHORITY_REQUIRED');
+  assert.equal(declined.accountedMicros, 0);
+  assert.deepEqual(eventTypes(f.wire.slice(firstWireLength)), ['session.update', 'conversation.item.create']);
+  assert.equal(f.store.getWork(project).busy, false);
+  const saved = await (await f.call('/api/chat', {id: conversationId})).json();
+  assert.equal(saved.conversation.messages.length, 2);
+});
+
+test('history over the bounded input budget remains readable without starting a truncated continuation', mac, async t => {
+  const f = await fixture(t, (socket, event) => {
+    if (event.type !== 'response.create') return;
+    audioResponse(socket, {body: '音'.repeat(7000)});
+    transcript(socket);
+    done(socket);
+  });
+  const first = (await events(await f.call(route, {data: request}))).at(-1);
+  const {conversationId} = first.turn;
+  assert.equal(first.turn.phase, 'completed');
+  assert.equal(first.outputTranscript.length, 7000);
+  const bound = await (await f.call(route, {query: {conversation: conversationId}})).json();
+  assert.equal(bound.reason, 'REALTIME_VOICE_HISTORY_LIMIT');
+  assert.equal((await f.call('/api/chat', {id: conversationId})).status, 200);
+  assert.equal(f.connections.length, 1);
+});
+
+test('a billed follow-up without both final transcripts leaves the old history intact and prevents silent continuation from it', mac, async t => {
+  let responses = 0;
+  const f = await fixture(t, (socket, event) => {
+    if (event.type === 'conversation.item.create') confirmContext(socket, event);
+    if (event.type !== 'response.create') return;
+    audioResponse(socket, {confirm: ++responses === 1});
+    transcript(socket);
+    done(socket);
+  });
+  const first = (await events(await f.call(route, {data: request}))).at(-1);
+  const {conversationId} = first.turn;
+  const {continuation} = await (await f.call(route, {query: {conversation: conversationId}})).json();
+  const data = {...request, id:'voice-with-unconfirmed-final', continuation};
+  const second = (await events(await f.call(route, {data}))).at(-1);
+  assert.deepEqual([second.turn.phase, second.turn.reason, second.turn.accountedMicros, second.turn.conversationId],
+    ['completed', 'REALTIME_VOICE_TRANSCRIPT_UNAVAILABLE', 4761, null]);
+  assert.equal(second.outputTranscript, undefined);
+  assert.equal(f.store.getWork(project).settledApiMicros, 9522);
+  const archive = await (await f.call('/api/chat', {id: conversationId})).json();
+  assert.equal(archive.conversation.messages.length, 2);
+  assert.equal((await (await f.call(route, {query: {conversation: conversationId}})).json()).reason, 'REALTIME_VOICE_HISTORY_UNVERIFIED');
+  assert.equal((await f.call(route, {data: {...data, id: 'voice-cannot-skip-final'}})).status, 409);
+  assert.equal(f.connections.length, 2);
 });
 
 test('provider disconnect retains the observed response receipt and shared headroom after a real server restart', mac, async t => {

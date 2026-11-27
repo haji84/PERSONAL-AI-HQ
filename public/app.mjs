@@ -2133,6 +2133,9 @@ async function chatEvents(response, visit) {
   } finally { reader.releaseLock(); }
 }
 
+const realtimeConversationId = /^realtime\/[a-f0-9-]{36}$/;
+const realtimeContinueLabel = 'この音声会話を続ける';
+
 function realtimeComposer(project, onConversation) {
   const area = panel('音声会話（API）');
   const readOnly = ui.capabilities.realtimeVoice !== true;
@@ -2151,6 +2154,11 @@ function realtimeComposer(project, onConversation) {
   const refresh = button('利用条件を確認', () => void sync());
   const check = button('前の音声の受付を確認', () => void checkReceipt());
   const openHistory = button('音声の履歴を開く', () => { if (archive) onConversation(archive); });
+  const continueHistory = button(realtimeContinueLabel, () => continueConversation(archive));
+  const newConversation = button('新しい音声会話に切り替える', () => {
+    if (active() && phase === 'idle' && !checking && continuationId) changeContinuation(undefined);
+  });
+  const contextStatus = node('p', 'small muted');
   const outputMode = node('select');
   for (const [value, label] of [['audio', '音声と文字'], ['text', '文字のみ']]) {
     const option = node('option', '', label);
@@ -2163,8 +2171,8 @@ function realtimeComposer(project, onConversation) {
   inputText.setAttribute('aria-label', '入力の文字起こし');
   const answer = node('pre', 'run-output');
   answer.setAttribute('aria-label', '音声応答の文字起こし');
-  actions.append(record, submit, stop, discard, check, openHistory, refresh);
-  area.body.append(status, mode, actions, inputText, answer);
+  actions.append(record, submit, stop, discard, check, openHistory, continueHistory, newConversation, refresh);
+  area.body.append(status, contextStatus, mode, actions, inputText, answer);
 
   const base = '/api/chat/realtime';
   const lifetime = new AbortController();
@@ -2178,9 +2186,22 @@ function realtimeComposer(project, onConversation) {
   let pcm;
   let turnId;
   let archive;
+  let archiveCanContinue = false;
+  let continuationId;
+  let continuationNeedsSelection = false;
+  let permissionCheck;
   let checking = false;
   let interrupting = false;
+  const continuationReasons = {
+    REALTIME_VOICE_HISTORY_NOT_FOUND: '選んだ音声会話が見つかりません。履歴を確認してください。',
+    REALTIME_VOICE_HISTORY_CHANGED: '音声会話の履歴が変わりました。利用条件を確認し直してください。',
+    REALTIME_VOICE_HISTORY_UNVERIFIED: '選んだ音声会話の履歴を照合できません。',
+    REALTIME_VOICE_HISTORY_LIMIT: 'この音声会話は引き継げる履歴の上限に達しました。',
+    REALTIME_VOICE_CONTEXT_UNVERIFIED: '過去の発言を音声APIに引き継げたことを確認できません。',
+    REALTIME_VOICE_TRANSCRIPT_UNAVAILABLE: '音声と応答の確定字幕が揃っていないため、続きには引き継げません。',
+  };
   const reasons = {
+    ...continuationReasons,
     REALTIME_VOICE_AUTHORITY_REQUIRED: 'この案件の音声APIの利用条件を確認してください。',
     REALTIME_VOICE_TARIFF_UNVERIFIED: '公式モデルと料金の上限を確認できません。',
     API_CREDIT_UNVERIFIED: '追加費用ゼロの条件と有効な組織残高を確認できません。',
@@ -2199,19 +2220,30 @@ function realtimeComposer(project, onConversation) {
     const receiving = ['sending', 'playing'].includes(phase);
     record.textContent = phase === 'recording' ? '録音を止める' : '録音を開始';
     record.hidden = !permission?.available || (!['idle', 'recording'].includes(phase));
-    record.disabled = checking;
+    record.disabled = checking || Boolean(permissionCheck);
     discard.hidden = !preparing;
     submit.hidden = phase !== 'prepared';
-    submit.disabled = !pcm?.byteLength;
+    submit.disabled = !pcm?.byteLength || !permission?.available;
     stop.hidden = !receiving;
     stop.disabled = interrupting;
     mode.hidden = !permission?.available;
     outputMode.disabled = receiving;
-    refresh.hidden = readOnly || phase !== 'idle';
-    refresh.disabled = checking;
+    refresh.hidden = readOnly || phase !== 'idle' || continuationNeedsSelection;
+    refresh.disabled = checking || Boolean(permissionCheck);
     check.hidden = !ui.realtimeTurns.has(project) || phase !== 'idle';
-    check.disabled = checking;
+    check.disabled = checking || Boolean(permissionCheck);
     openHistory.hidden = !archive || receiving;
+    continueHistory.hidden = readOnly || phase !== 'idle' || !archiveCanContinue ||
+      (archive === continuationId && !continuationNeedsSelection);
+    continueHistory.disabled = checking;
+    newConversation.hidden = readOnly || phase !== 'idle' || !continuationId;
+    newConversation.disabled = checking;
+    contextStatus.hidden = !continuationId;
+    contextStatus.textContent = continuationNeedsSelection ?
+      '続ける音声会話を選び直すか、新しい音声会話に切り替えてください。' :
+      permission?.continuation ?
+        `選んだ音声会話を続けます。送信すると過去の発言${permission.contextCount}件も音声APIに渡ります。` :
+        '選んだ音声会話の履歴を使います。録音の前に利用条件を確認してください。';
     inputText.hidden = !inputText.textContent;
     answer.hidden = !answer.textContent;
   }
@@ -2229,23 +2261,71 @@ function realtimeComposer(project, onConversation) {
     return `${permission.model} · 最大${permission.maxInputSeconds}秒 · 1回の予約上限 ${usd.format(permission.reservedMicros / 1e6)}`;
   }
 
+  function changeContinuation(id) {
+    continuationId = id;
+    continuationNeedsSelection = false;
+    permission = undefined;
+    status.textContent = '音声APIの利用条件を確認しています。';
+    void sync();
+  }
+
+  function continueConversation(id) {
+    if (!active() || readOnly || !realtimeConversationId.test(id ?? '')) return;
+    if (phase !== 'idle' || checking) {
+      setNotice('現在の音声操作を終えてから、続ける会話を選んでください。', true);
+      return;
+    }
+    if (ui.chatIds.get(project) !== id) onConversation(id);
+    changeContinuation(id);
+    area.root.scrollIntoView({block: 'nearest'});
+  }
+
+  function conversationChanged(id) {
+    if (!continuationId || id === continuationId) return;
+    continuationNeedsSelection = true;
+    permission = undefined;
+    permissionCheck?.abort();
+    permissionCheck = undefined;
+    if (['sending', 'playing'].includes(phase)) { paint(); return; }
+    const wasPreparing = phase !== 'idle';
+    if (wasPreparing) {
+      discardAudio();
+      phase = 'idle';
+      status.textContent = '別の会話を選んだため、未送信の録音を破棄しました。';
+    }
+    paint();
+  }
+
   async function sync(report = true) {
-    if (readOnly || checking || phase !== 'idle') return;
-    checking = true;
+    if (readOnly || phase !== 'idle' || continuationNeedsSelection) return;
+    permissionCheck?.abort();
+    const controller = new AbortController();
+    permissionCheck = controller;
+    const conversation = continuationId;
     paint();
     try {
-      const next = await api(apiPath(base, {project}), {signal: lifetime.signal});
-      if (!active()) return;
-      permission = next;
-      if (report) status.textContent = allowedText();
+      const next = await api(apiPath(base, {project, conversation}),
+        {signal: AbortSignal.any([controller.signal, lifetime.signal])});
+      if (!active() || permissionCheck !== controller) return;
+      const validContext = conversation ? next.continuation?.id === conversation &&
+        /^[a-f0-9]{64}$/.test(next.continuation.review ?? '') &&
+        Number.isSafeInteger(next.contextCount) && next.contextCount > 0 : !next.continuation;
+      permission = next.available && !validContext ? {available: false, reason: 'REALTIME_VOICE_HISTORY_UNVERIFIED'} : next;
+      if (report || (continuationId && !permission.available)) status.textContent = allowedText();
     } catch (error) {
+      if (permissionCheck !== controller) return;
       permission = undefined;
-      if (active() && report) status.textContent = error.message;
-    } finally { checking = false; if (active()) paint(); }
+      if (active() && (report || continuationId)) status.textContent = reasons[error.code] ?? reasons[error.message] ?? error.message;
+    } finally {
+      if (permissionCheck === controller) {
+        permissionCheck = undefined;
+        if (active()) paint();
+      }
+    }
   }
 
   async function start() {
-    if (!active() || phase !== 'idle' || !permission?.available || document.hidden) return;
+    if (!active() || phase !== 'idle' || checking || permissionCheck || !permission?.available || document.hidden) return;
     const controller = new AbortController();
     mic = controller;
     phase = 'opening';
@@ -2253,6 +2333,7 @@ function realtimeComposer(project, onConversation) {
     inputText.textContent = '';
     answer.textContent = '';
     archive = undefined;
+    archiveCanContinue = false;
     stopSpeech();
     abortLocalDictation();
     paint();
@@ -2293,7 +2374,8 @@ function realtimeComposer(project, onConversation) {
   }
 
   function showTurn(turn) {
-    archive = /^realtime\/[a-f0-9-]{36}$/.test(turn?.conversationId ?? '') ? turn.conversationId : undefined;
+    archive = realtimeConversationId.test(turn?.conversationId ?? '') ? turn.conversationId : undefined;
+    archiveCanContinue = Boolean(archive && turn?.continuationAvailable === true);
     const reason = reasons[turn?.reason] ?? apiWorkMessages[turn?.reason];
     const notes = {completed: archive ? '文字起こしをこの案件の履歴に保存しました。' : '音声応答が完了しました。文字履歴の保存は確認できません。',
       cancelled: '開始前に中止しました。', interrupted: '音声応答を中断しました。', failed: '音声応答を確認できませんでした。',
@@ -2305,7 +2387,7 @@ function realtimeComposer(project, onConversation) {
 
   async function checkReceipt() {
     const id = ui.realtimeTurns.get(project);
-    if (!active() || !id || phase !== 'idle' || checking) return;
+    if (!active() || !id || phase !== 'idle' || checking || permissionCheck) return;
     checking = true;
     paint();
     try {
@@ -2316,7 +2398,10 @@ function realtimeComposer(project, onConversation) {
   }
 
   async function send() {
-    if (!active() || phase !== 'prepared' || !pcm || document.hidden) return;
+    if (!active() || phase !== 'prepared' || !pcm || !permission?.available || document.hidden) return;
+    const selectedContext = continuationId;
+    const continuation = permission.continuation;
+    if (selectedContext !== continuation?.id) return;
     const controller = new AbortController();
     upload = controller;
     const playback = audio;
@@ -2325,7 +2410,9 @@ function realtimeComposer(project, onConversation) {
     turnId = crypto.randomUUID();
     ui.realtimeTurns.set(project, turnId);
     storeTab();
-    const payload = JSON.stringify({id: turnId, revision: permission.revision, pcm: bytesBase64(pcm)});
+    const payload = JSON.stringify({id: turnId, revision: permission.revision, pcm: bytesBase64(pcm),
+      ...(continuation && {continuation: {id: continuation.id, review: continuation.review}})});
+    let contextRecheckRequired = false;
     pcm = undefined;
     status.textContent = '音声APIの受付を確認しています。';
     paint();
@@ -2333,7 +2420,12 @@ function realtimeComposer(project, onConversation) {
       const response = await requestOwner(apiPath(base, {project}), {method: 'POST', signal: controller.signal,
         headers: {'Content-Type': 'application/json'}, body: payload, cache: 'no-store'});
       if (response.status === 401) endSession();
-      if (!response.ok) throw new Error((await response.json().catch(() => null))?.error ?? '音声応答を開始できませんでした。');
+      if (!response.ok) {
+        const problem = await response.json().catch(() => null);
+        const reason = problem?.code ?? problem?.error;
+        contextRecheckRequired = Object.hasOwn(continuationReasons, reason);
+        throw new Error(reasons[reason] ?? problem?.error ?? '音声応答を開始できませんでした。');
+      }
       let done = false;
       await chatEvents(response, event => {
         if (!active() || upload !== controller) return;
@@ -2342,9 +2434,11 @@ function realtimeComposer(project, onConversation) {
         if (event.type === 'transcript' && !interrupting && typeof event.text === 'string') answer.textContent += event.text;
         if (event.type === 'done') {
           done = true;
+          contextRecheckRequired = Object.hasOwn(continuationReasons, event.turn?.reason);
           if (typeof event.inputTranscript === 'string') inputText.textContent = event.inputTranscript;
           if (typeof event.outputTranscript === 'string') answer.textContent = event.outputTranscript;
           showTurn(event.turn);
+          if (archive && archive === selectedContext && ui.chatIds.get(project) === archive) onConversation(archive);
           if (event.turn?.phase !== 'completed') playback.stopPlayback();
         }
         paint();
@@ -2364,7 +2458,12 @@ function realtimeComposer(project, onConversation) {
         interrupting = false;
         discardAudio();
         phase = 'idle';
-        if (active()) { paint(); void sync(false); }
+        const recheck = contextRecheckRequired && selectedContext && selectedContext === continuationId;
+        if (recheck) permission = undefined;
+        if (active()) {
+          paint();
+          if (!recheck) void sync(false);
+        }
       }
     }
   }
@@ -2413,7 +2512,7 @@ function realtimeComposer(project, onConversation) {
   runViewCleanups.add(cleanup);
   paint();
   void sync();
-  return area.root;
+  return {root: area.root, continueConversation, conversationChanged};
 }
 
 function planComposer(project, onConversation) {
@@ -2967,6 +3066,7 @@ function chat() {
   let cleanupAdvice;
   let advisoryThread;
   let plan;
+  let realtime;
   let previousConversation;
   function showAdvice(nativeId) {
     if (ui.capabilities.apiDevelopment !== true || advisoryThread === nativeId) return;
@@ -2989,6 +3089,7 @@ function chat() {
     if (previousConversation !== id) {
       previousConversation = id;
       plan?.conversationChanged();
+      realtime?.conversationChanged(id);
     }
     const nativeId = id?.startsWith('codex/') ? id.slice('codex/'.length) : null;
     showAdvice(nativeId);
@@ -3025,6 +3126,13 @@ function chat() {
       let offset = result.nextOffset;
       let cursor = result.nextCursor;
       const detailIsCurrent = () => messages.isConnected && ui.project === project && ui.chatIds.get(project) === id;
+      if (conversation.source === 'openai-realtime' && ui.capabilities.realtimeVoice === true && realtimeConversationId.test(id) &&
+          asArray(conversation.messages).some(message => typeof message.turnId === 'string')) {
+        const continueVoice = button(realtimeContinueLabel, () => {
+          if (detailIsCurrent()) realtime?.continueConversation(id);
+        });
+        destination.insertBefore(continueVoice, messages);
+      }
       const transfer = button('表示中のAI回答をCodexの下書きに追加', () => {
         const recent = asArray(conversation.messages).findLast(message => message.role === 'assistant');
         moveToDraft(project, 'codex', recent, 'この案件でのChatGPTの回答');
@@ -3148,7 +3256,10 @@ function chat() {
     plan = planComposer(project, selectConversation);
     current.append(plan.root);
   }
-  if (ui.capabilities.realtimeVoice === true || ui.realtimeTurns.has(project)) current.append(realtimeComposer(project, selectConversation));
+  if (ui.capabilities.realtimeVoice === true || ui.realtimeTurns.has(project)) {
+    realtime = realtimeComposer(project, selectConversation);
+    current.append(realtime.root);
+  }
   if (ui.capabilities.apiDevelopment === true) current.append(adviceHost);
   layout.append(collection.root, current, chatDevelopmentPanel(details));
   dom.content.append(layout);

@@ -1,3 +1,4 @@
+import {randomBytes} from 'node:crypto';
 import {Agent} from 'node:https';
 import WebSocket from 'ws';
 import {normalizeRealtimeTranscriptionUsage, normalizeRealtimeUsage} from './realtime-usage.mjs';
@@ -13,17 +14,37 @@ const boundedInteger = (value, lower, upper) => Number.isSafeInteger(value) && v
 const validPcm = value => value?.type === pcm.type && value.rate === pcm.rate;
 const noCallbacks = {};
 
+export function validateRealtimeHistory(messages) {
+  if (!Array.isArray(messages) || messages.length > 40) return null;
+  const history = [];
+  let bytes = 0;
+  for (const message of messages) {
+    if (!message || typeof message !== 'object' || Array.isArray(message) || Reflect.ownKeys(message).length !== 2 ||
+        !Object.hasOwn(message, 'role') || !Object.hasOwn(message, 'text')) return null;
+    const {role, text} = message;
+    if ((role !== 'user' && role !== 'assistant') || typeof text !== 'string' || !text.length ||
+        text.length > textLimit || !text.isWellFormed()) return null;
+    bytes += Buffer.byteLength(text, 'utf8');
+    if (bytes > 20000) return null;
+    history.push({role, text});
+  }
+  return history;
+}
+
 function providerSocket(url, options) {
   return new WebSocket(url, {...options, agent: new Agent()});
 }
 
 export async function openRealtimeVoice({key, organization, project, model, voice, transcriptionModel, maxOutputTokens,
-  maxInputSeconds, authorize, connect = providerSocket, signal, timeoutMs = 30000, lifetimeMs = 180000}) {
+  maxInputSeconds, history = [], authorize, connect = providerSocket, signal, timeoutMs = 30000, lifetimeMs = 180000}) {
   if (![key, organization, project].every(value => typeof value === 'string' && /^[\x21-\x7e]{1,512}$/.test(value)) ||
       ![model, voice, transcriptionModel].every(value => typeof value === 'string' && tokenName.test(value)) ||
       !boundedInteger(maxOutputTokens, 1, 4096) || !boundedInteger(maxInputSeconds, 1, 60) ||
       !boundedInteger(timeoutMs, 100, 120000) || !boundedInteger(lifetimeMs, timeoutMs, 300000) ||
       typeof authorize !== 'function' || typeof connect !== 'function') throw error('REALTIME_VOICE_INVALID_CONFIGURATION');
+  const restore = validateRealtimeHistory(history);
+  if (!restore) throw error('REALTIME_VOICE_INVALID_HISTORY');
+  const hasHistory = restore.length > 0;
 
   const authorized = stage => !signal?.aborted && authorize(stage) === true;
   function admit(stage) {
@@ -41,6 +62,7 @@ export async function openRealtimeVoice({key, organization, project, model, voic
   const ready = Promise.withResolvers();
   const session = {
     type: 'realtime', output_modalities: ['audio'], max_output_tokens: maxOutputTokens, tools: [], tool_choice: 'none',
+    ...(hasHistory ? {truncation: 'disabled'} : {}),
     audio: {input: {format: pcm, transcription: {model: transcriptionModel}, turn_detection: null},
       output: {format: pcm, voice}},
   };
@@ -48,8 +70,12 @@ export async function openRealtimeVoice({key, organization, project, model, voic
   let active;
   let lastAudio;
   let truncation;
+  let restoredCount = 0;
+  let priorItemId = null;
+  let pendingItem;
   const lifetime = setTimeout(() => close('REALTIME_VOICE_SESSION_EXPIRED'), lifetimeMs);
-  const opening = setTimeout(() => close('REALTIME_VOICE_CONNECTION_FAILED'), timeoutMs);
+  const opening = setTimeout(() => close(phase === 'restoring' ? 'REALTIME_VOICE_CONTEXT_UNVERIFIED' :
+    'REALTIME_VOICE_CONNECTION_FAILED'), timeoutMs);
   lifetime.unref();
   opening.unref();
   function abort() { close('REALTIME_VOICE_CLOSED'); }
@@ -78,6 +104,8 @@ export async function openRealtimeVoice({key, organization, project, model, voic
     active = undefined;
     lastAudio = undefined;
     truncation = undefined;
+    restore.length = 0;
+    pendingItem = undefined;
   }
 
   function send(message) {
@@ -93,6 +121,38 @@ export async function openRealtimeVoice({key, organization, project, model, voic
       actual.tools?.length === 0 && actual.tool_choice === 'none' &&
       actual.audio?.input?.turn_detection === null && actual.audio.input.transcription?.model === transcriptionModel &&
       validPcm(actual.audio.input.format) && validPcm(actual.audio?.output?.format) && actual.audio.output.voice === voice;
+  }
+
+  function restoreNext() {
+    if (restoredCount === restore.length) {
+      restore.length = 0;
+      clearTimeout(opening);
+      phase = 'ready';
+      ready.resolve({turn, interrupt, playbackCompleted, close: () => close()});
+      return;
+    }
+    admit('context');
+    const {role, text} = restore[restoredCount];
+    pendingItem = {id: 'item_' + randomBytes(16).toString('base64url'), type: 'message', role, status: 'completed',
+      content: [{type: role === 'user' ? 'input_text' : 'output_text', text}]};
+    send({type: 'conversation.item.create', item: pendingItem, ...(priorItemId ? {previous_item_id: priorItemId} : {})});
+  }
+
+  function checkHistoryEvent(message) {
+    const item = message.item;
+    if (phase !== 'restoring' || !pendingItem || item?.id !== pendingItem.id) throw error('REALTIME_VOICE_CONTEXT_UNVERIFIED');
+    if (message.type !== 'conversation.item.done') return;
+    const content = Array.isArray(item.content) && item.content.length === 1 ? item.content[0] : null;
+    const expected = pendingItem.content[0];
+    if (item.type !== pendingItem.type || item.role !== pendingItem.role ||
+        (item.status !== undefined && item.status !== 'completed') || (message.previous_item_id ?? null) !== priorItemId ||
+        content?.type !== expected.type || content.text !== expected.text || Object.keys(content).length !== 2) {
+      throw error('REALTIME_VOICE_CONTEXT_UNVERIFIED');
+    }
+    priorItemId = pendingItem.id;
+    pendingItem = undefined;
+    restoredCount++;
+    restoreNext();
   }
 
   function requestTruncation(output, audioEndMs) {
@@ -117,10 +177,13 @@ export async function openRealtimeVoice({key, organization, project, model, voic
     active = undefined;
     clearTimeout(current.timer);
     lastAudio = current.interrupted || current.playbackCompleted ? undefined : current.audio;
+    const outputTranscriptConfirmed = current.response.status === 'completed' && !current.interrupted &&
+      typeof current.finalOutputTranscript === 'string';
     current.resolve({status: current.response.status, responseId: current.responseId, usage: current.response.usage,
       inputItemId: current.inputItemId,
       inputTranscript: current.transcription.text, transcriptionUsage: current.transcription.usage,
-      outputTranscript: current.interrupted ? '' : current.outputTranscript, interrupted: current.interrupted,
+      outputTranscript: outputTranscriptConfirmed ? current.finalOutputTranscript : '', outputTranscriptConfirmed,
+      interrupted: current.interrupted,
       responseRequested: current.responseRequested === true});
   }
 
@@ -186,9 +249,13 @@ export async function openRealtimeVoice({key, organization, project, model, voic
         return;
       case 'session.updated':
         if (phase !== 'configuring' || !checkSession(message.session)) throw error('REALTIME_VOICE_CONFIGURATION_UNVERIFIED');
-        clearTimeout(opening);
-        phase = 'ready';
-        ready.resolve({turn, interrupt, playbackCompleted, close: () => close()});
+        if (hasHistory && message.session.truncation !== 'disabled') throw error('REALTIME_VOICE_CONTEXT_UNVERIFIED');
+        if (hasHistory) phase = 'restoring';
+        restoreNext();
+        return;
+      case 'conversation.item.added':
+      case 'conversation.item.done':
+        if (hasHistory && phase !== 'ready') checkHistoryEvent(message);
         return;
       case 'input_audio_buffer.committed':
         if (!active?.committed || active.inputItemId || !validId(message.item_id)) throw error('REALTIME_VOICE_SETTLEMENT_UNKNOWN');
@@ -228,6 +295,7 @@ export async function openRealtimeVoice({key, organization, project, model, voic
         if (!bytes.length || bytes.length % 2 !== 0 || bytes.toString('base64') !== message.delta) {
           throw error('REALTIME_VOICE_INVALID_AUDIO');
         }
+        if (message.output_index !== undefined && message.output_index !== 0) active.finalOutputTranscript = null;
         active.audio ??= {itemId: message.item_id, bytes: 0};
         if (active.audio.itemId !== message.item_id || active.audio.bytes + bytes.length > 120000 * bytesPerMillisecond) {
           throw error('REALTIME_VOICE_INVALID_AUDIO');
@@ -240,9 +308,22 @@ export async function openRealtimeVoice({key, organization, project, model, voic
         if (!active?.responseId || active.responseId !== message.response_id || active.interrupted) return;
         if (!outputItemMatches(message) || typeof message.delta !== 'string' ||
             active.outputTranscript.length + message.delta.length > textLimit) throw error('REALTIME_VOICE_INVALID_TRANSCRIPT');
+        if (active.response || active.finalOutputTranscript !== undefined || message.output_index !== 0) active.finalOutputTranscript = null;
+        if (active.response || message.output_index !== 0) return;
+        active.transcriptDeltaSeen = true;
         active.outputTranscript += message.delta;
         active.onTranscript?.(message.delta);
         return;
+      case 'response.output_audio_transcript.done': {
+        if (!active?.responseId || active.responseId !== message.response_id || active.interrupted) return;
+        const text = message.transcript;
+        const valid = !active.response && active.finalOutputTranscript === undefined && !!active.outputItemId &&
+          active.outputItemId === message.item_id && message.content_index === 0 && message.output_index === 0 &&
+          typeof text === 'string' && text.length <= textLimit && !!text.trim() && text.isWellFormed() &&
+          (!active.transcriptDeltaSeen || active.outputTranscript === text);
+        active.finalOutputTranscript = valid ? text : null;
+        return;
+      }
       case 'response.done': {
         const response = message.response;
         if (!active?.responseId || active.responseId !== response?.id) throw error('REALTIME_VOICE_SETTLEMENT_UNKNOWN');

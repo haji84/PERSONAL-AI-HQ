@@ -4,6 +4,7 @@ import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { moneyMicros, normalizeSettings, resolveExecution, verifyHandover } from './execution-policy.mjs';
 import {maximumRealtimeCostMicros, normalizeRealtimeCostConfig, realtimeResponseMicros, realtimeTranscriptionMicros} from './realtime-cost.mjs';
+import {realtimeArchiveId, validRealtimeContinuation} from './realtime-history.mjs';
 
 const active = new Set(['reserved', 'running', 'uncertain', 'awaiting_settlement']);
 const terminals = new Set(['completed', 'failed', 'interrupted', 'cancelled']);
@@ -45,6 +46,17 @@ const emptyProject = initial => ({
   lastRoute: null, lastExecution: null, checkpoint: null,
 });
 
+function realtimeArchiveProof(project, archiveId) {
+  const first = archiveId.slice('realtime/'.length);
+  const turns = Object.values(project.operations).filter(operation => operation.kind === realtimeKind && operation.status === 'completed' &&
+    (operation.realtimeVoice.continuation ? operation.realtimeVoice.continuation.id === archiveId : operation.executionId === first))
+    .map(operation => ({id: operation.executionId, model: operation.model, startedAt: operation.dispatchedAt,
+      completedAt: operation.completedAt, scopeDigest: operation.realtimeVoice.scopeDigest,
+      continuation: operation.realtimeVoice.continuation, transcriptDigest: operation.voiceSettlement?.transcriptDigest}))
+    .sort((first, second) => first.id.localeCompare(second.id));
+  return {turns, review: digest(turns)};
+}
+
 function realtimeAdmission(project, task, context) {
   const scope = context.realtimeVoice;
   const config = normalizeRealtimeCostConfig(scope?.config);
@@ -53,7 +65,13 @@ function realtimeAdmission(project, task, context) {
       !hashPattern.test(scope?.scopeDigest ?? '') || task?.route !== 'api' || task.stage !== 'consultation' ||
       task.model !== config.model || task.reasoningEffort !== 'none') return denial('REALTIME_VOICE_AUTHORITY_REQUIRED');
   if (project.settings.mode === 'hybrid' && project.settings.stageRoutes.consultation !== 'api') return denial('ROUTE_NOT_ALLOWED');
-  return {allowed: true, realtimeVoice: {config, scopeDigest: scope.scopeDigest}, context: {...context,
+  const {continuation, archiveLedgerReview} = scope;
+  if (continuation !== undefined && (!validRealtimeContinuation(continuation) ||
+      !hashPattern.test(archiveLedgerReview ?? '') || realtimeArchiveProof(project, continuation.id).review !== archiveLedgerReview)) {
+    return denial('REALTIME_VOICE_HISTORY_CHANGED');
+  }
+  return {allowed: true, realtimeVoice: {config, scopeDigest: scope.scopeDigest,
+    ...(continuation ? {continuation, archiveLedgerReview} : {})}, context: {...context,
     safety: {...context.safety, api: {...context.safety?.api, maxRequestCostUsd: cost / 1_000_000}}}};
 }
 
@@ -83,10 +101,13 @@ function realtimeUsage(usage, kind) {
   return {...totals, output: modalities(usage.output, outputTokens), cachedInput};
 }
 
-function realtimeSettlement(config, {phase, outcome, receipts, reason}) {
+function realtimeSettlement(config, {phase, outcome, receipts, reason, transcriptDigest}) {
   if (!realtimePhases.has(phase) || !realtimeOutcomes.has(outcome) || typeof receipts?.responseRequested !== 'boolean' ||
       (phase !== 'terminal' && outcome === 'completed') || (reason !== undefined &&
-      (typeof reason !== 'string' || !/^[A-Z0-9_]{1,64}$/.test(reason)))) error('INVALID_REALTIME_SETTLEMENT');
+      (typeof reason !== 'string' || !/^[A-Z0-9_]{1,64}$/.test(reason))) || (transcriptDigest !== undefined &&
+      (phase !== 'terminal' || outcome !== 'completed' || typeof transcriptDigest !== 'string' || !hashPattern.test(transcriptDigest)))) {
+    error('INVALID_REALTIME_SETTLEMENT');
+  }
   const {responseRequested} = receipts;
   if (phase === 'not_committed' && (responseRequested || receipts.response || receipts.transcription) ||
       !responseRequested && receipts.response || (!responseRequested && phase === 'terminal' && outcome !== 'interrupted')) {
@@ -107,7 +128,8 @@ function realtimeSettlement(config, {phase, outcome, receipts, reason}) {
     const usage = realtimeUsage(receipts.transcription.usage, 'transcription');
     transcription = {itemId, usage, accountedMicros: realtimeTranscriptionMicros(config, usage)};
   }
-  return {phase, outcome, responseRequested, response, transcription, ...(reason ? {reason} : {})};
+  return {phase, outcome, responseRequested, response, transcription, ...(reason ? {reason} : {}),
+    ...(transcriptDigest ? {transcriptDigest} : {})};
 }
 
 // One owner-controlled server is the writer for this store. Do not replicate the
@@ -183,6 +205,9 @@ export class ExecutionStore {
           operation.task?.stage !== 'consultation' || !hashPattern.test(operation.realtimeVoice?.scopeDigest ?? '') ||
           operation.realtimeVoice?.config?.model !== operation.model || operation.nativeOrigin !== undefined ||
           operation.providerReceipts !== undefined || operation.checkpointVersion !== undefined)) error('STATE_INVALID');
+      if (operation.realtimeVoice?.continuation !== undefined && (!validRealtimeContinuation(operation.realtimeVoice.continuation) ||
+          !hashPattern.test(operation.realtimeVoice.archiveLedgerReview ?? ''))) error('STATE_INVALID');
+      if (operation.voiceSettlement?.transcriptDigest !== undefined && !hashPattern.test(operation.voiceSettlement.transcriptDigest)) error('STATE_INVALID');
       if (operation.route === 'api') { try { id(operation.organizationId); } catch { error('STATE_INVALID'); } }
     }
     return project;
@@ -231,6 +256,11 @@ export class ExecutionStore {
       .sort((a, b) => a.checkpointVersion - b.checkpointVersion) : [];
     return clone({operation, checkpoint: project.checkpoint, checkpointOperation, verifiedApiOperations, settledApiMicros: project.spentMicros,
       busy: operations.some(item => active.has(item.status))});
+  }
+
+  getRealtimeArchive(projectId, archiveId) {
+    if (typeof archiveId !== 'string' || !realtimeArchiveId.test(archiveId)) error('INVALID_ID');
+    return clone(realtimeArchiveProof(this.#project(this.#read(), projectId), archiveId));
   }
 
   portfolioPolicies(bindings) {
@@ -372,8 +402,10 @@ export class ExecutionStore {
     if (kind !== undefined && (kind !== realtimeKind || nativeOrigin !== undefined)) error('INVALID_EXECUTION_KIND');
     if (nativeOrigin !== undefined && (!validNativeOrigin(nativeOrigin) || request.task?.route !== 'api' ||
         !['consultation', 'design'].includes(request.task.stage))) error('INVALID_NATIVE_ORIGIN');
+    const continuation = kind === realtimeKind ? context.realtimeVoice?.continuation : undefined;
+    if (continuation !== undefined && !validRealtimeContinuation(continuation)) error('INVALID_EXECUTION_KIND');
     const fingerprint = digest({ instructionDigest: request.instructionDigest, task: request.task ?? {}, nativeOrigin,
-      ...(kind ? {kind} : {}) });
+      ...(kind ? {kind} : {}), ...(continuation ? {continuation} : {}) });
     return this.#change(data => {
       const project = this.#project(data, request.projectId, {create:true});
       const prior = project.operations[request.taskId];
