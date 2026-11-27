@@ -170,7 +170,7 @@ function comparableForecast(task, samples) {
     evidence:[...new Set(matches.map(sample=>forecastString(sample.source)))].slice(0,8)}};
 }
 
-function makeForecastTask(task, verifiedIds, now, comparableRuns) {
+function makeForecastTask(task, verifiedIds, now, comparableRuns, allowImplicitReadiness) {
   const verified = verifiedIds instanceof Set ? task.status === 'verified' && verifiedIds.has(task.id) &&
     task.externalWait !== 'unknown' && !taskHasOpenWork(task) : taskIsVerified(task);
   const direct = remainingEstimate(task.remainingMinutes);
@@ -189,7 +189,8 @@ function makeForecastTask(task, verifiedIds, now, comparableRuns) {
     assumptions:forecastList(task.estimate?.assumptions),evidence:forecastList(task.estimate?.evidence,8)};
   return {id:task.id,title:forecastString(task.title,140)??task.id,
     status:verified?'verified':rejectedCompletion?'unknown':forecastString(task.status,30)??'unknown',
-    verified,unconfirmedCompletion:rejectedCompletion,actionable:task.actionable!==false,expired,remainingMinutes,
+    verified,unconfirmedCompletion:rejectedCompletion,
+    actionable:allowImplicitReadiness ? task.actionable!==false : task.actionable===true,expired,remainingMinutes,
     previousMinutes:expired?proposed:null,estimate,
     dependencies:task.dependencies==null?[]:Array.isArray(task.dependencies) &&
       task.dependencies.length<=400 && task.dependencies.every(id=>typeof id==='string' && id.length<=120)
@@ -379,7 +380,7 @@ export function developmentForecast(delivery = {}, {
   const raw = Array.isArray(delivery.tasks) ? delivery.tasks : [];
   const validTasks = raw.length<=400 && new Set(raw.map(task=>task?.id)).size===raw.length &&
     raw.every(task=>typeof task?.id==='string' && task.id.length>0 && task.id.length<=120);
-  const tasks = validTasks ? raw.map(task=>makeForecastTask(task,verifiedTaskIds,now,delivery.comparableRuns)) : [];
+  const tasks = validTasks ? raw.map(task=>makeForecastTask(task,verifiedTaskIds,now,delivery.comparableRuns,status!=='unknown')) : [];
   const scoped = verifiedTaskIds instanceof Set;
   const confirmedRequirements = new Set(tasks.filter(task=>task.verified).flatMap(task=>task.requirements));
   const requirements = scoped && Array.isArray(delivery.requirements) ? delivery.requirements.map(row=>
@@ -401,6 +402,7 @@ export function developmentForecast(delivery = {}, {
   const unresolved = outstanding.filter(waits);
   const ownerAction = forecastString(delivery.ownerAction);
   const ownerHold = ownerAction && delivery.ownerActionAppliesTo!=='release';
+  const workspaceReviewAction = '保存済みの進行状態と作業先を照合する。';
   const canDate = !paused && !ownerAction && !workspaceUnconfirmed && calendar && asOf!==null && asOf<=now;
   function calendarDates(selected) {
     if (!canDate || !selected || selected.some(task=>waits(task) || task.unconfirmedCompletion || (!task.verified &&
@@ -451,13 +453,14 @@ export function developmentForecast(delivery = {}, {
     unresolved.map(task=>task.id));
   if (ownerAction) missing('owner-action','利用者の対応が残っています。',ownerAction);
   if (workspaceUnconfirmed) missing('workspace-observation','この端末の作業先で進行状態を確認できていません。',
-    '保存済みの進行状態と作業先を照合してから着手する。');
+    workspaceReviewAction);
   if (!calendar) missing('calendar','稼働を予定できる時間帯が未確認です。','担当と利用枠、稼働時間帯を確認し、経過時間から完成日時を計算する。');
   if (!original) missing('baseline','保存された開始前の見積もりがありません。','既存の履歴を照合し、復元した見込みには事後推定と記録する。');
   const start = timestamp(delivery.startedAt);
   const end = timestamp(delivery.completedAt)??(asOf!==null && asOf<=now ? asOf : null);
   const observed = observedTime(delivery.intervals);
-  const action = forecastString(nextAction)??forecastString(delivery.nextAction) ??
+  const action = workspaceUnconfirmed ? workspaceReviewAction :
+    forecastString(nextAction)??forecastString(delivery.nextAction) ??
     outstanding.find(task=>readyTaskIds.includes(task.id))?.nextAction ?? gaps[0]?.action ?? null;
   return {goal:target,stage:forecastString(delivery.stage),status,observedAt:forecastJst(asOf),progress,
     checkpoints:checkTotal ? {accepted:checkAccepted,total:checkTotal,percent:progressPercent(checkAccepted,checkTotal)} : null,
