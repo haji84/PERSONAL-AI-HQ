@@ -22,7 +22,7 @@ const stateLabels = {
 const dom = {};
 for (const id of [
   'gate', 'gate-title', 'gate-description', 'gate-retry', 'gate-tailnet', 'gate-code', 'gate-connect', 'shell', 'navigation',
-  'project-select', 'theme-button', 'page-title', 'page-summary', 'refresh-button', 'notice', 'content',
+  'project-select', 'theme-button', 'page-title', 'page-summary', 'chat-development-toggle', 'refresh-button', 'notice', 'content',
 ]) dom[id] = document.getElementById(id);
 const prefsKey = 'personal-ai-hq/preferences/v1';
 const tabKey = 'personal-ai-hq/tab/v1';
@@ -38,6 +38,7 @@ function writeStorage(storage, key, value) {
 
 const saved = readStorage(localStorage, prefsKey);
 const savedTab = readStorage(sessionStorage, tabKey);
+const chatDevelopmentWidth = window.matchMedia('(min-width: 1160px)');
 const view = () => {
   const name = location.hash.slice(1);
   return Object.hasOwn(pages, name) ? name : 'dashboard';
@@ -46,6 +47,7 @@ const ui = {
   view: view(), portfolio: null, capabilities: {},
   project: typeof saved.project === 'string' ? saved.project : '',
   theme: ['light', 'dark', 'system'].includes(saved.theme) ? saved.theme : 'system',
+  showChatDevelopment: savedTab.showChatDevelopment === true,
   chatIds: new Map(Object.entries(savedTab.chatIds ?? {})),
   threadIds: new Map(Object.entries(savedTab.threadIds ?? {})),
   options: new Map(Object.entries(saved.modelOptions ?? {})),
@@ -97,6 +99,7 @@ function storePreferences() {
 }
 function storeTab() {
   writeStorage(sessionStorage, tabKey, {
+    showChatDevelopment: ui.showChatDevelopment,
     chatIds: Object.fromEntries(ui.chatIds), threadIds: Object.fromEntries(ui.threadIds),
     scroll: Object.fromEntries(ui.scroll), drafts: Object.fromEntries(ui.drafts),
     searches: Object.fromEntries(ui.searches),
@@ -260,6 +263,7 @@ function endSession() {
   ui.attachmentDrafts.clear();
   ui.portfolio = null;
   dom.content.replaceChildren();
+  syncChatDevelopment();
   if (ui.capabilities.tailnetSignIn === true) {
     gate('遠隔サインイン', 'ホスト端末のダッシュボードで発行した接続コードを入力してください。', false);
     dom['gate-tailnet'].hidden = false;
@@ -319,7 +323,7 @@ function paintNativeActivity() {
     return listItem(select);
   }));
 }
-function recordNativeActivity(project, result, watched) {
+function recordNativeActivity(project, result, watched, trackNewTurns) {
   const previous = nativeActivities.get(project);
   if (!['observed', 'unconfigured', 'unavailable'].includes(result?.status) ||
       (result.status === 'observed' && (!Number.isFinite(Date.parse(result.observedAt)) ||
@@ -351,7 +355,7 @@ function recordNativeActivity(project, result, watched) {
   for (const row of result.live) {
     if (typeof row.turnId !== 'string' || !codexRecordId.test(row.turnId)) continue;
     const key = row.id + ':' + row.turnId;
-    if (!nativeNotices.has(key) && (watched.has(key) || watched.size < nativeWatchLimit)) watched.set(key, expires);
+    if (!nativeNotices.has(key) && (watched.has(key) || (trackNewTurns && watched.size < nativeWatchLimit))) watched.set(key, expires);
   }
   nativeActivities.set(project, {...result, receivedAt, watched, lastOutcome});
   const name = projectList().find(item => item.id === project)?.name;
@@ -401,7 +405,8 @@ async function pollActivity() {
     await Promise.allSettled([...selected].map(async project => {
       const previous = activities.get(project);
       const watched = new Map([...(nativeActivities.get(project)?.watched ?? [])].filter(([, expires]) => expires > now));
-      const observeNative = watched.size > 0 || (project === currentProject && ui.view === 'dashboard');
+      const trackNewTurns = watched.size > 0 || (project === currentProject && ui.view === 'dashboard');
+      const observeNative = trackNewTurns || (project === currentProject && document.getElementById('chat-development')?.hidden === false);
       let activity;
       let observedNative;
       try {
@@ -414,14 +419,14 @@ async function pollActivity() {
           if (previous && !previous.terminal && previous.phase !== 'cancelling') {
             activities.set(project, {...previous, phase: 'unconfirmed'});
           }
-          if (observeNative) recordNativeActivity(project, null, watched);
+          if (observeNative) recordNativeActivity(project, null, watched, trackNewTurns);
         }
         return;
       }
       if (activitySession !== session || (activity !== null && (typeof activity?.id !== 'string' ||
           typeof activity.terminal !== 'boolean' || !Object.hasOwn(activityLabels, activity.phase)))) return;
       activities.set(project, activity);
-      if (observeNative) recordNativeActivity(project, observedNative, watched);
+      if (observeNative) recordNativeActivity(project, observedNative, watched, trackNewTurns);
       if (activity?.kind === 'api' && (previous?.id !== activity.id || previous.phase !== activity.phase)) evictChats(project);
       if (previous !== undefined && activity?.terminal &&
           (previous?.id !== activity.id || previous.phase !== activity.phase)) {
@@ -2061,10 +2066,54 @@ function mountChatHandoff(destination, project, conversation, isCurrent) {
   });
   return run.cleanup;
 }
+function chatDevelopmentPanel(project) {
+  const area = panel('開発状況');
+  area.root.id = 'chat-development';
+  area.root.classList.add('chat-development');
+  area.root.hidden = true;
+  area.header.firstElementChild.id = 'chat-development-title';
+  area.root.setAttribute('aria-labelledby', 'chat-development-title');
+  area.body.append(node('p', 'strong', project.name));
+  const metrics = node('dl', 'properties');
+  metric(metrics, '案件の記録', stateLabels[project.state]);
+  metric(metrics, '正式な要求達成率', project.measurements?.formalCompletion, true);
+  metric(metrics, '残り作業時間', estimateLabel(project.schedule?.remainingMinutes));
+  metric(metrics, '完成予定', time(project.measurements?.estimateFinish));
+  metric(metrics, '案件データの取得時刻', time(project.observedAt ?? ui.portfolio?.observedAt));
+  area.body.append(metrics);
+  if (project.schedule?.delayed === true) area.body.append(node('p', 'chip notice-chip', '当初予定に対して遅延しています'));
+  const task = asArray(project.tasks).find(item => item.status !== 'verified');
+  if (task) {
+    const current = node('p', 'task-title');
+    current.append(node('strong', '', task.title), taskStatus(task));
+    area.body.append(node('h3', '', '確認が残るタスク'), current);
+    if (task.observedAt) area.body.append(node('p', 'small muted', 'タスクの記録 ' + time(task.observedAt)));
+  }
+  if (ui.capabilities.executionActivity === true) area.body.append(activityPanel());
+  return area.root;
+}
+
+function syncChatDevelopment() {
+  const panel = document.getElementById('chat-development');
+  const toggle = dom['chat-development-toggle'];
+  const available = Boolean(panel) && chatDevelopmentWidth.matches;
+  const visible = available && ui.showChatDevelopment;
+  const focused = document.activeElement;
+  toggle.hidden = !available;
+  toggle.setAttribute('aria-expanded', String(visible));
+  if (!panel) return;
+  if (!visible && (panel.contains(focused) || (!available && focused === toggle))) {
+    (available ? toggle : dom['refresh-button']).focus({preventScroll: true});
+  }
+  panel.hidden = !visible;
+  panel.parentElement.classList.toggle('with-development', visible);
+}
+
 function chat() {
-  const project = ui.project;
-  if (!project) return emptyProject();
-  if (selectedProject()?.registration === 'github') return projectNeedsWorkspace();
+  const details = selectedProject();
+  if (!details) return emptyProject();
+  if (details.registration === 'github') return projectNeedsWorkspace();
+  const project = details.id;
   const layout = node('div', 'split conversation-layout');
   const collection = panel('会話履歴');
   const thread = panel('会話');
@@ -2248,7 +2297,7 @@ function chat() {
     searchChats(search.value);
   }));
   if (ui.capabilities.apiDevelopment === true) current.append(adviceHost);
-  layout.append(collection.root, current);
+  layout.append(collection.root, current, chatDevelopmentPanel(details));
   dom.content.append(layout);
   showChatDetails();
   searchChats(search.value);
@@ -3525,6 +3574,7 @@ function render(restore = true, keepNotice = false) {
   };
   dom['page-summary'].textContent = summaries[ui.view];
   screens[ui.view]();
+  syncChatDevelopment();
   paintActivity();
   void pollActivity();
   if (restore) restoreScroll();
@@ -3617,6 +3667,17 @@ dom['gate-tailnet'].addEventListener('submit', async event => {
 dom['gate-retry'].addEventListener('click', activate);
 dom['project-select'].addEventListener('change', event => selectProject(event.target.value));
 dom['refresh-button'].addEventListener('click', refresh);
+dom['chat-development-toggle'].addEventListener('click', () => {
+  ui.showChatDevelopment = !ui.showChatDevelopment;
+  storeTab();
+  syncChatDevelopment();
+  paintActivity();
+});
+chatDevelopmentWidth.addEventListener('change', () => {
+  if (ui.view !== 'chat') return;
+  syncChatDevelopment();
+  paintActivity();
+});
 dom['theme-button'].addEventListener('click', () => {
   ui.theme = ui.theme === 'system' ? 'dark' : ui.theme === 'dark' ? 'light' : 'system';
   setTheme();
