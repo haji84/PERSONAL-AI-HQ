@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import {mkdir, mkdtemp, readFile, realpath, rm, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
-import {join} from 'node:path';
+import {join, resolve, sep} from 'node:path';
 import test from 'node:test';
 import {startOwnerApp} from '../app/server.mjs';
+import {ensurePrivateDirectory} from '../app/private-directory.mjs';
 
 const seed = {
   observedAt: '2026-11-27T06:25:00.000Z',
@@ -12,7 +13,9 @@ const seed = {
 };
 
 async function fixture(t) {
-  const directory = await mkdtemp(join(tmpdir(), 'hq-owner-test-'));
+  const fixtureRoot = await mkdtemp(join(tmpdir(), 'hq-owner-test-'));
+  const directory = join(fixtureRoot, 'runtime');
+  await ensurePrivateDirectory(directory);
   await writeFile(join(directory, 'portfolio.json'), JSON.stringify(seed), {mode: 0o600});
   let nativeReads = 0;
   const app = await startOwnerApp({directory, port: 0, codex: {
@@ -22,7 +25,13 @@ async function fixture(t) {
       return {data: [], nextCursor: null};
     },
   }});
-  t.after(async () => { await app.close(); await rm(directory, {recursive: true, force: true}); });
+  t.after(async () => {
+    await app.close();
+    const target = resolve(fixtureRoot);
+    assert.ok(target.startsWith(resolve(tmpdir()) + sep));
+    assert.ok(target.includes('hq-owner-test-'));
+    await rm(target, {recursive: true, force: true});
+  });
   return {app, directory, reads: () => nativeReads};
 }
 
@@ -83,6 +92,7 @@ test('an imported conversation survives restart and rejected cross-origin reques
   const detail = await fetch(`${reopened.url}/api/chat?project=example&id=conversation-1`, {headers: {cookie: reopenedCookie}});
   const {conversation} = await detail.json();
   assert.deepEqual(conversation.messages.map(message => message.text), ['選択した会話', '保存した回答']);
+  await reopened.close();
 });
 
 test('project execution settings block native dispatch in API-only mode and stay fixed while running', async t => {
