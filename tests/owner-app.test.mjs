@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import {mkdir, mkdtemp, readFile, realpath, rm, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
-import {join, resolve, sep} from 'node:path';
+import {basename, dirname, join, resolve} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
 import test from 'node:test';
 import {startOwnerApp} from '../app/server.mjs';
@@ -15,13 +15,34 @@ const seed = {
   artifacts: [],
 };
 
-async function fixture(t) {
-  const fixtureRoot = await mkdtemp(join(tmpdir(), 'hq-owner-test-'));
+async function runtimeFixture(t) {
+  const temp = await realpath(tmpdir());
+  const fixtureRoot = await mkdtemp(join(temp, 'hq-owner-test-'));
   const directory = join(fixtureRoot, 'runtime');
+  const apps = [];
+  t.after(async () => {
+    for (const app of apps.reverse()) await app.close();
+    const target = await realpath(fixtureRoot);
+    assert.equal(dirname(target), temp);
+    assert.ok(basename(target).startsWith('hq-owner-test-'));
+    await rm(target, {recursive: true, force: true});
+  });
   await ensurePrivateDirectory(directory);
+  return {
+    directory,
+    async start(options) {
+      const app = await startOwnerApp({directory, port: 0, ...options});
+      apps.push(app);
+      return app;
+    },
+  };
+}
+
+async function fixture(t) {
+  const {directory, start} = await runtimeFixture(t);
   await writeFile(join(directory, 'portfolio.json'), JSON.stringify(seed), {mode: 0o600});
   let nativeReads = 0;
-  const app = await startOwnerApp({directory, port: 0, codex: {
+  const app = await start({codex: {
     async listThreads(paths) {
       nativeReads++;
       assert.deepEqual(paths, [resolve(tmpdir(), 'fixture-scope')]);
@@ -29,14 +50,7 @@ async function fixture(t) {
     },
     async findSubmission() { nativeReads++; return null; },
   }});
-  t.after(async () => {
-    await app.close();
-    const target = resolve(fixtureRoot);
-    assert.ok(target.startsWith(resolve(tmpdir()) + sep));
-    assert.ok(target.includes('hq-owner-test-'));
-    await rm(target, {recursive: true, force: true});
-  });
-  return {app, directory, reads: () => nativeReads};
+  return {app, directory, start, reads: () => nativeReads};
 }
 
 async function login(app) {
@@ -102,7 +116,7 @@ test('execution activity is owner-scoped and returns only status metadata', asyn
 });
 
 test('an imported conversation survives restart and rejected cross-origin requests never write it', async t => {
-  const {app, directory} = await fixture(t);
+  const {app, start} = await fixture(t);
   const cookie = await login(app);
   const payload = {conversations: [{id: 'conversation-1', title: '公式書き出しの試験', current_node: 'reply', mapping: {
     input: {parent: null, message: {author: {role: 'user'}, content: {parts: ['選択した会話']}}},
@@ -116,8 +130,7 @@ test('an imported conversation survives restart and rejected cross-origin reques
   assert.equal((await upload(app.url)).status, 200);
   assert.equal((await upload(app.url)).status, 200);
   await app.close();
-  const reopened = await startOwnerApp({directory, port: 0, codex: {}});
-  t.after(() => reopened.close());
+  const reopened = await start({codex: {}});
   const reopenedCookie = await login(reopened);
   const response = await fetch(`${reopened.url}/api/chat?project=example`, {headers: {cookie: reopenedCookie}});
   const {conversations} = await response.json();
@@ -126,11 +139,10 @@ test('an imported conversation survives restart and rejected cross-origin reques
   const detail = await fetch(`${reopened.url}/api/chat?project=example&id=conversation-1`, {headers: {cookie: reopenedCookie}});
   const {conversation} = await detail.json();
   assert.deepEqual(conversation.messages.map(message => message.text), ['選択した会話', '保存した回答']);
-  await reopened.close();
 });
 
 test('project execution settings block native dispatch in API-only mode and stay fixed while running', async t => {
-  const directory = await realpath(await mkdtemp(join(tmpdir(), 'hq-policy-test-')));
+  const {directory, start} = await runtimeFixture(t);
   const work = join(directory, 'workspaces', 'example');
   await mkdir(work, {recursive: true, mode: 0o700});
   await writeFile(join(work, '.hq-owned-workspace'), 'example\n');
@@ -152,8 +164,7 @@ test('project execution settings block native dispatch in API-only mode and stay
     },
     async steer() { steers++; return 'fixture-turn'; },
   };
-  const app = await startOwnerApp({directory, port: 0, codex: native});
-  t.after(async () => { await app.close(); await rm(directory, {recursive: true, force: true}); });
+  const app = await start({codex: native});
   const cookie = await login(app);
   const call = (path, body) => fetch(app.url + path + '?project=example', {method: body ? 'POST' : 'GET',
     headers: {cookie, ...(body ? {Origin: app.url, 'Content-Type': 'application/json'} : {})},
@@ -180,7 +191,7 @@ test('project execution settings block native dispatch in API-only mode and stay
 });
 
 test('a scoped ChatGPT plan stream preserves text and never repeats the provider call on replay', async t => {
-  const directory = await mkdtemp(join(tmpdir(), 'hq-chat-route-'));
+  const {directory, start} = await runtimeFixture(t);
   await writeFile(join(directory, 'portfolio.json'), JSON.stringify(seed), {mode: 0o600});
   let runs = 0;
   let pauseDuringCatalog = false;
@@ -198,8 +209,7 @@ test('a scoped ChatGPT plan stream preserves text and never repeats the provider
       yield 'です。';
     },
   }};
-  const app = await startOwnerApp({directory, port: 0, codex: {}, plan});
-  t.after(async () => { await app.close(); await rm(directory, {recursive: true, force: true}); });
+  const app = await start({codex: {}, plan});
   const cookie = await login(app);
   const data = {id: 'turn-integration', prompt: '質問', model: 'fixture-model'};
   const send = (origin, payload = data) => fetch(`${app.url}/api/chat/live?project=example`, {method: 'POST',
