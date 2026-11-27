@@ -175,6 +175,41 @@ function providerAnswer(answer, changes = [{path: 'source.mjs', text: `export co
     })}]}]});
 }
 
+test('API consultation reserves one response, archives the full advice, and hands off without file edits', {skip: process.platform !== 'darwin'}, async t => {
+  const answers = [];
+  const advice = ` 照合用の相談を保存する。${'設計上の決定と根拠。'.repeat(260)}\n`;
+  const {call, store, source, directory} = await fixture(t, async (_url, request) => {
+    answers.push(JSON.parse(request.body));
+    return Response.json({model: modelId, service_tier: 'default', status: 'completed', usage: {input_tokens: 100, output_tokens: 25},
+      output: [{type: 'message', role: 'assistant', content: [{type: 'output_text', text: JSON.stringify({answer: advice})}]}]});
+  }, {handover: true});
+  const query = {id: 'api-advice-fixture'};
+  const request = {...query, prompt: 'この案件の設計を相談する', stage: 'consultation'};
+  assert.equal((await call('/api/execution/settings', {data: {revision: 0, settings: {mode: 'api-only', apiBudgetUsd: 0.06}}})).status, 200);
+  assert.equal((await call('/api/execution/api', {data: request})).status, 202);
+  const completed = await waitFor(call, 'completed', request.id);
+  assert.equal(completed.advice, advice);
+  assert.equal(completed.artifactCount, 0);
+  assert.equal(completed.verification, null);
+  const work = store.getWork(id, request.id).operation;
+  assert.equal(work.reservedMicros, 48000);
+  assert.equal(work.costMicros, 400);
+  const archived = createChatStore(directory);
+  try {
+    assert.equal(archived.read(id, `api/${work.executionId}`, 0).conversation.messages[1].text, advice);
+  } finally { archived.close(); }
+  assert.equal(await readFile(source, 'utf8'), 'export const answer = 1;\n');
+  assert.equal(answers.length, 1);
+  assert.ok(JSON.parse(answers[0].input[1].content).context.files.every(file => file.writable === false));
+  assert.equal((await call('/api/execution/api', {data: request})).status, 202);
+  assert.equal(answers.length, 1);
+  await call('/api/execution/settings', {data: {revision: 1, settings: {mode: 'subscription-only'}}});
+  const receipt = work.executionId;
+  const proof = await call('/api/execution/handover', {query: {receipt}});
+  assert.equal(proof.status, 200);
+  assert.deepEqual((await proof.json()).artifacts, []);
+});
+
 test('API-to-Codex rehearsal checks a committed requirement, conversation and applied artifact without enabling execution', {skip: process.platform !== 'darwin'}, async t => {
   let requests = 0;
   const {call, store, open, commitSource, requirements, portfolio, ledgerFile} = await fixture(t, async () => {

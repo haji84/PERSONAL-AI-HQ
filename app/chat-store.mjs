@@ -3,6 +3,7 @@ import {chmodSync, lstatSync} from 'node:fs';
 import {join} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
 import {chatInputLimit, chatMessageLimit, chatModelPattern, chatOutputLimit} from './chatgpt-responses.mjs';
+import {apiAdviceMaxLength} from './api-response.mjs';
 
 const date = value => Number.isFinite(value) && value >= 0 && value < 253402300800 ? new Date(value * 1000).toISOString() : null;
 const title = value => typeof value === 'string' && value.trim() ? value.trim().slice(0, 240) : '無題の会話';
@@ -236,14 +237,14 @@ export function createChatStore(directory, {now = Date.now} = {}) {
         return archiveView(get.get(project, archive));
       });
     },
-    finishDevelopment(project, {id, outcome, summary = '', updatedAt}) {
+    finishDevelopment(project, {id, outcome, summary = '', preserveSummary = false, updatedAt}) {
       const archive = developmentId(id);
       const time = isoTime(updatedAt);
-      if (!developmentStatuses.has(outcome) || typeof summary !== 'string' || summary.length > 2000 ||
+      if (!developmentStatuses.has(outcome) || typeof summary !== 'string' || summary.length > (preserveSummary ? apiAdviceMaxLength : 2000) ||
           (outcome === 'unconfirmed' && summary.trim())) {
         throw storeError(400, 'INVALID_DEVELOPMENT_RESULT', 'API作業の記録内容を確認できません。');
       }
-      const text = summary.trim();
+      const text = preserveSummary ? summary : summary.trim();
       return inTransaction(() => {
         const row = get.get(project, archive);
         if (row?.source !== developmentSource) throw storeError(404, 'DEVELOPMENT_NOT_FOUND', 'この案件のAPI作業を確認できません。');

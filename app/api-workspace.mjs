@@ -382,18 +382,8 @@ async function assertCandidate(candidate, contents) {
   }
 }
 
-export async function prepareApiWorkspace({ checkout, jobRoot, files, testPaths, priorChanges = [], signal }) {
-  if (process.platform !== 'darwin' || Number(process.versions.node.split('.')[0]) < 24) {
-    throw new Error('Isolated API development requires a macOS Node 24 sandbox');
-  }
-  signal?.throwIfAborted();
-  await access(SANDBOX, constants.X_OK);
-  const node = absolute(await realpath(process.execPath));
+async function enrolledSnapshot({ checkout, files, testPaths, priorChanges = [], signal }) {
   await canonicalDirectory(checkout);
-  const parent = await canonicalDirectory(path.dirname(absolute(jobRoot)));
-  if (parent.uid !== process.getuid() || (parent.mode & 0o077) !== 0 || jobRoot === checkout || jobRoot.startsWith(checkout + '/')) {
-    throw new Error('API job directory must be outside the checkout with a private owner-only parent');
-  }
   const baseSha = checkoutHead(checkout);
   const entries = makeEntries(files, testPaths);
   await snapshot(checkout, baseSha, entries, signal);
@@ -409,6 +399,29 @@ export async function prepareApiWorkspace({ checkout, jobRoot, files, testPaths,
       throw Object.assign(new Error('Previously verified changes require a checked handover', {cause}), {code: 'API_CANDIDATE_HANDOVER_REQUIRED'});
     }
   }
+  return { baseSha, entries };
+}
+
+export async function readAdvisoryWorkspace({ checkout, files, testPaths, priorChanges, signal }) {
+  signal?.throwIfAborted();
+  const { baseSha, entries } = await enrolledSnapshot({ checkout, files, testPaths, priorChanges, signal });
+  if (checkoutHead(checkout) !== baseSha) throw new Error('API advice Git HEAD changed during readback');
+  return { baseSha, files: [...entries.values()].filter(entry => entry.inContext).map(entry =>
+    ({ path: entry.name, text: entry.original, writable: false })) };
+}
+
+export async function prepareApiWorkspace({ checkout, jobRoot, files, testPaths, priorChanges, signal }) {
+  if (process.platform !== 'darwin' || Number(process.versions.node.split('.')[0]) < 24) {
+    throw new Error('Isolated API development requires a macOS Node 24 sandbox');
+  }
+  signal?.throwIfAborted();
+  await access(SANDBOX, constants.X_OK);
+  const node = absolute(await realpath(process.execPath));
+  const parent = await canonicalDirectory(path.dirname(absolute(jobRoot)));
+  if (parent.uid !== process.getuid() || (parent.mode & 0o077) !== 0 || jobRoot === checkout || jobRoot.startsWith(checkout + '/')) {
+    throw new Error('API job directory must be outside the checkout with a private owner-only parent');
+  }
+  const { baseSha, entries } = await enrolledSnapshot({ checkout, files, testPaths, priorChanges, signal });
   signal?.throwIfAborted();
   await mkdir(jobRoot, { mode: 0o700 });
   const runner = path.join(jobRoot, 'run-tests.mjs');

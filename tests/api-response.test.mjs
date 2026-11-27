@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {createApiResponseClient, maximumApiJobUsd} from '../app/api-response.mjs';
+import {apiAdviceMaxLength, createApiResponseClient, maximumApiJobUsd} from '../app/api-response.mjs';
 
 const model = {id: 'fixture-model-2026-11-27', contextTokens: 20000, outputTokens: 2000,
   inputUsdPerMillion: 2, outputUsdPerMillion: 8};
@@ -65,4 +65,82 @@ test('uncertain transport or unexpected billed model leaves settlement unknown a
     await assert.rejects(client.propose({model, prompt: '変更', context}), {code: 'API_SETTLEMENT_UNKNOWN'});
   }
   assert.equal(calls, 3);
+});
+
+test('advice uses a single private Responses request with a text-only schema', async () => {
+  const answer = '比較結果\n作業範囲を先に確認する。\n';
+  const prompt = '設計案を整理してください';
+  const signal = new AbortController().signal;
+  let calls = 0;
+  let checked = false;
+  const client = testClient(async (url, request) => {
+    calls++;
+    assert.equal(checked, true);
+    assert.equal(url, 'https://api.openai.com/v1/responses');
+    assert.equal(request.redirect, 'error');
+    assert.equal(request.signal, signal);
+    assert.equal(request.headers['OpenAI-Organization'], 'org-fixture');
+    assert.equal(request.headers['OpenAI-Project'], 'proj_fixture');
+    const body = JSON.parse(request.body);
+    assert.equal(body.store, false);
+    assert.equal(body.service_tier, 'default');
+    assert.equal(body.max_output_tokens, model.outputTokens);
+    assert.equal(body.reasoning.effort, 'low');
+    assert.equal(Object.hasOwn(body, 'tools'), false);
+    assert.deepEqual(body.text.format, {type: 'json_schema', name: 'project_advice', strict: true,
+      schema: {type: 'object', additionalProperties: false, required: ['answer'], properties: {answer: {type: 'string'}}}});
+    assert.deepEqual(JSON.parse(body.input[1].content), {work: prompt, context});
+    return fixture(completed([{type: 'output_text', text: JSON.stringify({answer})}]));
+  });
+  assert.equal(typeof client.advise, 'function');
+  assert.equal(apiAdviceMaxLength, 12000);
+  assert.deepEqual(await client.advise({model, effort: 'low', prompt, context, signal, beforeSend() { checked = true; }}),
+    {answer, accountedUsd: 0.0004, code: null});
+  assert.equal(calls, 1);
+});
+
+test('advice rejects replacements and malformed or over-limit answers while accounting for usage', async () => {
+  const advise = content => testClient(async () => fixture(completed(content))).advise({model, prompt: '相談', context});
+  for (const value of [proposal, {answer: '相談結果', changes: []}, {answer: ' \n'}, {answer: 'a'.repeat(12001)}, ['相談結果']]) {
+    assert.deepEqual(await advise([{type: 'output_text', text: JSON.stringify(value)}]),
+      {answer: null, accountedUsd: 0.0004, code: 'API_OUTPUT_UNUSABLE'});
+  }
+  assert.deepEqual(await advise([{type: 'refusal', refusal: 'fixture'}]),
+    {answer: null, accountedUsd: 0.0004, code: 'API_OUTPUT_UNUSABLE'});
+  assert.equal((await advise([{type: 'output_text', text: JSON.stringify({answer: 'a'.repeat(12000)})}])).answer.length, 12000);
+});
+
+test('advice preserves dispatch denial, billing mismatch and token guards', async () => {
+  let calls = 0;
+  const client = testClient(async () => { calls++; });
+  const gate = new Error('HELD');
+  await assert.rejects(client.advise({model, prompt: '相談', context, beforeSend: () => { throw gate; }}), gate);
+  assert.equal(calls, 0);
+  const content = [{type: 'output_text', text: JSON.stringify({answer: '相談結果'})}];
+  const advise = overrides => testClient(async () => fixture(completed(content, overrides))).advise({model, prompt: '相談', context});
+  await assert.rejects(advise({service_tier: 'priority'}), {code: 'API_SETTLEMENT_UNKNOWN'});
+  assert.deepEqual(await advise({usage: {input_tokens: 100, output_tokens: 2001}}),
+    {answer: null, accountedUsd: 0.016208, code: 'API_OUTPUT_UNUSABLE'});
+});
+
+test('unexpected action output leaves the price and advice unconfirmed', async () => {
+  const answer = '相談結果';
+  const message = {type: 'message', role: 'assistant', content: [{type: 'output_text', text: JSON.stringify({answer})}]};
+  let calls = 0;
+  const advise = output => testClient(async () => {
+    calls++;
+    return fixture(completed([], {output}));
+  }).advise({model, prompt: '相談', context});
+  await assert.rejects(advise([{type: 'web_search_call', status: 'completed'}, message]), {code: 'API_SETTLEMENT_UNKNOWN'});
+  assert.deepEqual(await advise([{type: 'reasoning', summary: []}, message]), {answer, accountedUsd: 0.0004, code: null});
+  assert.equal(calls, 2);
+});
+
+test('maximum job cost bounds single and double response reservations', () => {
+  assert.equal(maximumApiJobUsd(model, 1), 0.056);
+  assert.equal(maximumApiJobUsd(model, 2), 0.112);
+  assert.equal(maximumApiJobUsd(model), 0.112);
+  for (const rounds of [0, 3, 1.5, '1', Infinity]) {
+    assert.throws(() => maximumApiJobUsd(model, rounds), {code: 'API_ROUNDS_INVALID'});
+  }
 });

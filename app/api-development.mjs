@@ -1,10 +1,10 @@
 import {createHash} from 'node:crypto';
 import {constants, lstatSync, readFileSync, realpathSync, writeFileSync} from 'node:fs';
-import {open} from 'node:fs/promises';
+import {mkdir, open} from 'node:fs/promises';
 import {basename, join, resolve, sep} from 'node:path';
 import {readApiAuthority} from './api-authority.mjs';
-import {apiJobRounds, createApiResponseClient, maximumApiJobUsd} from './api-response.mjs';
-import {checkedEvidenceIsCurrent, prepareApiWorkspace, readCommittedEvidence} from './api-workspace.mjs';
+import {apiAdviceMaxLength, apiJobRounds, createApiResponseClient, maximumApiJobUsd} from './api-response.mjs';
+import {checkedEvidenceIsCurrent, prepareApiWorkspace, readAdvisoryWorkspace, readCommittedEvidence} from './api-workspace.mjs';
 import {STAGES, moneyMicros} from './execution-policy.mjs';
 import {readCurrentProject} from './portfolio.mjs';
 import {ensurePrivateDirectory} from './private-directory.mjs';
@@ -15,6 +15,7 @@ const held = new Set(['paused', 'approval', 'limit', 'blocked', 'offline', 'wait
 const sha = value => createHash('sha256').update(value).digest('hex');
 const digest = value => sha(JSON.stringify(value));
 const problem = (status, code) => Object.assign(new Error(code), {status, code});
+const isAdvisoryStage = stage => stage === 'consultation' || stage === 'design';
 const publicPhase = {reserved: 'reserved', running: 'running', uncertain: 'unconfirmed', awaiting_settlement: 'unconfirmed',
   completed: 'completed', failed: 'failed', interrupted: 'interrupted', cancelled: 'interrupted'};
 const terminalPhases = new Set(['completed', 'failed', 'interrupted']);
@@ -73,14 +74,14 @@ export function createApiDevelopment({directory, store, conversations, withProje
     return {...owned, authority, enrollment: authority.projects[projectId]};
   }
 
-  function context(authority, model) {
+  function context(authority, model, stage) {
     return {capabilities: {api: {available: true, executorId: 'owner-mac-responses', defaultModel: authority.defaultModel,
       models: authority.models}}, safety: {authorized: true, status: 'ready', allowedRoutes: ['api'], api: {
       organizationId: authority.organization, creditOrganizationId: authority.credit.organization,
       reservationAuthorityId: authority.reservationAuthorityId, ledgerBinding: authority.ledgerBinding,
       availableCreditUsd: authority.credit.availableCreditUsd, observedAt: authority.credit.observedAt,
       expiresAt: authority.credit.safeUntil, zeroAdditionalCostGuaranteed: true,
-      maxRequestCostUsd: maximumApiJobUsd(model),
+      maxRequestCostUsd: maximumApiJobUsd(model, isAdvisoryStage(stage) ? 1 : apiJobRounds),
     }}};
   }
 
@@ -102,17 +103,26 @@ export function createApiDevelopment({directory, store, conversations, withProje
     } catch { return null; }
   }
 
-  function verifiedReport(projectId, work) {
+  function completedReport(projectId, work) {
     if (work?.status !== 'completed') return null;
     const report = resultReport(work);
-    return report?.projectId === projectId && report.executionId === work.executionId && report.verification?.passed === true &&
-      Array.isArray(report.changes) && report.changes.length ? report : null;
+    if (report?.projectId !== projectId || report.executionId !== work.executionId || !Array.isArray(report.changes)) return null;
+    if (report.kind === 'advice') {
+      return isAdvisoryStage(work.task?.stage) && report.changes.length === 0 && report.candidate === null &&
+        typeof report.summary === 'string' && report.summary.trim() && report.summary.length <= apiAdviceMaxLength ? report : null;
+    }
+    return report.verification?.passed === true && report.changes.length ? report : null;
+  }
+
+  function verifiedReport(projectId, work) {
+    const report = completedReport(projectId, work);
+    return report?.changes.length ? report : null;
   }
 
   function retainedChanges(projectId, operations) {
     const changes = new Map();
     for (const work of operations) {
-      const report = verifiedReport(projectId, work);
+      const report = completedReport(projectId, work);
       if (!report) throw problem(409, 'API_CANDIDATE_HANDOVER_REQUIRED');
       for (const change of report.changes) changes.set(change.path, change);
     }
@@ -127,6 +137,7 @@ export function createApiDevelopment({directory, store, conversations, withProje
     return {operation: {id: work.taskId, project, route: 'api', stage: work.task?.stage, model: work.model, phase,
       createdAt: work.createdAt, startedAt: work.dispatchedAt ?? null, updatedAt: observedAt(work),
       result: output?.reason ?? work.reason ?? (phase === 'unconfirmed' ? 'API_SETTLEMENT_UNKNOWN' : null),
+      ...(work.status === 'completed' && output?.kind === 'advice' ? {advice: output.summary} : {}),
       verification: output?.verification ?? null, artifactCount: changes.length,
       changes: changes.map(({path, sha256, bytes}) => ({path, sha256, bytes}))}};
   }
@@ -137,11 +148,13 @@ export function createApiDevelopment({directory, store, conversations, withProje
     const report = outcome === 'completed' ? resultReport(work) : null;
     if (outcome === 'completed' && !report) throw problem(409, 'API_ARTIFACT_CHANGED');
     conversations.finishDevelopment(projectId, {id: work.executionId, outcome, summary: report?.summary ?? '',
-      updatedAt: observedAt(work)});
+      preserveSummary: report?.kind === 'advice', updatedAt: observedAt(work)});
   }
 
   async function run({projectId, operation, prior, scope, model, prompt, controller}) {
     const {executionId, taskId} = operation;
+    const stage = operation.task?.stage;
+    const advice = isAdvisoryStage(stage);
     const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(180_000)]);
     const jobRoot = join(artifacts, executionId);
     let dispatched = false;
@@ -150,10 +163,11 @@ export function createApiDevelopment({directory, store, conversations, withProje
     let baseSha = null;
     let verification = null;
     let finished = null;
+    let completed = false;
     let requirements = null;
     let summary = '';
     let conversationSaved = false;
-    let reason = 'API_VERIFICATION_FAILED';
+    let reason = advice ? 'API_OUTPUT_UNUSABLE' : 'API_VERIFICATION_FAILED';
     const fingerprint = binding(scope, model);
     const reauthorize = (forDispatch = true) => {
       signal.throwIfAborted();
@@ -172,9 +186,12 @@ export function createApiDevelopment({directory, store, conversations, withProje
       if (requirementsPath && scope.enrollment.files.some(file => file.path === requirementsPath && file.writable)) {
         throw problem(409, 'HANDOVER_REQUIREMENTS_CHANGED');
       }
-      const candidate = await prepareApiWorkspace({checkout: scope.checkout, jobRoot, files: scope.enrollment.files,
-        testPaths: scope.enrollment.testPaths, priorChanges: previousChanges, signal});
-      baseSha = candidate.context().baseSha;
+      const workspace = {checkout: scope.checkout, jobRoot, files: scope.enrollment.files,
+        testPaths: scope.enrollment.testPaths, priorChanges: previousChanges, signal};
+      const candidate = advice ? null : await prepareApiWorkspace(workspace);
+      const advisoryContext = advice ? await readAdvisoryWorkspace(workspace) : null;
+      if (advice) await mkdir(jobRoot, {mode: 0o700});
+      baseSha = advisoryContext?.baseSha ?? candidate.context().baseSha;
       if (requirementsPath) {
         const source = await checkedEvidence(scope.checkout, [requirementsPath], signal, 'HANDOVER_REQUIREMENTS_CHANGED');
         if (source.head !== baseSha) throw problem(409, 'HANDOVER_REQUIREMENTS_CHANGED');
@@ -182,11 +199,13 @@ export function createApiDevelopment({directory, store, conversations, withProje
       }
       const client = createApiResponseClient({key: getKey(), organization: scope.authority.organization,
         project: scope.authority.providerProject, fetchImpl});
-      for (let round = 0; round < apiJobRounds; round++) {
-        const answer = await client.propose({model, effort: operation.reasoningEffort, prompt, context: candidate.context(),
+      const respond = advice ? client.advise : client.propose;
+      for (let round = 0; round < (advice ? 1 : apiJobRounds); round++) {
+        const answer = await respond({model, effort: operation.reasoningEffort, prompt,
+          context: advice ? {...advisoryContext, requirements} : candidate.context(),
           feedback: verification?.output, signal, beforeSend: () => {
             const fresh = reauthorize();
-            const policy = context(fresh.authority, model);
+            const policy = context(fresh.authority, model, stage);
             const decision = dispatched ? store.recheckDispatched(projectId, taskId, executionId, policy)
               : store.markDispatched(projectId, taskId, executionId, policy);
             if (!decision.dispatchable) throw problem(409, decision.code);
@@ -196,8 +215,14 @@ export function createApiDevelopment({directory, store, conversations, withProje
         spentMicros += moneyMicros(answer.accountedUsd, 'ceil');
         awaitingReceipt = false;
         signal.throwIfAborted();
-        if (!answer.proposal || spentMicros > operation.reservedMicros) {
+        if (!(advice ? answer.answer : answer.proposal) || spentMicros > operation.reservedMicros) {
           reason = answer.code ?? 'API_RESERVATION_EXCEEDED';
+          break;
+        }
+        if (advice) {
+          summary = answer.answer;
+          completed = true;
+          reason = null;
           break;
         }
         await candidate.apply(answer.proposal.changes);
@@ -205,11 +230,7 @@ export function createApiDevelopment({directory, store, conversations, withProje
         signal.throwIfAborted();
         if (verification.passed) {
           const result = await candidate.finish();
-          if (requirements) {
-            const source = await checkedEvidence(scope.checkout, [requirements.path], signal, 'HANDOVER_REQUIREMENTS_CHANGED');
-            if (source.head !== baseSha || source.files[0].sha256 !== requirements.sha256) throw problem(409, 'HANDOVER_REQUIREMENTS_CHANGED');
-          }
-          if (result.changes.length) { finished = result; summary = answer.proposal.summary; reason = null; }
+          if (result.changes.length) { finished = result; summary = answer.proposal.summary; completed = true; reason = null; }
           else reason = 'API_NO_WORKSPACE_CHANGE';
           break;
         }
@@ -228,11 +249,21 @@ export function createApiDevelopment({directory, store, conversations, withProje
       archiveOutcome(projectId, saved.operation);
       return;
     }
-    if (finished) {
-      try { reauthorize(false); }
-      catch (cause) { finished = null; reason = signal.aborted ? 'INTERRUPTED' : cause.code ?? 'API_AUTHORITY_CHANGED'; }
+    if (completed) {
+      try {
+        if (requirements) {
+          const source = await checkedEvidence(scope.checkout, [requirements.path], signal, 'HANDOVER_REQUIREMENTS_CHANGED');
+          if (source.head !== baseSha || source.files[0].sha256 !== requirements.sha256) throw problem(409, 'HANDOVER_REQUIREMENTS_CHANGED');
+        }
+        reauthorize(false);
+      } catch (cause) {
+        finished = null;
+        completed = false;
+        reason = signal.aborted ? 'INTERRUPTED' : cause.code ?? 'API_AUTHORITY_CHANGED';
+      }
     }
-    const report = {executionId, projectId, baseSha, reason, verification, summary: finished ? summary : '', requirements,
+    const report = {executionId, projectId, baseSha, reason, verification, kind: advice ? 'advice' : 'development',
+      summary: completed ? summary : '', requirements,
       candidate: finished ? basename(finished.candidatePath) : null,
       changes: finished?.changes ?? []};
     const bytes = JSON.stringify(report);
@@ -243,7 +274,7 @@ export function createApiDevelopment({directory, store, conversations, withProje
       stopHash: digest({scope: fingerprint, phase: signal.aborted ? 'interrupted' : 'settled'}),
       budgetHash: digest({organization: scope.authority.organization, reservedMicros: operation.reservedMicros, spentMicros}),
       artifactsHash: sha(bytes)};
-    const saved = store.recordOutcome({projectId, taskId, executionId, outcome: signal.aborted ? 'interrupted' : finished ? 'completed' : 'failed',
+    const saved = store.recordOutcome({projectId, taskId, executionId, outcome: signal.aborted ? 'interrupted' : completed ? 'completed' : 'failed',
       confirmedTerminal: true, effectsReconciled: true, actualCostUsd: spentMicros / 1_000_000, checkpoint});
     archiveOutcome(projectId, saved.operation);
   }
@@ -271,7 +302,7 @@ export function createApiDevelopment({directory, store, conversations, withProje
     const predecessor = work.checkpointOperation;
     if (predecessor?.executionId !== receipt || predecessor.route !== 'api' || !work.checkpoint ||
         work.checkpoint.artifactsHash !== predecessor.artifactsHash) throw problem(409, 'HANDOVER_RECEIPT_STALE');
-    const report = verifiedReport(project.id, predecessor);
+    const report = completedReport(project.id, predecessor);
     if (!report) throw problem(409, 'API_CANDIDATE_HANDOVER_REQUIRED');
     if (!owned.current.handoverRequirements || !report.requirements) throw problem(409, 'HANDOVER_REQUIREMENTS_MISSING');
     if (report.requirements.path !== owned.current.handoverRequirements) throw problem(409, 'HANDOVER_REQUIREMENTS_CHANGED');
@@ -281,7 +312,7 @@ export function createApiDevelopment({directory, store, conversations, withProje
     const summary = archived?.messages[1];
     if (archived?.source !== 'api-development' || archived.outcome !== 'completed' || archived.model !== predecessor.model ||
         prompt?.role !== 'user' || sha(prompt.text) !== predecessor.instructionDigest ||
-        (report.summary ?? '').trim() !== (summary?.role === 'assistant' ? summary.text : '')) {
+        (report.kind === 'advice' ? report.summary : (report.summary ?? '').trim()) !== (summary?.role === 'assistant' ? summary.text : '')) {
       throw problem(409, 'HANDOVER_CONVERSATION_UNVERIFIED');
     }
     const signal = AbortSignal.timeout(12000);
@@ -386,7 +417,7 @@ export function createApiDevelopment({directory, store, conversations, withProje
         const model = scope.authority.models.find(item => item.id === (input.model ?? settings.model ?? scope.authority.defaultModel));
         if (!model) throw problem(409, 'MODEL_UNAVAILABLE');
         const receipt = store.prepareDispatch({projectId, taskId: input.id, instructionDigest: inputDigest, expectedRevision: revision, task},
-          context(scope.authority, model));
+          context(scope.authority, model, task.stage));
         if (!receipt.dispatchable) throw problem(409, receipt.code);
         const operation = receipt.operation;
         const controller = new AbortController();
