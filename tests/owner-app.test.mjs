@@ -8,7 +8,7 @@ import {ensurePrivateDirectory} from '../app/private-directory.mjs';
 
 const seed = {
   observedAt: '2026-11-27T06:25:00.000Z',
-  projects: [{id: 'example', name: '検証用プロジェクト', state: 'unknown', goal: '帰属範囲の確認', cwd: '/fixture-scope'}],
+  projects: [{id: 'example', name: '検証用プロジェクト', state: 'unknown', goal: '帰属範囲の確認', cwd: resolve(tmpdir(), 'fixture-scope')}],
   artifacts: [],
 };
 
@@ -21,7 +21,7 @@ async function fixture(t) {
   const app = await startOwnerApp({directory, port: 0, codex: {
     async listThreads(paths) {
       nativeReads++;
-      assert.deepEqual(paths, ['/fixture-scope']);
+      assert.deepEqual(paths, [resolve(tmpdir(), 'fixture-scope')]);
       return {data: [], nextCursor: null};
     },
   }});

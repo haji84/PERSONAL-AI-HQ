@@ -1,5 +1,5 @@
 import {lstat, readFile, realpath} from 'node:fs/promises';
-import {isAbsolute, join} from 'node:path';
+import {isAbsolute, join, resolve} from 'node:path';
 import {deliveryProgress} from './progress.mjs';
 
 export const projectKey = /^[a-z0-9][a-z0-9_.-]{0,79}$/i;
@@ -32,7 +32,7 @@ function normalizeProject(row, observedAt) {
   const name = text(row.name, 100);
   if (typeof id !== 'string' || !projectKey.test(id) || !name) throw new Error('Invalid project');
   const declared = Array.isArray(row.cwd) ? row.cwd : [row.cwd];
-  const cwd = [...new Set(declared.filter(value => typeof value === 'string' && isAbsolute(value)))].slice(0, 12);
+  const cwd = [...new Set(declared.filter(value => typeof value === 'string' && isAbsolute(value)).map(value => resolve(value)))].slice(0, 12);
   const metrics = row.measurements ?? {};
   const delivery = row.delivery ? deliveryProgress(row.delivery) : null;
   const computed = delivery?.counts;
