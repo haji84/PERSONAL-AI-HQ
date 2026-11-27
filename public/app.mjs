@@ -1341,6 +1341,7 @@ function projectForecastPanel(project) {
     details.append(node('p','small muted',forecast.source.label+' · '+forecast.source.revision.slice(0,12)));
   }
   const expanded=node('details','scope-info forecast-details');
+  expanded.dataset.dashboardDetail = 'forecast';
   expanded.append(node('summary','','残工程・見積もりの根拠'));
   const timings=node('dl','properties');
   const original=baseline.original??baseline.retrospective;
@@ -1457,6 +1458,7 @@ function projectDetail() {
   if (record?.requirementsReview === true) detail.body.append(requirementsReview(project));
   if (asArray(project.tasks).length) {
     const tasks = node('details', 'scope-info');
+    tasks.dataset.dashboardDetail = 'tasks';
     const rows = node('ul', 'task-progress-list');
     rows.append(...project.tasks.map(progressRow));
     tasks.append(node('summary', '', 'この案件の開発タスク'), rows);
@@ -4875,8 +4877,10 @@ function canRefreshVisibleDashboard() {
   if (document.hidden || dom.shell.hidden || ui.view !== 'dashboard' || !ui.portfolio || dom['refresh-button'].disabled) return false;
   const focused = document.activeElement;
   const editing = focused?.matches('input, select, textarea, [contenteditable="true"]');
+  const readingDetailLink = focused?.closest('details[data-dashboard-detail]') && !focused.matches('summary');
   const pairing = dom.content.querySelector('[data-pair-expires-at]');
-  return !editing && !dom.content.querySelector('details[open]:not(.forecast-details)') && !(Date.parse(pairing?.dataset.pairExpiresAt) > Date.now());
+  return !editing && !readingDetailLink && !dom.content.querySelector('details[open]:not([data-dashboard-detail])') &&
+    !(Date.parse(pairing?.dataset.pairExpiresAt) > Date.now());
 }
 async function refreshVisibleDashboard() {
   refreshEstimateReadouts();
@@ -4895,14 +4899,33 @@ async function refreshVisibleDashboard() {
       if (setObservedPortfolio(ui.portfolio, connection)) repaintDashboardExecutions();
       return;
     }
-    const focusedProject = document.activeElement?.dataset?.dashboardProject;
-    const forecastOpen = dom.content.querySelector('.forecast-details')?.open;
+    const focused = document.activeElement;
+    const focusedProject = focused?.dataset?.dashboardProject;
+    const focusedDetail = focused?.matches('summary') ? focused.parentElement.dataset.dashboardDetail : null;
+    const selected = ui.project;
+    const openDetails = [...dom.content.querySelectorAll('details[data-dashboard-detail][open]')];
+    const openNames = new Set(openDetails.map(detail => detail.dataset.dashboardDetail));
+    const visibleDetails = openDetails.filter(detail => {
+      const {top, bottom} = detail.getBoundingClientRect();
+      return top < innerHeight && bottom > 0;
+    });
+    const anchor = visibleDetails.find(detail => detail.contains(focused)) ?? visibleDetails[0];
+    const anchorTop = anchor?.getBoundingClientRect().top;
     rememberScroll();
     setObservedPortfolio(latest, connection);
     updateProjectSelect();
     render(true, true);
-    const forecastDetails = dom.content.querySelector('.forecast-details');
-    if (forecastOpen && forecastDetails) forecastDetails.open = true;
+    if (ui.project === selected) {
+      const details = [...dom.content.querySelectorAll('details[data-dashboard-detail]')];
+      for (const detail of details) {
+        if (openNames.has(detail.dataset.dashboardDetail)) detail.open = true;
+        if (focusedDetail === detail.dataset.dashboardDetail) detail.firstElementChild.focus({preventScroll: true});
+      }
+      const restoredAnchor = details.find(detail => detail.dataset.dashboardDetail === anchor?.dataset.dashboardDetail);
+      if (restoredAnchor?.open && pendingScroll) {
+        pendingScroll.y = Math.max(0, scrollY + restoredAnchor.getBoundingClientRect().top - anchorTop);
+      }
+    }
     if (focusedProject) dashboardProjectRow(focusedProject)?.focus({preventScroll: true});
   } catch {
     if (isCurrent()) dom['page-summary'].textContent = dashboardSummary() + ' · 更新できません。前回の情報を表示しています。';
