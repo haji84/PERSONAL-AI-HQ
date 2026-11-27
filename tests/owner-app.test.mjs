@@ -94,6 +94,9 @@ test('owner credentials are one-use and private API calls never expose the works
 });
 
 test('recent work outcomes survive sign-in and restart within the current authorized workspaces', async t => {
+  let receiptDatabase;
+  // Close the direct handle before the fixture removes the database on Windows.
+  t.after(() => receiptDatabase?.close());
   const {directory, start} = await runtimeFixture(t);
   const native = {
     async findSubmission() { assert.fail('The portfolio must never reconcile native submissions'); },
@@ -104,8 +107,8 @@ test('recent work outcomes survive sign-in and restart within the current author
   await writeFile(join(directory, 'portfolio.json'), JSON.stringify({...seed, projects: [...seed.projects, other]}), {mode: 0o600});
   const epoch = Date.now() - 60000;
   const at = value => new Date(epoch + value).toISOString();
-  const before = new DatabaseSync(join(directory, 'conversations.sqlite'));
-  const add = before.prepare(`INSERT INTO codex_operations
+  receiptDatabase = new DatabaseSync(join(directory, 'conversations.sqlite'));
+  const add = receiptDatabase.prepare(`INSERT INTO codex_operations
     (project,id,workspace,fingerprint,phase,threadId,turnId,createdAt,updatedAt,startedAt,output)
     VALUES (?,?,?,?,?,?,?,?,?,?,?)`);
   const fingerprint = 'a'.repeat(64);
@@ -131,9 +134,8 @@ test('recent work outcomes survive sign-in and restart within the current author
   put('example', 'malformed-time', 'failed', 115, {observed:'z-invalid'});
   put('example', 'future-result', 'completed', 116, {observed:at(120000)});
   put('example', 'invalid-sequence', 'failed', 117, {started:at(118)});
-  const allRows = () => before.prepare('SELECT * FROM codex_operations ORDER BY rowid').all();
+  const allRows = () => receiptDatabase.prepare('SELECT * FROM codex_operations ORDER BY rowid').all();
   const baseline = allRows();
-  t.after(() => before.close());
   const read = (app, cookie) => fetch(app.url + '/api/portfolio', {headers: cookie ? {cookie} : {}});
   assert.equal((await read(first)).status, 401);
   const signIn = await login(first);
