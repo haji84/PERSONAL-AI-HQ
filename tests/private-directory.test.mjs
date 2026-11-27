@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { ensurePrivateDirectory } from '../app/private-directory.mjs';
+import { ensurePrivateDirectory, readPrivateRuntimeToken } from '../app/private-directory.mjs';
 
 async function fixture(t) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'hq-private-test-'));
@@ -41,6 +41,44 @@ test('a redirected runtime directory is rejected', async t => {
   await assert.rejects(ensurePrivateDirectory(link), /private runtime/i);
 });
 
+test('WS credentials read only an owner file in the runtime directory, without changing it', async t => {
+  const root = await fs.realpath(await fixture(t));
+  const directory = path.join(root, 'runtime');
+  await ensurePrivateDirectory(directory);
+  const filename = path.join(directory, 'local.token');
+  const token = 'abC_'.repeat(16);
+  await fs.writeFile(filename, token + '\r\n', {mode: 0o600});
+  assert.equal(await readPrivateRuntimeToken(directory, filename), token);
+  assert.equal(await fs.readFile(filename, 'utf8'), token + '\r\n');
+  const outside = path.join(root, 'outside.token');
+  await fs.writeFile(outside, token + '\n', {mode: 0o600});
+  for (const invalid of [outside, 'local.token', path.join(directory, 'missing.token')]) {
+    await assert.rejects(readPrivateRuntimeToken(directory, invalid), /トークンを確認できません/);
+  }
+  assert.equal(await fs.readFile(outside, 'utf8'), token + '\n');
+  const alias = path.join(directory, 'alias.token');
+  await fs.link(filename, alias);
+  await assert.rejects(readPrivateRuntimeToken(directory, filename), /トークンを確認できません/);
+  await fs.unlink(alias);
+  await fs.writeFile(filename, token + ' \n', {mode: 0o600});
+  await assert.rejects(readPrivateRuntimeToken(directory, filename), /トークンを確認できません/);
+});
+
+test('POSIX WS token reading rejects broader access despite a valid token', {skip: process.platform === 'win32'}, async t => {
+  const root = await fs.realpath(await fixture(t)), directory = path.join(root, 'runtime');
+  await ensurePrivateDirectory(directory);
+  const filename = path.join(directory, 'local.token');
+  const token = 'EDv-'.repeat(16);
+  await fs.writeFile(filename, token, {mode: 0o600});
+  await fs.chmod(filename, 0o644);
+  await assert.rejects(readPrivateRuntimeToken(directory, filename), /トークンを確認できません/);
+  await fs.chmod(filename, 0o600);
+  if (process.platform === 'darwin') {
+    await promisify(execFile)('/bin/chmod', ['+a', 'everyone allow read', filename]);
+    await assert.rejects(readPrivateRuntimeToken(directory, filename), /トークンを確認できません/);
+  }
+});
+
 test('an existing directory that exposes future children is rejected without changing its ACL', { skip: process.platform !== 'win32' }, async t => {
   const root = await fixture(t), directory = path.join(root, 'runtime');
   await ensurePrivateDirectory(directory);
@@ -59,5 +97,31 @@ test('an existing directory that exposes future children is rejected without cha
   `);
   await assert.rejects(ensurePrivateDirectory(directory), /private runtime/i);
   const { stdout: after } = await run('[Console]::Out.Write(([IO.Directory]::GetAccessControl($env:HQ_TEST_ACL_DIRECTORY)).Sddl)');
+  assert.equal(after, before);
+});
+
+test('Windows rejects a token with a broadly readable file ACL while preserving that ACL', {skip: process.platform !== 'win32'}, async t => {
+  const root = await fs.realpath(await fixture(t)), directory = path.join(root, 'runtime');
+  await ensurePrivateDirectory(directory);
+  const filename = path.join(directory, 'local.token');
+  await fs.writeFile(filename, 'abcD'.repeat(16));
+  const powershell = path.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  const execute = promisify(execFile);
+  const run = command => execute(powershell, ['-NoProfile', '-NonInteractive', '-Command', command], {
+    windowsHide: true, env: {...process.env, HQ_TEST_PRIVATE_TOKEN_PATH: filename},
+  });
+  const {stdout: before} = await run(`
+    $file = $env:HQ_TEST_PRIVATE_TOKEN_PATH
+    $acl = [IO.File]::GetAccessControl($file)
+    $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+      [System.Security.Principal.SecurityIdentifier]::new('S-1-1-0'),
+      [System.Security.AccessControl.FileSystemRights]::Read,
+      [System.Security.AccessControl.AccessControlType]::Allow)
+    $acl.AddAccessRule($rule)
+    [IO.File]::SetAccessControl($file, $acl)
+    [Console]::Out.Write(([IO.File]::GetAccessControl($file)).Sddl)
+  `);
+  await assert.rejects(readPrivateRuntimeToken(directory, filename), /トークンを確認できません/);
+  const {stdout: after} = await run('[Console]::Out.Write(([IO.File]::GetAccessControl($env:HQ_TEST_PRIVATE_TOKEN_PATH)).Sddl)');
   assert.equal(after, before);
 });

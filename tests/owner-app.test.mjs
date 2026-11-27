@@ -88,6 +88,18 @@ test('owner credentials are one-use and private API calls never expose the works
   assert.equal(reads(), 1);
 });
 
+test('Codex loopback configuration refuses missing credentials, remote URLs and mixed transports', async t => {
+  const {directory, start} = await runtimeFixture(t);
+  const realDirectory = await realpath(directory);
+  const tokenFile = join(realDirectory, 'codex-local.token');
+  await writeFile(tokenFile, 'not_a_real_credential_'.repeat(3), {mode: 0o600});
+  await assert.rejects(start({directory: realDirectory, loopbackUrl: 'ws://127.0.0.1:3456'}), /ローカル接続先/);
+  await assert.rejects(start({directory: realDirectory, loopbackUrl: 'ws://127.0.0.1:3456',
+    loopbackTokenFile: tokenFile, socket: join(realDirectory, 'unused.sock')}), /ローカル接続先/);
+  await assert.rejects(start({directory: realDirectory, loopbackUrl: 'ws://192.0.2.1:3456', loopbackTokenFile: tokenFile}), error =>
+    error instanceof TypeError && !String(error).includes('not_a_real_credential'));
+});
+
 test('local speech runs only after an authenticated explicit request and returns uncached audio', {timeout: 15000}, async t => {
   const {directory, start} = await runtimeFixture(t);
   await writeFile(join(directory, 'portfolio.json'), JSON.stringify(seed), {mode: 0o600});

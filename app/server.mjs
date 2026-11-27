@@ -10,13 +10,14 @@ import {fileURLToPath, pathToFileURL} from 'node:url';
 import {pipeline} from 'node:stream/promises';
 import {readPortfolio} from './portfolio.mjs';
 import {createChatStore} from './chat-store.mjs';
-import {createCodexClient} from './codex.mjs';
+import {createCodexClient, isCodexLoopbackUrl} from './codex.mjs';
 import {createOperations} from './operations.mjs';
 import {createExecutionAccess} from './execution-access.mjs';
 import {createPlanAuth, PLAN_AUTH_CALLBACK_PATH} from './chatgpt-plan-auth.mjs';
 import {createChatGPTResponses} from './chatgpt-responses.mjs';
-import {ensurePrivateDirectory} from './private-directory.mjs';
+import {ensurePrivateDirectory, readPrivateRuntimeToken} from './private-directory.mjs';
 import {createApiDevelopment} from './api-development.mjs';
+import {createCodexPeerVerifier} from './codex-peer.mjs';
 import {localSpeechAvailable, localSpeechMaxChars, synthesizeLocalSpeech} from './local-speech.mjs';
 
 const root = fileURLToPath(new URL('../public/', import.meta.url));
@@ -134,10 +135,21 @@ async function checkedSocket(socket) {
   return target;
 }
 
-export async function startOwnerApp({directory = defaultRuntime, port = 4328, socket, codex, plan, apiDevelopment = false, speech} = {}) {
+export async function startOwnerApp({directory = defaultRuntime, port = 4328, socket, codex, plan, apiDevelopment = false, speech,
+  loopbackUrl, loopbackTokenFile} = {}) {
   directory = resolve(directory);
   await ensurePrivateDirectory(directory);
-  const native = codex ?? createCodexClient({socket: await checkedSocket(socket)});
+  let loopback;
+  if (loopbackUrl !== undefined || loopbackTokenFile !== undefined) {
+    if (socket !== undefined || codex || typeof loopbackUrl !== 'string' || typeof loopbackTokenFile !== 'string' ||
+        !loopbackUrl || !loopbackTokenFile) throw new Error('Codexのローカル接続先と本人専用トークンを指定してください。');
+    if (!isCodexLoopbackUrl(loopbackUrl)) throw new TypeError('Codexの接続先には端末内のループバックポートを指定してください。');
+    const [token, verifyPeer] = await Promise.all([
+      readPrivateRuntimeToken(directory, loopbackTokenFile), createCodexPeerVerifier(),
+    ]);
+    loopback = {url: loopbackUrl, token, verifyPeer};
+  }
+  const native = codex ?? createCodexClient({socket: await checkedSocket(socket), loopback});
   const chats = createChatStore(directory);
   const execution = createExecutionAccess(directory, native);
   const operations = createOperations(directory, native, execution, {
@@ -474,7 +486,8 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   const app = await startOwnerApp({directory: process.env.HQ_PRIVATE_DIRECTORY, port: Number(process.env.HQ_PORT ?? 4328),
-    socket: process.env.HQ_CODEX_SOCKET, plan: process.env.HQ_CHATGPT_PLAN === '1', apiDevelopment: process.env.HQ_API_EXECUTION === '1'});
+    socket: process.env.HQ_CODEX_SOCKET, plan: process.env.HQ_CHATGPT_PLAN === '1', apiDevelopment: process.env.HQ_API_EXECUTION === '1',
+    loopbackUrl: process.env.HQ_CODEX_LOOPBACK_URL, loopbackTokenFile: process.env.HQ_CODEX_LOOPBACK_TOKEN_FILE});
   console.log(JSON.stringify({url: app.url, signInFile: app.signInFile}));
   if (process.argv.includes('--open') && process.platform === 'darwin') {
     spawn('/usr/bin/open', [app.signInFile], {stdio: 'ignore'}).on('error', () => {});

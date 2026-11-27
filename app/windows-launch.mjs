@@ -17,7 +17,9 @@ if (!process.env.HQ_CODEX_BIN) {
   process.env.HQ_CODEX_BIN = command;
 }
 const { startOwnerApp } = await import('./server.mjs');
-const app = await startOwnerApp({ directory: process.env.HQ_PRIVATE_DIRECTORY, port: Number(process.env.HQ_PORT ?? 4328) });
-console.log(JSON.stringify({ url: app.url, signInFile: app.signInFile, codexWrite: false }));
+const loopbackUrl = process.env.HQ_CODEX_LOOPBACK_URL;
+const app = await startOwnerApp({ directory: process.env.HQ_PRIVATE_DIRECTORY, port: Number(process.env.HQ_PORT ?? 4328),
+  loopbackUrl, loopbackTokenFile: process.env.HQ_CODEX_LOOPBACK_TOKEN_FILE });
+console.log(JSON.stringify({ url: app.url, signInFile: app.signInFile, ...(loopbackUrl ? {} : {codexWrite: false}) }));
 process.once('SIGINT', () => { void app.close(); });
 process.once('SIGTERM', () => { void app.close(); });
