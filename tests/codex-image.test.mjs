@@ -166,3 +166,57 @@ test('image dispatch does not select another model or bypass project state', {sk
   assert.equal(writeCalls()[1][1].model, 'image-model');
   assert.equal(writeCalls()[1][1].input[1].url, `data:image/jpeg;base64,${jpeg}`);
 });
+
+test('document dispatch preserves UTF-8 prompt and reference text and binds both name and bytes to replay', {skip: process.platform === 'win32'}, async t => {
+  const {directory, call, run, writeCalls} = await fixture(t);
+  const document = {name: '見積もり 😺.CSV', text: '\ufeff\t 項目,数量\r\n  部材,2\r\n\t'};
+  const prompt = '\n資料を確認してください。 \t';
+  const request = {id: 'fixture-document', prompt, model: 'text-model', document};
+  assert.equal((await run(request)).status, 202);
+  const terminal = await readCompleted(call, request.id);
+  assert.equal(terminal.document, undefined);
+  assert.equal(JSON.stringify(terminal).includes(document.name), false);
+  assert.equal((await run({...request, document: {...document}})).status, 202);
+  assert.equal((await run({...request, document: {...document, name: '他の資料.csv'}})).status, 409);
+  assert.equal((await run({...request, document: {...document, text: document.text.trim()}})).status, 409);
+  assert.equal((await run({...request, document: undefined})).status, 409);
+  assert.deepEqual(writeCalls().map(([method]) => method), ['thread/start', 'turn/start']);
+  const {input, model, sandboxPolicy} = writeCalls()[1][1];
+  assert.equal(model, 'text-model');
+  assert.equal(sandboxPolicy.networkAccess, false);
+  assert.deepEqual(input[0], {type: 'text', text: prompt, text_elements: []});
+  assert.equal(input[1].type, 'text');
+  const [explanation, json] = input[1].text.split('\n', 2);
+  assert.match(explanation, /参考資料/);
+  assert.match(explanation, /指示/);
+  assert.deepEqual(JSON.parse(json), document);
+  const db = new DatabaseSync(join(directory, 'conversations.sqlite'), {readOnly: true});
+  try {
+    const row = db.prepare('SELECT * FROM codex_operations WHERE id = ?').get(request.id);
+    assert.equal(JSON.stringify(row).includes(document.name), false);
+    assert.equal(JSON.stringify(row).includes('部材'), false);
+  } finally { db.close(); }
+});
+
+test('document uploads reject path, suffix, binary data, dual attach and steering before reservation', {skip: process.platform === 'win32'}, async t => {
+  const {call, run, writeCalls} = await fixture(t);
+  const document = {name: '資料.md', text: '# 注記\r\n'};
+  const request = {id: 'fixture-document-reject', prompt: '資料の内容を確認してください。', document};
+  for (const bad of [null, [document], {name: '資料.md', url: 'file:///fixture.md'}, {...document, url: 'https://fixture.invalid'},
+    {...document, name: '../資料.md'}, {...document, name: 'dir\\資料.md'}, {...document, name: 'C:資料.md'},
+    {...document, name: '...'}, {...document, name: '資料.exe'}, {...document, name: '資料\n.md'},
+    {...document, name: '資料\u202e.md'}, {...document, name: `${'日'.repeat(85)}.txt`},
+    {...document, text: 'binary\0flag'}, {...document, text: '\ud800'},
+  ]) assert.equal((await run({...request, document: bad})).status, 400);
+  const limit = 16 * 1024;
+  const atLimit = '界'.repeat(Math.floor(limit / 3)) + '\n';
+  assert.equal(Buffer.byteLength(atLimit), limit);
+  assert.equal((await run({...request, document: {...document, text: atLimit + '\n'}})).status, 413);
+  assert.equal((await run({...request, image: image()})).status, 400);
+  assert.equal((await call('/api/codex/steer?project=fixture', {...request, operationId: 'active-native-turn'})).status, 400);
+  assert.equal(writeCalls().length, 0);
+  assert.equal((await run({...request, document: {...document, text: atLimit}})).status, 202);
+  await readCompleted(call, request.id);
+  const reference = writeCalls()[1][1].input[1].text;
+  assert.equal(JSON.parse(reference.split('\n', 2)[1]).text, atLimit);
+});

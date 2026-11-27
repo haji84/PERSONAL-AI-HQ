@@ -12,6 +12,10 @@ const receiptId = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
 const reviewHash = /^[a-f0-9]{64}$/;
 const imageByteLimit = 512 * 1024;
 const imageBase64Limit = 4 * Math.ceil(imageByteLimit / 3);
+const documentByteLimit = 16 * 1024;
+const documentExtension = /\.(?:txt|md|markdown|csv|json)$/i;
+const unsafeDocumentName = /[/\\<>:"|?*\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
+const binaryDocumentText = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/u;
 const pngMagic = Buffer.from('89504e470d0a1a0a', 'hex');
 const jpegMagic = Buffer.from('ffd8ff', 'hex');
 const imageSignatures = new Map([
@@ -38,6 +42,19 @@ function validatedImage(value) {
   if (bytes.toString('base64') !== data || !matches(bytes)) throw invalid();
   if (bytes.length > imageByteLimit) throw tooLarge();
   return {image: {mime, data}, digest: createHash('sha256').update(bytes).digest('hex')};
+}
+
+function validatedDocument(value) {
+  if (value === undefined) return null;
+  const invalid = () => problem(400, 'UTF-8のテキスト、Markdown、CSV、JSONの文書を1件指定してください。');
+  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length !== 2 ||
+      !Object.hasOwn(value, 'name') || !Object.hasOwn(value, 'text')) throw invalid();
+  const {name, text} = value;
+  if (typeof name !== 'string' || !name.isWellFormed() || Buffer.byteLength(name, 'utf8') > 255 ||
+      unsafeDocumentName.test(name) || !documentExtension.test(name) || typeof text !== 'string' ||
+      !text.isWellFormed() || binaryDocumentText.test(text)) throw invalid();
+  if (Buffer.byteLength(text, 'utf8') > documentByteLimit) throw problem(413, '文書は16 KiB以下にしてください。');
+  return {document: {name, text}, digest: createHash('sha256').update(text, 'utf8').digest('hex')};
 }
 
 export function createOperations(directory, native, execution, {prepareHandover} = {}) {
@@ -243,7 +260,9 @@ export function createOperations(directory, native, execution, {prepareHandover}
             typeof handover.review !== 'string' || !reviewHash.test(handover.review) || input.resume !== undefined || input.route !== 'subscription'))) {
         throw problem(400, '有効な指示を入力してください。');
       }
+      if (input.image !== undefined && input.document !== undefined) throw problem(400, '画像か文書のどちらか1件だけを添付してください。');
       const attachment = validatedImage(input.image);
+      const reference = validatedDocument(input.document);
       const previous = input.resume ? byId.get(project.id, input.resume) : null;
       const expected = await confirmedWorkspace(project);
       if (input.resume && (!previous?.threadId || !previous.turnId || !terminal.has(previous.phase) || previous.workspace !== expected)) {
@@ -253,6 +272,7 @@ export function createOperations(directory, native, execution, {prepareHandover}
       const identity = [input.prompt, input.model, input.effort, input.resume, ...choice];
       if (beginsHandover) identity.push(handover.receipt, handover.review);
       if (attachment) identity.push({mime: attachment.image.mime, sha256: attachment.digest});
+      if (reference) identity.push({name: reference.document.name, sha256: reference.digest});
       const digest = createHash('sha256').update(JSON.stringify(identity)).digest('hex');
       const duplicate = () => {
         const row = byId.get(project.id, input.id);
@@ -320,6 +340,7 @@ export function createOperations(directory, native, execution, {prepareHandover}
       } : undefined;
       void native.submit({workspace: expected, prompt: submittedPrompt, knownId: previous?.threadId,
         model: selection.model, effort: selection.effort, requestId: input.id, ...(attachment ? {image: attachment.image} : {}),
+        ...(reference ? {document: reference.document} : {}),
         beforeThread: maySubmit, ...(beforeTurn ? {beforeTurn} : {}),
         onThread: id => readyForTurn && maySubmit() && (!beginsHandover || stillCurrent?.() === true) &&
           setThread.run(id, timestamp(), project.id, input.id).changes === 1,
@@ -367,7 +388,8 @@ export function createOperations(directory, native, execution, {prepareHandover}
     async steer(project, input) {
       if (typeof input?.id !== 'string' || !allowedId.test(input.id) ||
           typeof input.operationId !== 'string' || !allowedId.test(input.operationId) ||
-          typeof input.prompt !== 'string' || !input.prompt.trim() || input.prompt.length > 16000 || input.image !== undefined) {
+          typeof input.prompt !== 'string' || !input.prompt.trim() || input.prompt.length > 16000 ||
+          input.image !== undefined || input.document !== undefined) {
         throw problem(400, '追加指示と対象の作業を指定してください。');
       }
       const workspace = await confirmedWorkspace(project);

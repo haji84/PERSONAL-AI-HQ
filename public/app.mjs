@@ -49,7 +49,7 @@ const ui = {
   options: new Map(Object.entries(saved.modelOptions ?? {})),
   scroll: new Map(Object.entries(savedTab.scroll ?? {})),
   drafts: new Map(Object.entries(savedTab.drafts ?? {})),
-  imageDrafts: new Map(),
+  attachmentDrafts: new Map(),
   searches: new Map(Object.entries(savedTab.searches ?? {})),
   runIntents: new Map(Object.entries(savedTab.runIntents ?? {})),
   steerIntents: new Map(Object.entries(savedTab.steerIntents ?? {})),
@@ -233,7 +233,7 @@ function endSession() {
   activities.clear();
   activitySession = undefined;
   resources.clear();
-  ui.imageDrafts.clear();
+  ui.attachmentDrafts.clear();
   ui.portfolio = null;
   dom.content.replaceChildren();
   gate('サインイン', 'この端末のサインイン用ファイルを開いてください。', true);
@@ -695,6 +695,13 @@ function messageBubble(item) {
   const box = node('div', 'message' + (user ? ' user' : ''));
   const label = (user ? 'あなた' : 'AI') + (item.createdAt ? ' · ' + time(item.createdAt) : '');
   box.append(node('span', 'small muted strong', label), node('p', '', text(item.text, '')));
+  if (user && typeof item.reference?.name === 'string' && typeof item.reference.text === 'string') {
+    const reference = node('details', 'scope-info');
+    const original = node('pre', 'run-output', item.reference.text);
+    original.tabIndex = 0;
+    reference.append(node('summary', '', item.reference.name), original);
+    box.append(reference);
+  }
   return box;
 }
 function messagesInto(parent, items, onTop) {
@@ -1243,9 +1250,19 @@ const apiWorkMessages = {
 const apiAdviceStages = {consultation: '相談', design: '設計'};
 const codexImageTypes = ['image/png', 'image/jpeg', 'image/webp'];
 const codexImageLimit = 512 * 1024;
+const codexDocumentLimit = 16 * 1024;
+const codexDocumentExtensions = ['.txt', '.md', '.markdown', '.csv', '.json'];
+const documentDecoder = new TextDecoder('utf-8', {fatal: true, ignoreBOM: true});
 
-async function imageDigest(bytes) {
-  const hash = await crypto.subtle.digest('SHA-256', bytes);
+async function attachmentDigest(bytes, filename = '') {
+  let input = bytes;
+  if (filename) {
+    const prefix = new TextEncoder().encode(filename + '\0');
+    input = new Uint8Array(prefix.length + bytes.length);
+    input.set(prefix);
+    input.set(bytes, prefix.length);
+  }
+  const hash = await crypto.subtle.digest('SHA-256', input);
   return Array.from(new Uint8Array(hash), byte => byte.toString(16).padStart(2, '0')).join('');
 }
 
@@ -1314,57 +1331,60 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
   actions.append(send, resume, steer, interrupt, recover, check, checkSteer, closeSteer);
   if (!advice) section.append(node('h3', '', apiMode ? '通常APIの開発操作' : 'Codex操作'));
   section.append(caption);
-  let imageControls;
-  let imageInput;
-  let imageInfo;
-  let removeImage;
-  let imageSequence = 0;
-  let imageMessage = '';
-  let imageReading = false;
+  let attachmentInput;
+  let attachmentInfo;
+  let removeAttachment;
+  let attachmentSequence = 0;
+  let attachmentMessage = '';
+  let readingAttachment = false;
   if (imageModel) {
-    imageControls = node('div', 'stack');
-    const imageLabel = node('label', 'picker');
-    imageInput = node('input');
-    imageInput.type = 'file';
-    imageInput.accept = codexImageTypes.join(',');
-    imageLabel.append(node('span', '', 'Codexへの画像添付'), imageInput);
-    imageInfo = node('p', 'small muted');
-    imageInfo.setAttribute('role', 'status');
-    removeImage = button('画像を外す', () => {
-      imageSequence++;
-      imageReading = false;
-      ui.imageDrafts.delete(draftKey);
-      imageMessage = '';
+    const attachmentControls = node('div', 'stack');
+    const attachmentLabel = node('label', 'picker');
+    attachmentInput = node('input');
+    attachmentInput.type = 'file';
+    attachmentLabel.append(node('span', '', 'Codexへの添付'), attachmentInput);
+    attachmentInfo = node('p', 'small muted');
+    attachmentInfo.setAttribute('role', 'status');
+    removeAttachment = button('添付を外す', () => {
+      attachmentSequence++;
+      readingAttachment = false;
+      ui.attachmentDrafts.delete(draftKey);
+      attachmentMessage = '';
       paint();
     });
-    imageInput.addEventListener('change', async () => {
-      const imageFile = imageInput.files?.[0];
-      if (!imageFile) return;
-      imageInput.value = '';
-      const sequence = ++imageSequence;
-      if (!codexImageTypes.includes(imageFile.type) || !imageFile.size || imageFile.size > codexImageLimit) {
-        imageReading = false;
-        imageMessage = '512 KiB以内のPNG、JPEG、WebPを選んでください。';
-        paint();
-        return;
+    attachmentInput.addEventListener('change', async () => {
+      const file = attachmentInput.files?.[0];
+      if (!file) return;
+      attachmentInput.value = '';
+      const sequence = ++attachmentSequence;
+      const extension = file.name.slice(file.name.lastIndexOf('.')).toLowerCase();
+      const kind = codexImageTypes.includes(file.type) ? 'image' : codexDocumentExtensions.includes(extension) ? 'document' : null;
+      readingAttachment = false;
+      if (kind === 'image' && !imageModel() && !currentIntent()?.imageSha256) {
+        attachmentMessage = '画像入力に対応するモデルを選んでください。';
+      } else if (!file.size || !kind || file.size > (kind === 'image' ? codexImageLimit : codexDocumentLimit)) {
+        attachmentMessage = '画像は512 KiB、UTF-8のテキスト資料は16 KiBまでです。';
+      } else {
+        readingAttachment = true;
+        attachmentMessage = '添付を照合しています。';
       }
-      imageReading = true;
-      imageMessage = '添付画像を照合しています。';
       paint();
+      if (!readingAttachment) return;
       try {
-        const bytes = await imageFile.arrayBuffer();
-        const digest = await imageDigest(bytes);
-        if (sequence !== imageSequence || !isCurrent()) return;
-        ui.imageDrafts.set(draftKey, {file: imageFile, digest});
-        imageMessage = '';
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        if (kind === 'document') documentDecoder.decode(bytes);
+        const digest = await attachmentDigest(bytes, kind === 'document' ? file.name : '');
+        if (sequence !== attachmentSequence || !isCurrent()) return;
+        ui.attachmentDrafts.set(draftKey, {kind, file, digest});
+        attachmentMessage = '';
       } catch {
-        if (sequence === imageSequence) imageMessage = '画像を読み取れませんでした。';
+        if (sequence === attachmentSequence) attachmentMessage = '添付を読み取れませんでした。';
       } finally {
-        if (sequence === imageSequence) { imageReading = false; paint(); }
+        if (sequence === attachmentSequence) { readingAttachment = false; paint(); }
       }
     });
-    imageControls.append(imageLabel, imageInfo, removeImage);
-    section.append(imageControls);
+    attachmentControls.append(attachmentLabel, attachmentInfo, removeAttachment);
+    section.append(attachmentControls);
   }
   section.append(status, details, warning, steeringStatus, actions, output, artifacts);
   area.body.append(section);
@@ -1383,7 +1403,7 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
       Boolean(run.operation.threadId && run.operation.turnId);
   }
   function hasRoom() {
-    return run.known && !imageReading && (!apiMode || apiReady()?.available === true) && !ui.runIntents.has(runKey) &&
+    return run.known && !readingAttachment && (!apiMode || apiReady()?.available === true) && !ui.runIntents.has(runKey) &&
       (!run.operation || finishedPhases.has(run.operation.phase));
   }
   function paint() {
@@ -1391,13 +1411,16 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
     clearTimeout(timer);
     const phase = run.operation?.phase;
     const intention = currentIntent();
-    if (imageControls) {
-      const image = ui.imageDrafts.get(draftKey);
-      imageControls.hidden = !imageModel() && !image && !intention?.imageSha256;
-      imageInput.disabled = !imageModel() && !intention?.imageSha256;
-      imageInfo.textContent = imageMessage || (image ? `${image.file.name} · ${Math.ceil(image.file.size / 1024)} KiB` :
-        intention?.imageSha256 ? '再送する場合は、同じ画像を選んでください。' : 'PNG、JPEG、WebPを1枚、512 KiBまで送れます。');
-      removeImage.hidden = !image;
+    if (attachmentInput) {
+      const attachment = ui.attachmentDrafts.get(draftKey);
+      const imageAvailable = Boolean(imageModel() || intention?.imageSha256);
+      attachmentInput.accept = [...codexDocumentExtensions, ...(imageAvailable ? codexImageTypes : [])].join(',');
+      const defaultMessage = imageAvailable ? '画像は512 KiB、UTF-8のテキスト資料は16 KiBまでです。' : 'UTF-8のテキスト資料を16 KiBまで添付できます。';
+      const retryMessage = intention?.imageSha256 ? '再送する場合は、同じ画像を選んでください。' :
+        intention?.documentSha256 ? '再送する場合は、同じファイルを選んでください。' : defaultMessage;
+      attachmentInfo.textContent = attachmentMessage || (attachment ?
+        `${attachment.file.name} · ${Math.ceil(attachment.file.size / 1024)} KiB` : retryMessage);
+      removeAttachment.hidden = !attachment;
     }
     const relevantOperation = matchesStage(run.operation) && (!intention || intention.id === run.operation?.id) ? run.operation : null;
     const otherWork = apiMode && ((!intention && ui.runIntents.has(runKey)) ||
@@ -1471,7 +1494,8 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
       if (intent?.id === operation.id) {
         ui.runIntents.delete(runKey);
         const key = intentDraftKey(intent);
-        if (intent.imageSha256 && ui.imageDrafts.get(key)?.digest === intent.imageSha256) ui.imageDrafts.delete(key);
+        const attachmentSha = intent.imageSha256 ?? intent.documentSha256;
+        if (attachmentSha && ui.attachmentDrafts.get(key)?.digest === attachmentSha) ui.attachmentDrafts.delete(key);
         if (text(ui.drafts.get(key), '').trim() === intent.prompt) {
           ui.drafts.delete(key);
           if (key === draftKey) run.clearDraft = intent.prompt;
@@ -1511,14 +1535,18 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
     run.message = '';
     run.onChange?.();
     try {
-      const {draftReceipt, imageSha256, ...request} = payload;
-      if (imageSha256) {
-        const image = ui.imageDrafts.get(intentDraftKey(payload));
-        if (image?.digest !== imageSha256) throw new Error('再送する画像を選んでください。');
-        const bytes = new Uint8Array(await image.file.arrayBuffer());
-        if (await imageDigest(bytes) !== imageSha256) throw new Error('送信する画像の内容が変わりました。');
+      const {draftReceipt, imageSha256, documentSha256, ...request} = payload;
+      const digest = imageSha256 ?? documentSha256;
+      if (digest) {
+        const attachment = ui.attachmentDrafts.get(intentDraftKey(payload));
+        if (attachment?.digest !== digest) throw new Error(imageSha256 ?
+          '再送する画像を選んでください。' : '再送するファイルを選んでください。');
+        const {file} = attachment;
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        if (await attachmentDigest(bytes, documentSha256 ? file.name : '') !== digest) throw new Error('送信する添付の内容が変わりました。');
         if (!isCurrent()) return;
-        request.image = {mime: image.file.type, data: imageBase64(bytes)};
+        if (imageSha256) request.image = {mime: file.type, data: imageBase64(bytes)};
+        else request.document = {name: file.name, text: documentDecoder.decode(bytes)};
       }
       const result = await api(apiPath(endpoint, {project}), {
         method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(request),
@@ -1585,8 +1613,8 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
 
   function sendSteering() {
     if (steer.hidden || run.busy || run.checking || !isCurrent() || ui.steerIntents.has(project)) return;
-    if (ui.imageDrafts.has(draftKey)) {
-      run.steerMessage = '添付した画像は、このスレッドの次のターンに送れます。';
+    if (ui.attachmentDrafts.has(draftKey)) {
+      run.steerMessage = '添付は、このスレッドの次のターンに送れます。';
       paint();
       return;
     }
@@ -1610,10 +1638,11 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
     if (handoff && !previous && (!review || (run.operation?.threadId && run.operation?.turnId))) return;
     const nativeOrigin = native?.origin();
     if (native && !nativeOrigin) return;
-    const image = ui.imageDrafts.get(draftKey);
-    const selectedImageModel = image && imageModel?.();
-    if (image && !selectedImageModel) {
-      run.message = apiMode ? '添付した画像はCodex操作から送信してください。' : '画像入力に対応するモデルを選んでください。';
+    const attachment = ui.attachmentDrafts.get(draftKey);
+    const isImage = attachment?.kind === 'image';
+    const selectedImageModel = isImage && imageModel?.();
+    if (attachment && (apiMode || (isImage && !selectedImageModel))) {
+      run.message = apiMode ? '添付はCodex操作から送信してください。' : '画像入力に対応するモデルを選んでください。';
       paint();
       return;
     }
@@ -1626,9 +1655,11 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
       return;
     }
     const intent = {id: crypto.randomUUID(), prompt, ...choices()};
-    if (image) {
-      intent.imageSha256 = image.digest;
+    if (isImage) {
+      intent.imageSha256 = attachment.digest;
       intent.model = selectedImageModel;
+    } else if (attachment) {
+      intent.documentSha256 = attachment.digest;
     }
     if (previous) {
       intent.resume = previous.id;
