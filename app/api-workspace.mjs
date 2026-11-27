@@ -72,25 +72,42 @@ async function exactFile(root, relative, { allowMissing = false } = {}) {
   throw new Error('Invalid API source path');
 }
 
-async function diskBytes({ current, stat }) {
-  const handle = await open(current, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+async function diskBytes({ current, stat }, maxBytes = MAX_FILE_BYTES) {
+  const handle = await open(current, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
   try {
     const observed = await handle.stat();
     if (
       !observed.isFile() || observed.nlink !== 1 || observed.dev !== stat.dev || observed.ino !== stat.ino
       || observed.uid !== stat.uid
-      || observed.size > MAX_FILE_BYTES
+      || observed.size > maxBytes
     ) throw new Error('API source file changed or exceeds its size limit');
-    const buffer = Buffer.alloc(MAX_FILE_BYTES + 1);
+    const buffer = Buffer.alloc(Math.min(maxBytes, observed.size) + 1);
     const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
     const after = await handle.stat();
-    if (after.size !== bytesRead || bytesRead > MAX_FILE_BYTES || after.ctimeMs !== observed.ctimeMs) {
+    if (after.size !== bytesRead || bytesRead > maxBytes || after.ctimeMs !== observed.ctimeMs) {
       throw new Error('API source file changed or exceeds its size limit');
     }
     return buffer.subarray(0, bytesRead);
   } finally {
     await handle.close();
   }
+}
+
+export async function readBoundedWorkspaceFile(root, relative, maxBytes) {
+  const parts = relative.split('/');
+  if (relative.length > 240 || parts.some(part => !/^[A-Za-z0-9._-]+$/.test(part) ||
+      part === '.' || part === '..' || /\.$/.test(part) || /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(part))) {
+    throw new Error('Invalid workspace evidence path');
+  }
+  const file = await exactFile(root, relative);
+  if (file.stat.size > maxBytes) throw new Error('Workspace evidence exceeds its size limit');
+  const bytes = await diskBytes(file, maxBytes);
+  const [named, actual] = await Promise.all([lstat(file.current), realpath(file.current)]);
+  if (!named.isFile() || named.nlink !== 1 || named.dev !== file.stat.dev || named.ino !== file.stat.ino ||
+      named.ctimeMs !== file.stat.ctimeMs || actual !== file.current) {
+    throw new Error('Workspace evidence changed during reading');
+  }
+  return bytes;
 }
 
 export function readOnlyGitInvocation(checkout, args) {

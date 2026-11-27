@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import {execFileSync} from 'node:child_process';
 import {createHash, randomUUID} from 'node:crypto';
-import {mkdir, mkdtemp, readFile, realpath, rm, writeFile} from 'node:fs/promises';
+import {link, mkdir, mkdtemp, readFile, realpath, rm, unlink, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {dirname, join} from 'node:path';
 import test from 'node:test';
@@ -15,7 +15,7 @@ const repository = 'https://github.com/fixture-owner/delivery-records';
 const ref = 'refs/heads/stable-test';
 const hash = value => createHash('sha256').update(value).digest('hex');
 
-async function fixture(t) {
+async function fixture(t, {versioned=true}={}) {
   const root = await mkdtemp(join(await realpath(tmpdir()), 'hq-delivery-'));
   t.after(() => rm(root, {recursive:true, force:true}));
   const directory = await ensurePrivateDirectory(join(root, 'runtime'));
@@ -25,8 +25,10 @@ async function fixture(t) {
     env:{...process.env, GIT_AUTHOR_NAME:'Fixture', GIT_AUTHOR_EMAIL:'fixture@example.invalid',
       GIT_COMMITTER_NAME:'Fixture', GIT_COMMITTER_EMAIL:'fixture@example.invalid',
       ...(date && {GIT_AUTHOR_DATE:date,GIT_COMMITTER_DATE:date})}, stdio:['ignore','pipe','pipe']}).trim();
-  git(['init', '-q', '-b', 'stable-test']);
-  git(['remote', 'add', 'origin', repository + '.git']);
+  if (versioned) {
+    git(['init', '-q', '-b', 'stable-test']);
+    git(['remote', 'add', 'origin', repository + '.git']);
+  }
   async function commit(files, date) {
     for (const [name, text] of Object.entries(files)) {
       const destination = join(checkout, name);
@@ -454,4 +456,126 @@ test('a registered local Git project adopts its own exact checkout without publi
   const rejected=(await readPortfolio(directory,undefined,true)).view.projects[0];
   assert.equal(rejected.forecast.goal,'Local goal');
   assert.equal(rejected.forecast.source,null);
+});
+
+test('an unversioned project reads its own bounded state, honors pending work, and never chooses an ambiguous workspace', async t => {
+  const {directory,checkout,configure}=await fixture(t,{versioned:false});
+  const file=join(checkout,'.codex','autonomy-state.json');
+  const canonical=join(checkout,'PLAN.md');
+  const proof=join(checkout,'proof.txt');
+  const row={id:'local',name:'Local work',goal:'Registration goal',cwd:[checkout]};
+  await configure([row]);
+  await mkdir(dirname(file));
+  await writeFile(canonical,'Existing plan');
+  await writeFile(proof,'Evidence saved here');
+  const state={version:1,status:'active',goal:{id:'local-delivery',title:'Local project plan'},
+    next_action:'Inspect the finished result',source:{path:'PLAN.md',sha256:hash('Existing plan')},
+    tasks:[
+      {id:'draft',status:'verified',actionable:false,depends_on:[],evidence:[{path:'proof.txt',sha256:hash('Evidence saved here')}]},
+      {id:'review',status:'pending',actionable:true,depends_on:['draft'],evidence:[]},
+    ],
+    delivery:{stage:'検証中',observationAt:new Date().toISOString(),scopeComplete:true,capacity:{calendar:'continuous'},
+      tasks:[{id:'review',remainingMinutes:{optimistic:4,standard:6,cautious:10},
+        estimate:{basis:'Saved output is ready for inspection',confidence:'medium'}}]}};
+  async function save() {
+    await writeFile(file,JSON.stringify(state));
+  }
+  const view=async ()=>(await readPortfolio(directory,undefined,true)).view.projects[0];
+  await save();
+  let result=await view();
+  assert.equal(result.forecast.goal,'Local project plan');
+  assert.equal(result.forecast.stage,'検証中');
+  assert.deepEqual(result.forecast.schedule.readyTaskIds,['review']);
+  assert.equal(result.forecast.schedule.workMinutes.standard,6);
+  assert.equal(result.forecast.source.revision,hash(await readFile(file)));
+  assert.equal(result.forecast.source.url,undefined);
+  assert.ok(!JSON.stringify(result).includes(JSON.stringify(checkout).slice(1,-1)));
+
+  const otherLink=join(directory,'alias-proof.txt');
+  await link(proof,otherLink);
+  result=await view();
+  assert.equal(result.forecast.tasks[0].unconfirmedCompletion,true);
+  assert.deepEqual(result.forecast.schedule.readyTaskIds,[]);
+  assert.equal(result.forecast.schedule.completionDates,null);
+  await unlink(otherLink);
+
+  const independentRepo=join(checkout,'independent');
+  await mkdir(independentRepo);
+  execFileSync('git',['init','-q',independentRepo]);
+  await writeFile(join(independentRepo,'proof.txt'),'Evidence saved here');
+  state.tasks[0].evidence[0].path='independent/proof.txt';
+  await save();
+  result=await view();
+  assert.equal(result.forecast.tasks[0].unconfirmedCompletion,true);
+  assert.deepEqual(result.forecast.schedule.readyTaskIds,[]);
+  state.tasks[0].evidence[0].path='proof.txt';
+  await save();
+
+  await writeFile(canonical,'Changed plan');
+  result=await view();
+  assert.equal(result.forecast.goal,'Registration goal');
+  assert.equal(result.forecast.source,null);
+  await writeFile(canonical,'Existing plan');
+
+  state.status='paused';
+  await save();
+  result=await view();
+  assert.equal(result.forecast.status,'paused');
+  assert.deepEqual(result.forecast.schedule.readyTaskIds,[]);
+  assert.equal(result.forecast.schedule.completionDates,null);
+
+  await configure([row,{...row,id:'another',name:'Another project'}]);
+  result=await view();
+  assert.equal(result.forecast.goal,'Registration goal');
+  assert.equal(result.forecast.source,null);
+
+  const nested=join(checkout,'nested');
+  await mkdir(nested);
+  await configure([row,{id:'nested',name:'Nested project',cwd:[nested]}]);
+  result=await view();
+  assert.equal(result.forecast.goal,'Registration goal');
+  assert.equal(result.forecast.source,null);
+  await configure([row]);
+
+  execFileSync('git',['init','-q',directory]);
+  result=await view();
+  assert.equal(result.forecast.goal,'Registration goal');
+  assert.equal(result.forecast.source,null);
+});
+
+test('the existing shared observation can carry a local project across devices by its registered ID', async t => {
+  const {directory,checkout,commit,configure,portfolioPath}=await fixture(t);
+  const id='registered-offline-project';
+  const observedAt=new Date().toISOString();
+  const task={id:'compare',status:'pending',actionable:true,remainingMinutes:{optimistic:4,standard:6,cautious:10},
+    estimate:{basis:'The saved evidence narrows the remaining check',confidence:'medium'}};
+  const localRecord={localProjectId:id,tasks:[task],delivery:{
+    stage:'Evidence check',scopeComplete:true,capacity:{calendar:'continuous'}}};
+  const path=initiative+'/portfolio-observation.json';
+  const saved=await commit({[path]:JSON.stringify({taskProgress:{observedAt,projects:[],localProjects:[localRecord]}})});
+  const local={id,name:'Same name'};
+  await configure([local,{id:'different',name:'Same name'}]);
+  const settings=JSON.parse(await readFile(portfolioPath,'utf8'));
+  settings.taskProgressSource={checkout,repository,ref};
+  await writeFile(portfolioPath,JSON.stringify(settings));
+  async function view() {return (await readPortfolio(directory,undefined,true)).view;}
+  let portfolio=await view();
+  let [matched,other]=portfolio.projects;
+  assert.equal(matched.forecast.stage,'Evidence check');
+  assert.equal(matched.forecast.schedule.workMinutes.standard,6);
+  assert.ok(matched.forecast.source.url.includes(saved));
+  assert.deepEqual(matched.forecast.schedule.readyTaskIds,[]);
+  assert.equal(matched.forecast.schedule.completionDates,null);
+  assert.equal(other.forecast.source,null);
+  assert.equal(portfolio.taskProgressSource.unmatched,0);
+
+  settings.projects[0].repository='http://github.com/fixture-owner/unrelated';
+  await writeFile(portfolioPath,JSON.stringify(settings));
+  portfolio=await view();
+  assert.equal(portfolio.projects[0].forecast.source,null);
+  assert.equal(portfolio.taskProgressSource.unmatched,1);
+
+  await commit({[path]:JSON.stringify({taskProgress:{
+    observedAt,projects:[],localProjects:[{...localRecord,repository}]}})});
+  assert.equal((await view()).taskProgressSource.status,'unavailable');
 });
