@@ -841,11 +841,12 @@ function messageBubble(item) {
   const box = node('div', 'message' + (user ? ' user' : ''));
   const label = (user ? 'あなた' : 'AI') + (item.createdAt ? ' · ' + time(item.createdAt) : '');
   box.append(node('span', 'small muted strong', label), node('p', '', text(item.text, '')));
-  if (user && typeof item.reference?.name === 'string' && typeof item.reference.text === 'string') {
+  const attachment = item.document ?? item.reference;
+  if (user && typeof attachment?.name === 'string' && typeof attachment.text === 'string') {
     const reference = node('details', 'scope-info');
-    const original = node('pre', 'run-output', item.reference.text);
+    const original = node('pre', 'run-output', attachment.text);
     original.tabIndex = 0;
-    reference.append(node('summary', '', item.reference.name), original);
+    reference.append(node('summary', '', attachment.name), original);
     box.append(reference);
   }
   if (!user && ui.view === 'chat' && ui.capabilities.localSpeech === true && typeof item.text === 'string' && item.text.trim()) {
@@ -935,7 +936,55 @@ function planComposer(project, onConversation) {
   const referenceLabel = node('label', 'picker');
   const reference = node('input');
   reference.type = 'checkbox';
-  referenceLabel.append(reference, node('span', '', '選択中の会話から最近の発言を引き継ぐ'));
+  referenceLabel.append(reference, node('span', '', '選択中の会話から最近の発言と資料を引き継ぐ'));
+  const attachmentField = node('div', 'stack');
+  const attachmentLabel = node('label', 'picker');
+  const attachmentInput = node('input');
+  attachmentInput.type = 'file';
+  attachmentInput.accept = textDocumentExtensions.join(',');
+  attachmentLabel.append(node('span', '', 'テキスト資料を添付（16 KiBまで）'), attachmentInput);
+  const attachmentStatus = node('span', 'small muted');
+  attachmentStatus.setAttribute('role', 'status');
+  let readingDocument = false;
+  let documentError = '';
+  let documentSelection = 0;
+  const attached = () => ui.attachmentDrafts.get(draftKey);
+  const currentAttachmentField = () => attachmentInput.isConnected && ui.view === 'chat' && ui.project === project;
+  const clearAttachment = button('添付を外す', () => {
+    documentSelection++;
+    readingDocument = false;
+    documentError = '';
+    ui.attachmentDrafts.delete(draftKey);
+    controls();
+  });
+  attachmentInput.addEventListener('change', async () => {
+    const file = attachmentInput.files?.[0];
+    if (!file) return;
+    attachmentInput.value = '';
+    const selection = ++documentSelection;
+    ui.attachmentDrafts.delete(draftKey);
+    readingDocument = true;
+    documentError = '';
+    controls();
+    const checkSelection = () => selection === documentSelection && currentAttachmentField();
+    try {
+      const ext = file.name.slice(file.name.lastIndexOf('.')).toLowerCase();
+      if (!file.size || file.size > textDocumentLimit || !textDocumentExtensions.includes(ext)) {
+        throw new Error('16 KiB以下のテキスト、Markdown、CSV、JSONを選んでください。');
+      }
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      let text;
+      try { text = documentDecoder.decode(bytes); }
+      catch { throw new Error('UTF-8で保存した資料を選んでください。'); }
+      const digest = await attachmentDigest(bytes, file.name);
+      if (checkSelection()) ui.attachmentDrafts.set(draftKey, {document: {name: file.name, text}, digest});
+    } catch (error) {
+      if (checkSelection()) documentError = error.message;
+    } finally {
+      if (checkSelection()) { readingDocument = false; controls(); }
+    }
+  });
+  attachmentField.append(attachmentLabel, attachmentStatus, clearAttachment);
   const output = node('pre', 'run-output');
   output.setAttribute('aria-label', 'ChatGPTの応答');
   output.tabIndex = 0;
@@ -962,7 +1011,7 @@ function planComposer(project, onConversation) {
   actions.append(send, stop, check, retry, discard);
   picks.append(modelLabel, referenceLabel, draftLabel);
   addDictation(picks, draft);
-  picks.append(actions, output);
+  picks.append(attachmentField, actions, output);
   area.body.append(status, signIn, picks);
   signIn.hidden = true;
   picks.hidden = true;
@@ -977,20 +1026,30 @@ function planComposer(project, onConversation) {
   function controls() {
     const active = chatStreams.get(project)?.controller;
     const pending = ui.chatIntents.get(project);
-    send.disabled = !canSend || Boolean(active) || Boolean(pending);
+    const attachment = attached();
+    const needsFile = Boolean(pending?.documentDigest) && pending.documentDigest !== attachment?.digest;
+    send.disabled = !canSend || Boolean(active) || Boolean(pending) || readingDocument || Boolean(documentError);
     stop.hidden = !active;
     check.hidden = !ui.chatTurns.has(project) || Boolean(active);
     retry.hidden = !pending || Boolean(active);
+    retry.disabled = readingDocument || needsFile;
     discard.hidden = retry.hidden;
     output.hidden = !output.textContent;
+    attachmentInput.disabled = Boolean(active) || (Boolean(pending) && !pending.documentDigest);
+    clearAttachment.hidden = !attachment && !documentError && !readingDocument;
+    clearAttachment.disabled = Boolean(active);
+    attachmentStatus.textContent = readingDocument ? '添付を照合しています。'
+      : documentError || (needsFile ? '再送するには最初と同じ資料を選んでください。' : attachment?.document.name ?? '');
   }
   function showTurn(turn, selectConversation = true) {
     if (!turn) { status.textContent = 'この受付番号の応答はまだ確認できません。'; return; }
     status.textContent = phaseText[turn.status] ?? '応答の状態を確認できません。';
     output.textContent = typeof turn.text === 'string' ? turn.text : '';
     const terminal = turn.status !== 'in_progress' && Object.hasOwn(phaseText, turn.status);
-    if (terminal && ui.chatIntents.get(project)?.id === turn.id) {
+    const intent = ui.chatIntents.get(project);
+    if (terminal && intent?.id === turn.id) {
       ui.chatIntents.delete(project);
+      if (intent.documentDigest && attached()?.digest === intent.documentDigest) ui.attachmentDrafts.delete(draftKey);
       storeTab();
     }
     if (selectConversation && turn.conversationId && terminal) {
@@ -1018,14 +1077,22 @@ function planComposer(project, onConversation) {
     }
     abortLocalDictation(draft);
     const id = crypto.randomUUID();
-    ui.chatIntents.set(project, {id, conversationId, model: model.value, prompt});
+    const attachment = attached();
+    ui.chatIntents.set(project, {id, conversationId, model: model.value, prompt,
+      ...(attachment ? {documentDigest: attachment.digest} : {})});
     ui.chatTurns.set(project, id);
     storeTab();
     void submitIntent();
   }
   async function submitIntent() {
     const intent = ui.chatIntents.get(project);
-    if (!intent || !canSend || chatStreams.has(project)) return;
+    if (!intent || !canSend || chatStreams.has(project) || readingDocument) return;
+    const {documentDigest, ...payload} = intent;
+    const attachment = attached();
+    if (documentDigest && documentDigest !== attachment?.digest) {
+      status.textContent = '最初と同じ資料を選んでから再送してください。';
+      return;
+    }
     const controller = new AbortController();
     const selected = ui.chatIds.get(project);
     chatStreams.set(project, {controller});
@@ -1034,7 +1101,8 @@ function planComposer(project, onConversation) {
     controls();
     try {
       const response = await fetch(apiPath('/api/chat/live', {project}), {method: 'POST', credentials: 'same-origin',
-        headers: {'Content-Type': 'application/json'}, body: JSON.stringify(intent),
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({...payload, ...(documentDigest ? {document: attachment.document} : {})}),
         signal: controller.signal});
       if (response.status === 401) endSession();
       if (!response.ok) {
@@ -1427,8 +1495,8 @@ const apiWorkMessages = {
 const apiAdviceStages = {consultation: '相談', design: '設計'};
 const codexImageTypes = ['image/png', 'image/jpeg', 'image/webp'];
 const codexImageLimit = 512 * 1024;
-const codexDocumentLimit = 16 * 1024;
-const codexDocumentExtensions = ['.txt', '.md', '.markdown', '.csv', '.json'];
+const textDocumentLimit = 16 * 1024;
+const textDocumentExtensions = ['.txt', '.md', '.markdown', '.csv', '.json'];
 const documentDecoder = new TextDecoder('utf-8', {fatal: true, ignoreBOM: true});
 
 async function attachmentDigest(bytes, filename = '') {
@@ -1535,11 +1603,11 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
       attachmentInput.value = '';
       const sequence = ++attachmentSequence;
       const extension = file.name.slice(file.name.lastIndexOf('.')).toLowerCase();
-      const kind = codexImageTypes.includes(file.type) ? 'image' : codexDocumentExtensions.includes(extension) ? 'document' : null;
+      const kind = codexImageTypes.includes(file.type) ? 'image' : textDocumentExtensions.includes(extension) ? 'document' : null;
       readingAttachment = false;
       if (kind === 'image' && !imageModel() && !currentIntent()?.imageSha256) {
         attachmentMessage = '画像入力に対応するモデルを選んでください。';
-      } else if (!file.size || !kind || file.size > (kind === 'image' ? codexImageLimit : codexDocumentLimit)) {
+      } else if (!file.size || !kind || file.size > (kind === 'image' ? codexImageLimit : textDocumentLimit)) {
         attachmentMessage = '画像は512 KiB、UTF-8のテキスト資料は16 KiBまでです。';
       } else {
         readingAttachment = true;
@@ -1591,7 +1659,7 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
     if (attachmentInput) {
       const attachment = ui.attachmentDrafts.get(draftKey);
       const imageAvailable = Boolean(imageModel() || intention?.imageSha256);
-      attachmentInput.accept = [...codexDocumentExtensions, ...(imageAvailable ? codexImageTypes : [])].join(',');
+      attachmentInput.accept = [...textDocumentExtensions, ...(imageAvailable ? codexImageTypes : [])].join(',');
       const defaultMessage = imageAvailable ? '画像は512 KiB、UTF-8のテキスト資料は16 KiBまでです。' : 'UTF-8のテキスト資料を16 KiBまで添付できます。';
       const retryMessage = intention?.imageSha256 ? '再送する場合は、同じ画像を選んでください。' :
         intention?.documentSha256 ? '再送する場合は、同じファイルを選んでください。' : defaultMessage;

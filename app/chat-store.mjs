@@ -63,14 +63,25 @@ function archiveView(row, offset = 0) {
     nextOffset: offset + 40 < messages.length ? offset + 40 : null};
 }
 
+const documentText = ({name, text}) => '添付資料（' + name + '）\n' + text;
+
+function providerMessage({role, text, document}) {
+  return {role, content: document ? [
+    {type: 'input_text', text}, {type: 'input_text', text: documentText(document)},
+  ] : text};
+}
+
 function boundedHistory(messages, budget = chatInputLimit) {
   const result = [];
   for (let at = messages.length - 1; at >= 0 && result.length < chatMessageLimit - 1 && budget > 0; at--) {
-    const message = messages[at];
+    const {document, ...message} = messages[at];
     const text = message.text.slice(0, Math.min(budget, 6000));
     if (!text.trim()) continue;
-    result.push({...message, text});
     budget -= text.length;
+    const attachmentLength = document ? documentText(document).length : 0;
+    const includeDocument = attachmentLength > 0 && attachmentLength <= budget;
+    if (includeDocument) budget -= attachmentLength;
+    result.push({...message, text, ...(includeDocument ? {document} : {})});
   }
   return result.reverse();
 }
@@ -97,7 +108,7 @@ export function createChatStore(directory, {now = Date.now} = {}) {
     );
     CREATE TABLE IF NOT EXISTS live_turns (
       project TEXT NOT NULL, id TEXT NOT NULL, conversation_id TEXT NOT NULL,
-      requested_conversation_id TEXT, model TEXT NOT NULL, prompt TEXT NOT NULL, text TEXT NOT NULL,
+      requested_conversation_id TEXT, model TEXT NOT NULL, prompt TEXT NOT NULL, text TEXT NOT NULL, document TEXT,
       status TEXT NOT NULL CHECK (status IN ('in_progress','completed','failed','incomplete','aborted','interrupted')),
       created_at TEXT NOT NULL, updated_at TEXT NOT NULL, lease_until INTEGER NOT NULL,
       PRIMARY KEY(project,id),
@@ -109,6 +120,9 @@ export function createChatStore(directory, {now = Date.now} = {}) {
     inTransaction(() => {
       if (!db.prepare('PRAGMA table_info(conversations)').all().some(({name}) => name === 'source')) {
         db.exec("ALTER TABLE conversations ADD COLUMN source TEXT NOT NULL DEFAULT 'chatgpt-export'");
+      }
+      if (!db.prepare('PRAGMA table_info(live_turns)').all().some(({name}) => name === 'document')) {
+        db.exec('ALTER TABLE live_turns ADD COLUMN document TEXT');
       }
     });
   } catch (error) {
@@ -130,7 +144,11 @@ export function createChatStore(directory, {now = Date.now} = {}) {
     SELECT c.id,c.title,c.updated_at,'chatgpt-live' FROM live_conversations c
       WHERE c.project=?1 AND (?2='' OR instr(lower(c.title),lower(?2))>0 OR instr(lower(c.history),lower(?2))>0 OR
         EXISTS(SELECT 1 FROM live_turns t WHERE t.project=c.project AND t.conversation_id=c.id AND
-          (instr(lower(t.prompt),lower(?2))>0 OR instr(lower(t.text),lower(?2))>0)))
+          (instr(lower(t.prompt),lower(?2))>0 OR instr(lower(t.text),lower(?2))>0 OR
+            CASE WHEN json_valid(t.document) THEN
+              instr(lower(json_extract(t.document,'$.name')),lower(?2))>0 OR
+              instr(lower(json_extract(t.document,'$.text')),lower(?2))>0
+            ELSE 0 END)))
     ) ORDER BY importedAt DESC,id LIMIT 250`);
   const get = db.prepare(`SELECT id,title,imported_at AS importedAt,messages,source FROM conversations WHERE project=? AND id=?`);
   const getLive = db.prepare(`SELECT id,title,updated_at AS importedAt,source_id AS sourceConversationId,history
@@ -138,22 +156,22 @@ export function createChatStore(directory, {now = Date.now} = {}) {
   const insertLive = db.prepare(`INSERT INTO live_conversations(project,id,title,updated_at,source_id,history) VALUES(?,?,?,?,?,?)`);
   const touchLive = db.prepare(`UPDATE live_conversations SET updated_at=? WHERE project=? AND id=?`);
   const getTurn = db.prepare(`SELECT id,conversation_id AS conversationId,requested_conversation_id AS requestedConversationId,
-    model,prompt,text,status,created_at AS createdAt,updated_at AS updatedAt FROM live_turns WHERE project=? AND id=?`);
-  const addTurn = db.prepare(`INSERT INTO live_turns(project,id,conversation_id,requested_conversation_id,model,prompt,text,status,created_at,updated_at,lease_until)
-    VALUES(?,?,?,?,?,?,'','in_progress',?,?,?)`);
+    model,prompt,text,document,status,created_at AS createdAt,updated_at AS updatedAt FROM live_turns WHERE project=? AND id=?`);
+  const addTurn = db.prepare(`INSERT INTO live_turns(project,id,conversation_id,requested_conversation_id,model,prompt,document,text,status,created_at,updated_at,lease_until)
+    VALUES(?,?,?,?,?,?,?,'','in_progress',?,?,?)`);
   const activeTurn = db.prepare(`SELECT 1 FROM live_turns WHERE project=? AND conversation_id=? AND status='in_progress'`);
   const activeProject = db.prepare(`SELECT 1 FROM live_turns WHERE project=? AND status='in_progress' AND lease_until>? LIMIT 1`);
   const hasStaleTurns = db.prepare(`SELECT 1 FROM live_turns WHERE project=? AND status='in_progress' AND lease_until<=? LIMIT 1`);
   const staleTurns = db.prepare(`UPDATE live_turns SET status='interrupted',updated_at=?
     WHERE project=? AND status='in_progress' AND lease_until<=?`);
   const saveTurn = db.prepare(`UPDATE live_turns SET status=?,text=?,updated_at=? WHERE project=? AND id=? AND status='in_progress'`);
-  const recentTurns = db.prepare(`SELECT prompt,text FROM live_turns WHERE project=? AND conversation_id=? AND status='completed'
+  const recentTurns = db.prepare(`SELECT prompt,text,document FROM live_turns WHERE project=? AND conversation_id=? AND status='completed'
     ORDER BY rowid DESC LIMIT 8`);
-  const page = db.prepare(`SELECT role,text,createdAt,status,turnId FROM (
-    SELECT rowid AS sequence,0 AS part,'user' AS role,prompt AS text,created_at AS createdAt,status,id AS turnId FROM live_turns
+  const page = db.prepare(`SELECT role,text,document,createdAt,status,turnId FROM (
+    SELECT rowid AS sequence,0 AS part,'user' AS role,prompt AS text,document,created_at AS createdAt,status,id AS turnId FROM live_turns
       WHERE project=?1 AND conversation_id=?2
     UNION ALL
-    SELECT rowid,1,'assistant',text,updated_at,status,id FROM live_turns
+    SELECT rowid,1,'assistant',text,NULL,updated_at,status,id FROM live_turns
       WHERE project=?1 AND conversation_id=?2 AND (text<>'' OR status<>'in_progress')
     ) ORDER BY sequence,part LIMIT ?3 OFFSET ?4`);
 
@@ -171,8 +189,8 @@ export function createChatStore(directory, {now = Date.now} = {}) {
 
   function turnView(row) {
     if (!row) return null;
-    const {requestedConversationId, ...turn} = row;
-    return turn;
+    const {requestedConversationId, document, ...turn} = row;
+    return document ? {...turn, document: {name: JSON.parse(document).name}} : turn;
   }
 
   function expireTurnLeases(project, time) {
@@ -209,7 +227,8 @@ export function createChatStore(directory, {now = Date.now} = {}) {
       const {history, ...details} = live;
       const snapshot = JSON.parse(history);
       const messages = snapshot.slice(offset, offset + 41);
-      messages.push(...page.all({1: project, 2: id, 3: 41 - messages.length, 4: Math.max(0, offset - snapshot.length)}));
+      const current = page.all({1: project, 2: id, 3: 41 - messages.length, 4: Math.max(0, offset - snapshot.length)});
+      messages.push(...current.map(({document, ...message}) => document ? {...message, document: JSON.parse(document)} : message));
       return {conversation: {...details, source: 'chatgpt-live', messages: messages.slice(0, 40)},
         nextOffset: messages.length > 40 ? offset + 40 : null};
     },
@@ -263,19 +282,23 @@ export function createChatStore(directory, {now = Date.now} = {}) {
       });
     },
     hasActiveLive: project => Boolean(activeProject.get(project, now())),
-    beginLive(project, {id, conversationId = null, model, prompt}, beforeReserve) {
+    beginLive(project, {id, conversationId = null, model, prompt, document}, beforeReserve) {
       if (typeof id !== 'string' || !idPattern.test(id) || typeof model !== 'string' ||
           !chatModelPattern.test(model) || typeof prompt !== 'string' || !prompt.trim() || prompt.length > 12000 ||
           (conversationId !== null && (typeof conversationId !== 'string' ||
-            (!idPattern.test(conversationId) && !liveIdPattern.test(conversationId))))) {
+            (!idPattern.test(conversationId) && !liveIdPattern.test(conversationId)))) ||
+          (document !== undefined && (!document || typeof document.name !== 'string' || typeof document.text !== 'string' ||
+            prompt.length + documentText(document).length > chatInputLimit))) {
         throw storeError(400, 'INVALID_CHAT_REQUEST', 'チャットの入力が正しくありません。');
       }
+      const savedDocument = document ? JSON.stringify({name: document.name, text: document.text}) : null;
       return inTransaction(() => {
         const time = now();
         expireTurnLeases(project, time);
         const previous = getTurn.get(project, id);
         if (previous) {
-          if (previous.requestedConversationId !== conversationId || previous.model !== model || previous.prompt !== prompt) {
+          if (previous.requestedConversationId !== conversationId || previous.model !== model || previous.prompt !== prompt ||
+              previous.document !== savedDocument) {
             throw storeError(409, 'CHAT_REQUEST_CONFLICT', 'この送信IDは別の入力に使用されています。');
           }
           return {turn: turnView(previous), duplicate: true};
@@ -297,12 +320,14 @@ export function createChatStore(directory, {now = Date.now} = {}) {
           insertLive.run(project, liveId, source?.title ?? title(prompt), createdAt, source?.id ?? null, JSON.stringify(snapshot));
         }
         const recent = recentTurns.all(project, liveId).reverse().flatMap(row => [
-          {role: 'user', text: row.prompt}, {role: 'assistant', text: row.text},
+          {role: 'user', text: row.prompt, ...(row.document ? {document: JSON.parse(row.document)} : {})},
+          {role: 'assistant', text: row.text},
         ]);
-        const history = boundedHistory([...snapshot, ...recent], chatInputLimit - prompt.length);
-        const messages = history.map(({role, text}) => ({role, content: text}));
-        messages.push({role: 'user', content: prompt});
-        addTurn.run(project, id, liveId, conversationId, model, prompt, createdAt, createdAt, time + liveLease);
+        const history = boundedHistory([...snapshot, ...recent],
+          chatInputLimit - prompt.length - (document ? documentText(document).length : 0));
+        const messages = history.map(providerMessage);
+        messages.push(providerMessage({role: 'user', text: prompt, document}));
+        addTurn.run(project, id, liveId, conversationId, model, prompt, savedDocument, createdAt, createdAt, time + liveLease);
         touchLive.run(createdAt, project, liveId);
         return {turn: turnView(getTurn.get(project, id)), duplicate: false, messages};
       });

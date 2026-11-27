@@ -3,6 +3,7 @@ import {lstat, readFile, realpath} from 'node:fs/promises';
 import {join} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
 import {ROUTES, STAGES} from './execution-policy.mjs';
+import {validatedDocument} from './text-attachment.mjs';
 
 const active = new Set(['reserved', 'sending', 'running', 'interrupting', 'unconfirmed']);
 const terminal = new Set(['completed', 'interrupted', 'failed']);
@@ -12,10 +13,6 @@ const receiptId = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
 const reviewHash = /^[a-f0-9]{64}$/;
 const imageByteLimit = 512 * 1024;
 const imageBase64Limit = 4 * Math.ceil(imageByteLimit / 3);
-const documentByteLimit = 16 * 1024;
-const documentExtension = /\.(?:txt|md|markdown|csv|json)$/i;
-const unsafeDocumentName = /[/\\<>:"|?*\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
-const binaryDocumentText = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/u;
 const pngMagic = Buffer.from('89504e470d0a1a0a', 'hex');
 const jpegMagic = Buffer.from('ffd8ff', 'hex');
 const imageSignatures = new Map([
@@ -42,19 +39,6 @@ function validatedImage(value) {
   if (bytes.toString('base64') !== data || !matches(bytes)) throw invalid();
   if (bytes.length > imageByteLimit) throw tooLarge();
   return {image: {mime, data}, digest: createHash('sha256').update(bytes).digest('hex')};
-}
-
-function validatedDocument(value) {
-  if (value === undefined) return null;
-  const invalid = () => problem(400, 'UTF-8のテキスト、Markdown、CSV、JSONの文書を1件指定してください。');
-  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length !== 2 ||
-      !Object.hasOwn(value, 'name') || !Object.hasOwn(value, 'text')) throw invalid();
-  const {name, text} = value;
-  if (typeof name !== 'string' || !name.isWellFormed() || Buffer.byteLength(name, 'utf8') > 255 ||
-      unsafeDocumentName.test(name) || !documentExtension.test(name) || typeof text !== 'string' ||
-      !text.isWellFormed() || binaryDocumentText.test(text)) throw invalid();
-  if (Buffer.byteLength(text, 'utf8') > documentByteLimit) throw problem(413, '文書は16 KiB以下にしてください。');
-  return {document: {name, text}, digest: createHash('sha256').update(text, 'utf8').digest('hex')};
 }
 
 export function createOperations(directory, native, execution, {prepareHandover} = {}) {

@@ -20,6 +20,7 @@ import {createApiDevelopment} from './api-development.mjs';
 import {createCodexPeerVerifier} from './codex-peer.mjs';
 import {localSpeechAvailable, localSpeechMaxChars, synthesizeLocalSpeech} from './local-speech.mjs';
 import {createTailnetAccess, tailnetCookieName} from './tailnet-access.mjs';
+import {validatedDocument} from './text-attachment.mjs';
 
 const root = fileURLToPath(new URL('../public/', import.meta.url));
 const assets = new Map([['/', ['index.html', 'text/html']], ['/app.mjs', ['app.mjs', 'text/javascript']],
@@ -188,6 +189,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
         typeof input.id !== 'string' || typeof input.prompt !== 'string' || !input.prompt.trim() || input.prompt.length > 16000) {
       throw error(400, '会話の入力とモデルを指定してください。');
     }
+    const attachment = validatedDocument(input.document);
     const controller = new AbortController();
     liveRequests.add(controller);
     const cancel = () => controller.abort();
@@ -214,7 +216,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
           throw error(409, '実行経路が更新されました。もう一度確認してください。');
         }
       };
-      request = chats.beginLive(project.id, input, confirmRoute);
+      request = chats.beginLive(project.id, {...input, document: attachment?.document}, confirmRoute);
       response.writeHead(200, {'Content-Type': 'text/event-stream; charset=utf-8'});
       if (request.duplicate) {
         await publish({type: 'done', turn: request.turn});
@@ -460,7 +462,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
     }
     if (route === '/api/chat/live') {
       if (get) return send(response, 200, {turn: chats.readLive(project.id, target.searchParams.get('id'))});
-      if (post) return liveChat(project, await jsonBody(request, 64000), response);
+      if (post) return liveChat(project, await jsonBody(request, 96 * 1024), response);
     }
     if (post && route === '/api/chat/speech') {
       if (target.searchParams.getAll('project').length !== 1) throw error(404, '案件を指定してください。');

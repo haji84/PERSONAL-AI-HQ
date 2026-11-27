@@ -141,12 +141,18 @@ export function createChatGPTResponses({auth, fetchImpl = globalThis.fetch}) {
       let inputLength = 0;
       const input = messages.map(message => {
         const {role, content} = message ?? {};
-        if ((role !== 'user' && role !== 'assistant') || typeof content !== 'string' || !content.trim()) {
+        if (role !== 'user' && role !== 'assistant') throw new ChatGPTPlanError('CHATGPT_PLAN_INVALID_REQUEST');
+        let parts;
+        if (typeof content === 'string' && content.trim()) parts = [content];
+        else if (role === 'user' && Array.isArray(content) && content.length === 2 &&
+            content.every(part => part?.type === 'input_text' && typeof part.text === 'string' && part.text.trim())) {
+          parts = content.map(part => part.text);
+        } else {
           throw new ChatGPTPlanError('CHATGPT_PLAN_INVALID_REQUEST');
         }
-        inputLength += content.length;
+        inputLength += parts.reduce((length, part) => length + part.length, 0);
         if (inputLength > chatInputLimit) throw new ChatGPTPlanError('CHATGPT_PLAN_INVALID_REQUEST');
-        return {role, content};
+        return {role, content: typeof content === 'string' ? content : parts.map(text => ({type: 'input_text', text}))};
       });
 
       const response = await request('/responses', {signal, beforeSend, body: {model, input, store: false, stream: true}});

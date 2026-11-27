@@ -5,6 +5,7 @@ import {basename, dirname, join} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
 import test from 'node:test';
 import {createChatStore} from '../app/chat-store.mjs';
+import {chatInputLimit} from '../app/chatgpt-responses.mjs';
 
 const request = {id: 'request-1', model: 'fixture-model', prompt: '新しい質問'};
 
@@ -132,4 +133,92 @@ test('reserves only after a synchronous routing check and can inspect active tur
   }
   store.finishLive('project', request.id, {status: 'failed', text: '途中までの回答'});
   assert.equal(store.hasActiveLive('project'), false);
+});
+
+test('migrates old live rows and retains exact document identity, history and replay across connections', async t => {
+  const unit = await fixture(t);
+  const oldRequest = {...request, id: 'old-request'};
+  const previous = unit.store();
+  previous.beginLive('example', oldRequest);
+  const oldTurn = previous.finishLive('example', oldRequest.id, {status: 'completed', text: '以前の回答'});
+  unit.close(previous);
+
+  const oldSchema = unit.database();
+  if (oldSchema.prepare('PRAGMA table_info(live_turns)').all().some(({name}) => name === 'document')) {
+    oldSchema.exec('ALTER TABLE live_turns DROP COLUMN document');
+  }
+  unit.close(oldSchema);
+
+  const first = unit.store();
+  const second = unit.store();
+  assert.deepEqual(first.readLive('example', oldRequest.id), oldTurn);
+  const document = {name: '元資料.csv', text: '\ufeff項目,数量\r\n部材,2\r\n'};
+  const attached = {...request, document};
+  const {turn, messages} = first.beginLive('example', attached);
+  const userMessage = {role: 'user', content: [
+    {type: 'input_text', text: attached.prompt},
+    {type: 'input_text', text: '添付資料（元資料.csv）\n' + document.text},
+  ]};
+  assert.deepEqual(messages, [userMessage]);
+  assert.deepEqual(turn.document, {name: document.name});
+  assert.deepEqual(second.beginLive('example', {...attached, document: {text: document.text, name: document.name}},
+    () => assert.fail('duplicate should not reserve')), {duplicate: true, turn});
+  for (const mismatch of [undefined, {...document, name: '同じ内容.csv'}, {...document, text: document.text.replaceAll('\r\n', '\n')}]) {
+    assert.throws(() => second.beginLive('example', {...attached, document: mismatch}), {status: 409, code: 'CHAT_REQUEST_CONFLICT'});
+  }
+  assert.equal(second.readLive('other', attached.id), null);
+  assert.equal(second.read('other', turn.conversationId, 0), null);
+  assert.throws(() => second.beginLive('other', {...request, conversationId: turn.conversationId}), {status: 404});
+  const finished = first.finishLive('example', attached.id, {status: 'completed', text: '資料を確認しました'});
+  unit.close(first);
+  unit.close(second);
+  const reopened = unit.store();
+  assert.deepEqual(reopened.readLive('example', attached.id), finished);
+  assert.deepEqual(reopened.read('example', turn.conversationId, 0).conversation.messages[0],
+    {role: 'user', text: attached.prompt, document, createdAt: turn.createdAt, status: 'completed', turnId: attached.id});
+  assert.equal(reopened.read('example', turn.conversationId, 1).conversation.messages[0].document, undefined);
+  for (const query of ['元資料.CSV', '数量\r\n部材']) {
+    assert.deepEqual(reopened.list('example', query).conversations.map(row => row.id), [turn.conversationId]);
+    assert.deepEqual(reopened.list('other', query).conversations, []);
+  }
+  assert.ok(reopened.list('example', oldRequest.prompt).conversations.some(row => row.id === oldTurn.conversationId));
+
+  const followup = {...request, id: 'request-followup', conversationId: turn.conversationId, prompt: '続き'};
+  assert.deepEqual(reopened.beginLive('example', followup).messages, [
+    userMessage, {role: 'assistant', content: '資料を確認しました'}, {role: 'user', content: '続き'},
+  ]);
+  reopened.finishLive('example', followup.id, {status: 'completed', text: '続きを確認しました'});
+  const interruptedDocument = {name: '中断資料.txt', text: '次の会話に出さない'};
+  const interrupted = {...followup, id: 'interrupted-request', document: interruptedDocument};
+  reopened.beginLive('example', interrupted);
+  reopened.finishLive('example', interrupted.id, {status: 'interrupted', text: '途中'});
+  const continued = reopened.beginLive('example', {...followup, id: 'after-interrupt'});
+  assert.equal(continued.messages.length, 5);
+  assert.equal(JSON.stringify(continued.messages).includes(interruptedDocument.text), false);
+  const interruptedHistory = reopened.read('example', turn.conversationId, 4).conversation.messages;
+  assert.deepEqual(interruptedHistory[0].document, interruptedDocument);
+  assert.equal(interruptedHistory[1].text, '途中');
+});
+
+test('provider context omits an oversized prior attachment without altering saved history', async t => {
+  const unit = await fixture(t);
+  const store = unit.store();
+  const document = {name: '大きい資料.txt', text: 'x'.repeat(16 * 1024)};
+  const {turn} = store.beginLive('example', {...request, document});
+  const reply = '応'.repeat(6000);
+  store.finishLive('example', request.id, {status: 'completed', text: reply});
+  const next = {id: 'request-bound', model: request.model, conversationId: turn.conversationId,
+    prompt: '問'.repeat(12000), document: {name: '追加.txt', text: 'y'.repeat(16 * 1024)}};
+  const {messages} = store.beginLive('example', next);
+  assert.equal(messages.length, 3);
+  assert.deepEqual(messages[0], {role: 'user', content: request.prompt});
+  assert.equal(messages[1].role === 'assistant' && messages[1].content === reply, true, 'prior answer remains intact');
+  assert.equal(messages[2].role, 'user');
+  assert.ok(Array.isArray(messages[2].content));
+  assert.deepEqual(messages[2].content.map(part => part.type), ['input_text', 'input_text']);
+  assert.equal(messages[2].content[0].text === next.prompt, true, 'current prompt remains intact');
+  assert.equal(messages[2].content[1].text === '添付資料（追加.txt）\n' + next.document.text, true, 'current attachment remains intact');
+  assert.ok(messages.reduce((sum, {content}) => sum + (Array.isArray(content) ?
+    content.reduce((length, part) => length + part.text.length, 0) : content.length), 0) <= chatInputLimit);
+  assert.deepEqual(store.read('example', turn.conversationId, 0).conversation.messages[0].document, document);
 });

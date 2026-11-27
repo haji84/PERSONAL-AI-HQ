@@ -53,6 +53,20 @@ test('posts only the text input, never follows redirects, and decodes split UTF-
   assert.deepEqual(await collect(client, controller.signal), ['日本', '語']);
 });
 
+test('sends the prompt and the exact attached text as two parts of the same user message', async () => {
+  const input = [{role: 'assistant', content: '前の返答'}, {role: 'user', content: [
+    {type: 'input_text', text: 'この資料を読んで'}, {type: 'input_text', text: '添付資料（日本語.csv）\n\uFEFFa,b\r\n1,2\r\n'},
+  ]}];
+  let requests = 0;
+  const client = createChatGPTResponses({auth, fetchImpl: async (_url, init) => {
+    requests++;
+    assert.deepEqual(JSON.parse(init.body), {model, input, store: false, stream: true});
+    return sse([encode.encode(event('response.completed', {response: {status: 'completed'}}))]);
+  }});
+  assert.equal((await client.stream({model, messages: input}).next()).done, true);
+  assert.equal(requests, 1);
+});
+
 test('requires a complete official terminal event and preserves prior partial chunks', async () => {
   for (const [terminal, code] of [
     ['', 'CHATGPT_PLAN_INTERRUPTED'],
@@ -88,6 +102,8 @@ test('keeps abort distinct from network interruptions and never retries', async 
 test('rejects unbounded text and non-text prompts without contacting the endpoint', async () => {
   const client = createChatGPTResponses({auth, fetchImpl: async () => assert.fail('network dependency called')});
   for (const input of [[{role: 'system', content: 'system'}], [{role: 'user', content: [{type: 'input_image'}]}],
+    [{role: 'assistant', content: [{type: 'input_text', text: 'text'}, {type: 'input_text', text: 'document'}]}],
+    [{role: 'user', content: [{type: 'input_text', text: 'x'.repeat(47000)}, {type: 'input_text', text: 'x'.repeat(2000)}]}],
     [{role: 'user', content: 'x'.repeat(100000)}]]) {
     await assert.rejects(async () => client.stream({model, messages: input}).next(), {code: 'CHATGPT_PLAN_INVALID_REQUEST'});
   }
