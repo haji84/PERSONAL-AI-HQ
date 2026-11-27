@@ -1,7 +1,8 @@
 const isMinutes = value => Number.isFinite(value) && value >= 0;
 const timestamp = value => typeof value === 'string' && Number.isFinite(Date.parse(value)) ? Date.parse(value) : null;
 const isTime = value => value !== null;
-const integerPercent = (count, total) => Math.round(count * 1000 / total) / 10;
+const progressPercent = (count, total) => count === total ? 100 : Math.min(99.9, Math.round(count * 1000 / total) / 10);
+const openTaskStates = new Set(['pending','active','waiting','paused','approval','limit','blocked','failed']);
 
 function acceptance(requirement) {
   const {review, validation} = requirement;
@@ -20,9 +21,9 @@ export function requirementProgress(requirements) {
     (requirement.targetRuntimeRequired !== true || requirement.validation.runtime === 'target')).length;
   const accepted = requirements.filter(acceptance);
   const useful = accepted.filter(requirement => requirement.artifact?.usable === true).length;
-  return {total, accepted: accepted.length, implementationCompletion: integerPercent(implemented, total),
-    formalCompletion: integerPercent(accepted.length, total), verifiedCompletion: integerPercent(verified, total),
-    usableCompletion: integerPercent(useful, total)};
+  return {total, accepted: accepted.length, implementationCompletion: progressPercent(implemented, total),
+    formalCompletion: progressPercent(accepted.length, total), verifiedCompletion: progressPercent(verified, total),
+    usableCompletion: progressPercent(useful, total)};
 }
 
 export function remainingEstimate(value) {
@@ -32,7 +33,8 @@ export function remainingEstimate(value) {
 }
 
 export function taskHasOpenWork(task) {
-  return (typeof task?.blocker === 'string' && Boolean(task.blocker.trim())) ||
+  return openTaskStates.has(task?.status) ||
+    (typeof task?.blocker === 'string' && Boolean(task.blocker.trim())) ||
     (Array.isArray(task?.remaining) && task.remaining.some(item => typeof item === 'string' && item.trim()));
 }
 

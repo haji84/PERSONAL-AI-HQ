@@ -32,6 +32,7 @@ test('a completion label cannot zero the schedule unless the scoped requirements
   const zero = {optimistic:0,standard:0,cautious:0};
   assert.equal(criticalPath([{...task, requirements:[accepted], blocker:'Awaiting approval', remainingMinutes:zero}]),null);
   assert.equal(criticalPath([{id:'pending',status:'pending',remaining:['Production check'],remainingMinutes:zero}]),null);
+  assert.equal(criticalPath([{id:'blocked',status:'blocked',remainingMinutes:zero}]),null);
 });
 
 test('a fixture run or an unimplemented requirement cannot shrink the formal denominator', () => {
@@ -42,6 +43,11 @@ test('a fixture run or an unimplemented requirement cannot shrink the formal den
   assert.deepEqual(requirementProgress([accepted, loose, {id: 'missing'}]), {
     total: 3, accepted: 1, implementationCompletion: 66.7, formalCompletion: 33.3, verifiedCompletion: 33.3, usableCompletion: 33.3});
   assert.equal(requirementProgress([]), null);
+  const almost = Array.from({length:1999},(_,index)=>({...accepted,id:'accepted-'+index}));
+  almost.push({id:'outstanding'});
+  assert.equal(requirementProgress(almost).formalCompletion,99.9);
+  assert.equal(requirementProgress(almost).implementationCompletion,99.9);
+  assert.equal(requirementProgress(almost).verifiedCompletion,99.9);
 });
 
 test('activity and wait times handle overlapping host and agent intervals separately', () => {
