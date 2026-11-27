@@ -36,10 +36,10 @@ function link(repository, revision, file, label) {
   return {label, url:'https://github.com/' + repository + '/blob/' + revision + '/' + file};
 }
 
-async function openSource(source, {allowHead=false} = {}) {
+async function openSource(source, {allowHead=false, localOnly=false} = {}) {
   const {checkout, ref} = source;
   const repository = gitHubRepository(source.repository);
-  if (!repository || typeof checkout !== 'string' || !isAbsolute(checkout) || normalize(checkout) !== checkout ||
+  if ((!repository && !localOnly) || typeof checkout !== 'string' || !isAbsolute(checkout) || normalize(checkout) !== checkout ||
       typeof ref !== 'string' || (!(allowHead && ref==='HEAD') && !sourceRef.test(ref)) || ref.includes('..') || ref.endsWith('/')) throw new Error('Invalid delivery source');
   const owner = process.getuid?.();
   const info = await lstat(checkout);
@@ -52,10 +52,11 @@ async function openSource(source, {allowHead=false} = {}) {
     return (await cli(command.executable, command.args, {env:command.env, signal, encoding:'buffer',
       timeout:3000, maxBuffer:256 * 1024})).stdout;
   }
-  const [root, origin, selected] = await Promise.all([git('rev-parse','--show-toplevel'), git('config','--local','--get','remote.origin.url'),
+  const [root, origin, selected] = await Promise.all([git('rev-parse','--show-toplevel'), localOnly ? null : git('config','--local','--get','remote.origin.url'),
     git('rev-parse','--verify',ref + '^{commit}')]);
   const revision = selected.toString().trim();
-  if (normalize(root.toString().trim()) !== checkout || gitHubRepository(origin.toString().trim())?.toLowerCase() !== repository.toLowerCase() ||
+  if (normalize(root.toString().trim()) !== checkout ||
+      (!localOnly && gitHubRepository(origin.toString().trim())?.toLowerCase() !== repository.toLowerCase()) ||
       !commitId.test(revision)) throw new Error('Delivery source identity did not match');
   async function objects(version, names) {
     const tree = (await git('ls-tree','-z',version,'--',...names)).toString().split('\0');
@@ -224,13 +225,14 @@ function lifecyclePathValid(file) {
 }
 
 export async function readProjectForecastState(checkout, repository) {
-  if (!checkout || !repository) return null;
+  if (!checkout) return null;
+  const localOnly = repository == null;
   try {
     const folder = await lstat(join(checkout,'.codex'));
     if (!folder.isDirectory() || folder.isSymbolicLink()) return null;
     const file = await lstat(join(checkout,lifecycleStateFile));
     if (!file.isFile() || file.size>128*1024) return null;
-    const reader = await openSource({checkout,repository,ref:'HEAD'},{allowHead:true});
+    const reader = await openSource({checkout,repository,ref:'HEAD'},{allowHead:true,localOnly});
     const [bytes] = await reader.files(reader.revision,[lifecycleStateFile]);
     if (bytes.length>128*1024) return null;
     const state = JSON.parse(bytes);
@@ -260,12 +262,13 @@ export async function readProjectForecastState(checkout, repository) {
     for (const task of planning) if (lifecycleId.test(task?.id??'')) {
       byId.set(task.id,byId.has(task.id)?null:task);
     }
-    const tasks = state.tasks.map(task=>({...byId.get(task.id),id:task.id,title:byId.get(task.id)?.title??task.title,
-      status:task.status==='running'?'active':task.status,actionable:task.actionable,dependencies:task.depends_on}));
+    const tasks = state.tasks.map(({evidence,depends_on,...task})=>({...byId.get(task.id),...task,
+      status:task.status==='running'?'active':task.status,dependencies:depends_on}));
     return {delivery:{...state.delivery,tasks,goal:state.goal.title,goalId:state.goal.id,
       observationAt:iso(state.delivery?.observationAt)},
       nextAction:state.next_action,status:state.status,verifiedTaskIds,
-      source:link(reader.repository,reader.revision,lifecycleStateFile,'案件の保存済み進行状態')};
+      source:localOnly ? {label:'作業先の保存済み進行状態',revision:reader.revision} :
+        link(reader.repository,reader.revision,lifecycleStateFile,'案件の保存済み進行状態')};
   } catch { return null; }
 }
 export function tasksForRepository(observation, repository) {

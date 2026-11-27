@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import {execFileSync} from 'node:child_process';
-import {createHash} from 'node:crypto';
+import {createHash, randomUUID} from 'node:crypto';
 import {mkdir, mkdtemp, readFile, realpath, rm, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {dirname, join} from 'node:path';
 import test from 'node:test';
-import {readCurrentProject, readPortfolio} from '../app/portfolio.mjs';
+import {readCurrentProject, readPortfolio, registerProject} from '../app/portfolio.mjs';
 import * as deliveryRecords from '../app/delivery-records.mjs';
 import {startOwnerApp} from '../app/server.mjs';
 import {ensurePrivateDirectory} from '../app/private-directory.mjs';
@@ -321,4 +321,113 @@ test('a scoped existing checkout contributes committed lifecycle state without i
   [undated]=await views();
   assert.equal(undated.forecast.observedAt,null);
   assert.equal(undated.forecast.schedule.completionDates,null);
+});
+
+test('a newly registered repository switches from intake to the committed plan and retains both estimates', async t => {
+  const {directory,checkout,commit,configure,portfolioPath}=await fixture(t);
+  const source='.codex/autonomy-state.json';
+  await configure([]);
+  const input={requestId:randomUUID(),githubProject:'github-100',goal:'Registration goal',settings:{mode:'subscription-only'}};
+  const projectStub={id:input.githubProject,name:'New delivery',repository,registrationAvailable:true};
+  const registration={github:{view:()=>({projects:[projectStub]})},hasSavedWork:()=>false};
+  registerProject(directory,input,registration);
+  const view=async ()=>(await readPortfolio(directory,undefined,true)).view.projects[0];
+  const first=await view();
+  assert.equal(first.forecast.stage,'着手前');
+  assert.equal(first.forecast.tasks[0].id,'requirements-readback');
+  const intake=first.forecast.baseline.original;
+  const saved=JSON.parse(await readFile(portfolioPath,'utf8'));
+  saved.projects[0].cwd=[checkout];
+  await writeFile(portfolioPath,JSON.stringify(saved));
+
+  const requirement={id:'build',implemented:true,review:{independent:true,status:'accepted'},
+    validation:{status:'passed',source:'Runtime observation'}};
+  const planning={id:'build',title:'Build the requested result',requirements:[requirement],
+    remainingMinutes:{optimistic:8,standard:12,cautious:20},estimate:{basis:'Current scope',confidence:'medium'}};
+  const state={version:1,status:'active',goal:{id:'build',title:'Committed delivery goal'},next_action:'Check the saved result',
+    tasks:[{id:'build',status:'verified',actionable:false,depends_on:[],evidence:[{path:'proof.txt',sha256:hash('pass')}]}],
+    delivery:{stage:'検証中',observationAt:new Date().toISOString(),tasks:[planning],
+      estimates:[{kind:'original',target:'first-usable',minutes:{optimistic:10,standard:15,cautious:24}}]}};
+  const revision=await commit({[source]:JSON.stringify(state),'proof.txt':'pass'});
+  const active=await view();
+  assert.equal(active.forecast.stage,'検証中');
+  assert.equal(active.forecast.goal,'Committed delivery goal');
+  assert.equal(active.forecast.source.url.includes(revision),true);
+  assert.equal(active.forecast.baseline.original.minutes.standard,15);
+  assert.deepEqual(active.forecast.baseline.intake,intake);
+  assert.deepEqual(active.tasks.map(task=>[task.id,task.status,task.remainingMinutes.standard]),[['build','verified',0]]);
+
+  await commit({'proof.txt':'changed'});
+  const unconfirmed=await view();
+  assert.equal(unconfirmed.tasks[0].status,'unknown');
+  assert.equal(unconfirmed.tasks[0].progress,null);
+  assert.equal(unconfirmed.forecast.tasks[0].unconfirmedCompletion,true);
+  assert.equal(unconfirmed.forecast.schedule.completionDates,null);
+  state.tasks[0].remaining=['Check the handset'];
+  state.tasks[0].externalWait='unknown';
+  await commit({[source]:JSON.stringify(state),'proof.txt':'pass'});
+  const unfinished=await view();
+  assert.equal(unfinished.tasks[0].status,'unknown');
+  assert.deepEqual(unfinished.tasks[0].remaining,['Check the handset']);
+  assert.equal(unfinished.forecast.tasks[0].externalWait,true);
+  assert.equal(unfinished.tasks[0].remainingMinutes.standard,12);
+  assert.equal(registerProject(directory,input,registration).created,false);
+  assert.deepEqual(JSON.parse(await readFile(portfolioPath,'utf8')),saved);
+
+  saved.taskProgressSource={checkout,repository,ref};
+  const tracking={observationAt:state.delivery.observationAt,stage:'共有済み',nextAction:'Continue shared work',
+    scopeComplete:true,capacity:{calendar:'continuous'}};
+  state.status='paused';
+  await commit({[source]:JSON.stringify(state),[initiative+'/portfolio-observation.json']:JSON.stringify({
+    taskProgress:{observedAt:tracking.observationAt,projects:[{
+      repository,tasks:[{...planning,status:'pending',actionable:true}],delivery:tracking}]}})});
+  await writeFile(portfolioPath,JSON.stringify(saved));
+  const held=await view();
+  assert.equal(held.forecast.status,'paused');
+  assert.equal(held.forecast.stage,'検証中');
+  assert.deepEqual(held.forecast.schedule.readyTaskIds,[]);
+
+  delete saved.projects[0].cwd;
+  await writeFile(portfolioPath,JSON.stringify(saved));
+  const shared=await view();
+  assert.equal(shared.forecast.stage,'共有済み');
+  assert.equal(shared.forecast.nextAction,'Continue shared work');
+  assert.equal(shared.forecast.schedule.workMinutes.standard,12);
+  assert.deepEqual(shared.forecast.schedule.readyTaskIds,[]);
+  assert.equal(shared.forecast.schedule.completionDates,null);
+  assert.ok(shared.forecast.ownerAction);
+  assert.deepEqual(shared.forecast.baseline.intake,intake);
+  assert.equal(shared.tasks[0].id,'build');
+});
+
+test('a registered local Git project adopts its own exact checkout without publishing a local path', async t => {
+  const {directory,checkout,commit,configure,portfolioPath}=await fixture(t);
+  const source='.codex/autonomy-state.json';
+  await configure([]);
+  const {id}=registerProject(directory,{requestId:randomUUID(),name:'Local project',goal:'Local goal',
+    settings:{mode:'subscription-only'}},{hasSavedWork:()=>false});
+  const saved=JSON.parse(await readFile(portfolioPath,'utf8'));
+  saved.projects[0].cwd=[checkout];
+  await writeFile(portfolioPath,JSON.stringify(saved));
+  const revision=await commit({[source]:JSON.stringify({version:1,status:'paused',goal:{id:'local',title:'Committed local goal'},
+    next_action:'Review local result after resuming',tasks:[{id:'review',status:'pending',actionable:true,depends_on:[]}],
+    delivery:{observationAt:new Date().toISOString(),stage:'現地確認',tasks:[{id:'review',
+      remainingMinutes:{optimistic:4,standard:6,cautious:10}}]}})});
+  const {view}=await readPortfolio(directory,undefined,true);
+  const project=view.projects.find(item=>item.id===id);
+  assert.equal(project.forecast.goal,'Committed local goal');
+  assert.equal(project.forecast.stage,'現地確認');
+  assert.equal(project.forecast.status,'paused');
+  assert.equal(project.forecast.schedule.completionDates,null);
+  assert.deepEqual(project.forecast.schedule.readyTaskIds,[]);
+  assert.equal(project.forecast.source.revision,revision);
+  assert.equal(project.forecast.source.url,undefined);
+  assert.equal(project.tasks[0].id,'review');
+  assert.ok(!JSON.stringify(project).includes(checkout));
+
+  saved.projects[0].repository=repository.replace('https:','http:');
+  await writeFile(portfolioPath,JSON.stringify(saved));
+  const rejected=(await readPortfolio(directory,undefined,true)).view.projects[0];
+  assert.equal(rejected.forecast.goal,'Local goal');
+  assert.equal(rejected.forecast.source,null);
 });

@@ -12,6 +12,7 @@ const requestKey = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f
 const registrationFields = new Set(['requestId', 'name', 'goal', 'settings', 'githubProject']);
 const portfolioBytes = 1024 ** 2;
 const projectLimit = 250;
+const intakeTask = 'requirements-readback';
 const registrationError = (status, message) => Object.assign(new Error(message), {status});
 const digest = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const orderedSettings = settings => ({...settings, stageRoutes:Object.fromEntries(Object.entries(settings.stageRoutes).sort())});
@@ -50,21 +51,23 @@ function apiCreditObservation(value) {
   return {balanceUsd, observedFrom, observedUntil, expiresOn: value.expiresOn};
 }
 
-function taskProgress(delivery) {
+function taskProgress(delivery, verifiedForecast) {
   const tasks = delivery?.tasks;
   if (!Array.isArray(tasks) || tasks.length > 400) return [];
   const ids = tasks.map(task => task?.id);
   if (new Set(ids).size !== ids.length || ids.some(id => typeof id !== 'string' || !projectKey.test(id))) return [];
   const observedAt = date(delivery.observationAt);
+  const forecastTasks = verifiedForecast && new Map(verifiedForecast.tasks.map(task => [task.id, task]));
   return tasks.map(task => {
     const counts = requirementProgress(task.requirements);
-    const verified = taskIsVerified(task, counts);
-    const progress = counts && (verified || counts.accepted < counts.total)
+    const forecastTask = forecastTasks?.get(task.id);
+    const verified = forecastTasks ? forecastTask?.verified === true : taskIsVerified(task, counts);
+    const progress = counts && (verified || (!forecastTasks && counts.accepted < counts.total))
       ? {accepted:counts.accepted, total:counts.total, percent:counts.formalCompletion} : null;
     const rejectedCompletion = task.status === 'verified' && !verified;
     const status = rejectedCompletion || !taskStates.has(task.status) ? 'unknown' : task.status;
     const estimate = remainingEstimate(task.remainingMinutes);
-    const remainingMinutes = verified ? {optimistic:0, standard:0, cautious:0} :
+    const remainingMinutes = forecastTasks ? forecastTask?.remainingMinutes ?? null : verified ? {optimistic:0, standard:0, cautious:0} :
       estimate?.cautious === 0 && (rejectedCompletion || taskHasOpenWork(task)) ? null : estimate;
     const device = text(task.device, 60);
     return {id: task.id, title: text(task.title, 120) || task.id, status, progress, remainingMinutes,
@@ -216,13 +219,18 @@ function initialDelivery(observedAt, fromGithub) {
     '最初の要求確認の工数。機能実装・認証待ち・全体の完成時期は別途算定する。'];
   const title = 'GOAL・受入条件・作業先を照合する';
   return {observationAt:observedAt,stage:'着手前',scopeComplete:false,investigationMinutes:minutes,
-    estimates:[{kind:'original',target:'requirements-readback',recordedAt:observedAt,minutes,basis,assumptions}],
-    nextAction:title,tasks:[{id:'requirements-readback',title,status:'pending',actionable:false,
+    estimates:[{kind:'original',target:intakeTask,recordedAt:observedAt,minutes,basis,assumptions}],
+    nextAction:title,tasks:[{id:intakeTask,title,status:'pending',actionable:false,
       remainingMinutes:minutes,estimate:{basis,assumptions,confidence:'low'},observedAt}]};
 }
 
+function registrationIntake(delivery) {
+  return delivery?.stage === '着手前' && delivery.tasks?.length === 1 && delivery.tasks[0]?.id === intakeTask &&
+    Array.isArray(delivery.estimates) && delivery.estimates.some(estimate => estimate?.kind === 'original' && estimate.target === intakeTask);
+}
+
 function forecastInput(project, local, tracking, deliveryRecord) {
-  const recorded = local?.tasks?.length ? local : tracking ? {...tracking.delivery,tasks:tracking.tasks,
+  const recorded = tracking ? {...tracking.delivery,tasks:tracking.tasks,
     observationAt:date(tracking.delivery?.observationAt)??tracking.observationAt} : local;
   if (recorded) return {...recorded,goal:recorded.goal??project.goal,
     firstUsableAt:recorded.firstUsableAt??deliveryRecord?.firstUsable?.actualAt};
@@ -319,7 +327,7 @@ export async function readPortfolio(directory, githubProjects, refreshGithub = f
     raw.taskProgressSource ? readPortfolioTaskRecords(raw.taskProgressSource) : null,
   ]) : [[], null];
   const deliveryRecords = new Map(deliveryEntries);
-  const localDelivery = new Map(raw.projects.map(row=>[row.id,row.delivery]));
+  const definitions = new Map(raw.projects.map(row => [row.id, row]));
   const visible = [...projects, ...discovered];
   const taskMatches = new Map();
   for (const row of projects) {
@@ -327,9 +335,11 @@ export async function readPortfolio(directory, githubProjects, refreshGithub = f
     if (record) taskMatches.set(record, (taskMatches.get(record) ?? 0) + 1);
   }
   const unmatchedTaskRecords = [...(taskRecords?.projects.values() ?? [])].filter(record => taskMatches.get(record) !== 1).length;
-  const scopedStates = new Map(refreshGithub ? await Promise.all(projects.filter(project=>project.cwd.length===1 &&
-    project.repository && !localDelivery.get(project.id) && !tasksForRepository(taskRecords,project.repository)).map(async project=>
-    [project.id,await readProjectForecastState(project.cwd[0],project.repository)])) : []);
+  const scopedStates = new Map(refreshGithub ? await Promise.all(projects.filter(project => {
+    const delivery = definitions.get(project.id).delivery;
+    return project.cwd.length === 1 && (!delivery || registrationIntake(delivery));
+  }).map(async project => [project.id, await readProjectForecastState(project.cwd[0],
+    project.repository ?? definitions.get(project.id).repository)])) : []);
   const rawArtifacts = Array.isArray(raw.artifacts) ? raw.artifacts.slice(0, 150) : [];
   const artifacts = (await Promise.all(rawArtifacts.map(row => normalizeArtifact(row, byId, observedAt)))).filter(Boolean);
   if (new Set(artifacts.map(row => row.id)).size !== artifacts.length) throw new Error('Duplicate artifact');
@@ -349,14 +359,26 @@ export async function readPortfolio(directory, githubProjects, refreshGithub = f
       projects: visible.map(({cwd, handoverRequirements, nativeHandover, ...project}) => {
         const tracking = byId.has(project.id) && tasksForRepository(taskRecords, project.repository);
         const matched = tracking && taskMatches.get(tracking) === 1 ? tracking : null;
-        if (!project.tasks.length && matched) project.tasks = taskProgress(matched);
+        const local = definitions.get(project.id)?.delivery;
+        const isIntake = registrationIntake(local);
+        const shared = matched && (!local?.tasks?.length || (isIntake && matched.tasks.length)) ? matched : null;
         const deliveryRecord = deliveryRecords.get(project.id);
         const scoped = scopedStates.get(project.id);
         const projectHeld = ['paused','completed','blocked','approval','limit','offline'].includes(project.state);
-        const forecast = developmentForecast(scoped?.delivery??forecastInput(project,localDelivery.get(project.id),matched,deliveryRecord),
+        const input = scoped?.delivery ?? forecastInput(project,local,shared,deliveryRecord);
+        if (project.scopeRequired) {
+          input.ownerAction = ['ホスト側でこの案件の作業先と実行権限を設定する。',text(input.ownerAction,360)].filter(Boolean).join(' ');
+          delete input.ownerActionAppliesTo;
+        }
+        const forecast = developmentForecast(input,
           {goal:project.goal,status:projectHeld?project.state:scoped?.status??project.state,
-            nextAction:scoped?.nextAction??deliveryRecord?.nextAction,verifiedTaskIds:scoped?.verifiedTaskIds});
-        project.forecast = {...forecast,source:scoped?.source??(matched?taskRecords.source:null)};
+            nextAction:scoped?.nextAction??input.nextAction??deliveryRecord?.nextAction,verifiedTaskIds:scoped?.verifiedTaskIds});
+        if (isIntake && (scoped || shared)) {
+          forecast.baseline.intake = developmentForecast({estimates:local.estimates}).baseline.original;
+        }
+        if (scoped) project.tasks = taskProgress(input,forecast);
+        else if (shared) project.tasks = taskProgress(input);
+        project.forecast = {...forecast,source:scoped?.source??(shared?taskRecords.source:null)};
         if (deliveryRecord) {
           project.deliveryRecord = deliveryRecord;
           if (deliveryRecord.scope === '統合アプリの初回提供') {
