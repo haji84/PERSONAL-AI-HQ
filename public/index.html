@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="ja" data-theme="system">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <title>Personal AI HQ</title>
+  <link rel="stylesheet" href="/app.css">
+  <script type="module" src="/app.mjs"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">本文へ移動</a>
+  <div id="gate" class="gate" aria-live="polite">
+    <div class="gate-card">
+      <div class="brand"><span class="brand-mark" aria-hidden="true"></span>Personal AI HQ</div>
+      <h1 id="gate-title">接続を確認しています</h1>
+      <p id="gate-description"></p>
+      <button id="gate-retry" class="button" type="button" hidden>再確認</button>
+    </div>
+  </div>
+  <div id="shell" class="shell" hidden>
+    <aside class="rail">
+      <a class="brand" href="#dashboard"><span class="brand-mark" aria-hidden="true"></span>Personal AI HQ</a>
+      <nav id="navigation" aria-label="メインメニュー">
+        <a href="#dashboard" data-view="dashboard"><span class="nav-icon grid-icon" aria-hidden="true"></span><span>ダッシュボード</span></a>
+        <a href="#chat" data-view="chat"><span class="nav-icon chat-icon" aria-hidden="true"></span><span>チャット</span></a>
+        <a href="#codex" data-view="codex"><span class="nav-icon code-icon" aria-hidden="true"></span><span>Codex</span></a>
+        <a href="#artifacts" data-view="artifacts"><span class="nav-icon folder-icon" aria-hidden="true"></span><span>成果物</span></a>
+      </nav>
+      <div class="rail-bottom"><span class="connection-dot" aria-hidden="true"></span>オーナーセッション</div>
+    </aside>
+    <div class="workspace">
+      <header class="topbar">
+        <a class="brand mobile-brand" href="#dashboard"><span class="brand-mark" aria-hidden="true"></span>Personal AI HQ</a>
+        <div class="top-controls">
+          <label class="project-control"><span>プロジェクト</span><select id="project-select" aria-label="プロジェクト"></select></label>
+          <button id="theme-button" class="icon-button" type="button" aria-label="表示テーマを切り替える" title="表示テーマを切り替える"><span aria-hidden="true">◐</span></button>
+        </div>
+      </header>
+      <main id="main" tabindex="-1">
+        <div class="page-heading">
+          <div><h1 id="page-title"></h1><p id="page-summary"></p></div>
+          <button id="refresh-button" class="button secondary" type="button">更新</button>
+        </div>
+        <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+        <div id="content"></div>
+      </main>
+    </div>
+  </div>
+</body>
+</html>

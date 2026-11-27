@@ -1,0 +1,38 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import {criticalPath, deliveryProgress, observedTime, requirementProgress} from '../app/progress.mjs';
+
+const duration = (id, minutes, dependencies = []) => ({id, dependencies,
+  remainingMinutes: {optimistic: minutes, standard: minutes + 2, cautious: minutes + 4}});
+
+test('critical path counts independent work once and preserves unknown external waiting', () => {
+  const tasks = [duration('survey', 5), duration('build', 20), duration('verify', 6, ['survey', 'build'])];
+  assert.deepEqual(criticalPath(tasks), {optimistic: 26, standard: 30, cautious: 34});
+  assert.equal(criticalPath([...tasks, {...duration('human', 0, ['verify']), externalWait: 'unknown'}]), null);
+  assert.equal(criticalPath([duration('cycle', 0, ['cycle'])]), null);
+});
+
+test('a fixture run or an unimplemented requirement cannot shrink the formal denominator', () => {
+  const accepted = {id: 'working', implemented: true, targetRuntimeRequired: true,
+    review: {independent: true, status: 'accepted'}, validation: {status: 'passed', source: 'native run', runtime: 'target'},
+    artifact: {usable: true}};
+  const loose = {...accepted, id: 'mocked', validation: {...accepted.validation, runtime: 'fixture'}};
+  assert.deepEqual(requirementProgress([accepted, loose, {id: 'missing'}]), {
+    total: 3, accepted: 1, implementationCompletion: 66.7, formalCompletion: 33.3, verifiedCompletion: 33.3, usableCompletion: 33.3});
+  assert.equal(requirementProgress([]), null);
+});
+
+test('activity and wait times handle overlapping host and agent intervals separately', () => {
+  const at = minute => new Date(Date.UTC(2026, 10, 27, 6, minute)).toISOString();
+  assert.deepEqual(observedTime([
+    {kind: 'active', agent: 'lead', start: at(0), end: at(15)},
+    {kind: 'active', agent: 'worker', start: at(5), end: at(10)},
+    {kind: 'waiting', start: at(10), end: at(20)},
+  ]), {activeMinutes: 15, waitingMinutes: 5, agentMinutes: 20});
+  const result = deliveryProgress({observationAt: at(5), estimates: [{dueAt: at(10)}, {dueAt: at(23)}],
+    requirements: [{id: 'pending'}], tasks: [duration('build', 15)]}, new Date(at(6)));
+  assert.equal(result.originalDueAt, at(10));
+  assert.equal(result.estimateFinish, at(22));
+  assert.equal(result.forecastDeltaMinutes, 12);
+  assert.equal(result.delayed, true);
+});
