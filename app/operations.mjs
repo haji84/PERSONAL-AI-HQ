@@ -6,6 +6,7 @@ import {ROUTES, STAGES} from './execution-policy.mjs';
 import {validatedDocument} from './text-attachment.mjs';
 import {validatedImage} from './image-attachment.mjs';
 import {readCurrentProject} from './portfolio.mjs';
+import {observedWorkTime, workOutcomeLimit} from './work-outcomes.mjs';
 
 const active = new Set(['reserved', 'sending', 'running', 'interrupting', 'unconfirmed']);
 const nativeTerminal = new Set(['completed', 'interrupted', 'failed']);
@@ -80,6 +81,9 @@ export function createOperations(directory, native, execution, {prepareHandover,
       cancellationRequestedAt,cancellationDispatchedAt
     FROM codex_operations WHERE project=?
     AND workspace IN (SELECT value FROM json_each(?)) ORDER BY createdAt DESC, rowid DESC LIMIT 1`);
+  const savedOutcomes = db.prepare(`SELECT id,phase,threadId,turnId,createdAt,updatedAt,startedAt,fingerprint
+    FROM codex_operations WHERE project=? AND workspace IN (SELECT value FROM json_each(?))
+      AND phase IN ('completed','failed') ORDER BY updatedAt DESC, id`);
   const activeRun = db.prepare(`SELECT 1 FROM codex_operations WHERE project=? AND id IS NOT ?
     AND phase IN ('reserved','sending','running','interrupting','unconfirmed') LIMIT 1`);
   const knownNativeWork = db.prepare(`SELECT 1 FROM codex_operations WHERE project=? AND threadId IS NOT NULL AND turnId IS NOT NULL
@@ -324,6 +328,25 @@ export function createOperations(directory, native, execution, {prepareHandover,
         id ? byId.get(project.id, id) : receipt ? latestHandover.get(project.id, receipt) : latest.get(project.id);
       if (row && (!project.cwd.includes(row.workspace) || (receipt && row.handoverReceipt !== receipt))) return {operation: null};
       return {operation: response(await runtimeResult(row))};
+    },
+    recentOutcomes(projects, now) {
+      const results = [];
+      for (const project of projects) {
+        let count = 0;
+        for (const row of savedOutcomes.iterate(project.id, JSON.stringify(project.cwd))) {
+          if (!allowedId.test(row.id) || !reviewHash.test(row.fingerprint) ||
+              !observedWorkTime(row.updatedAt, now) || !observedWorkTime(row.createdAt, Date.parse(row.updatedAt))) continue;
+          const exact = typeof row.threadId === 'string' && nativeThreadId.test(row.threadId) &&
+            typeof row.turnId === 'string' && nativeThreadId.test(row.turnId) &&
+            (row.startedAt === null || observedWorkTime(row.startedAt, Date.parse(row.updatedAt)));
+          const unsentFailure = row.phase === 'failed' && row.threadId === null && row.turnId === null && row.startedAt === null;
+          if (!exact && !unsentFailure) continue;
+          results.push({projectId:project.id, id:row.id, kind:'codex', phase:row.phase, observedAt:row.updatedAt,
+            ...(exact ? {threadId:row.threadId} : {})});
+          if (++count === workOutcomeLimit) break;
+        }
+      }
+      return results;
     },
     portfolioActivity(project, now) {
       const row = latestScoped.get(project.id, JSON.stringify(project.cwd));
