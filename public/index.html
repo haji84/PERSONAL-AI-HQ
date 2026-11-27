@@ -15,6 +15,11 @@
       <div class="brand"><span class="brand-mark" aria-hidden="true"></span>Personal AI HQ</div>
       <h1 id="gate-title">接続を確認しています</h1>
       <p id="gate-description"></p>
+      <form id="gate-tailnet" class="stack" hidden>
+        <label class="picker"><span>接続コード</span><input id="gate-code" class="search" type="password" required
+          autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="32" pattern="[a-f0-9]{32}"></label>
+        <button id="gate-connect" class="button" type="submit">サインイン</button>
+      </form>
       <button id="gate-retry" class="button" type="button" hidden>再確認</button>
     </div>
   </div>

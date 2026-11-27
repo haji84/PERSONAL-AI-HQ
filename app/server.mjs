@@ -19,6 +19,7 @@ import {ensurePrivateDirectory, readPrivateRuntimeToken} from './private-directo
 import {createApiDevelopment} from './api-development.mjs';
 import {createCodexPeerVerifier} from './codex-peer.mjs';
 import {localSpeechAvailable, localSpeechMaxChars, synthesizeLocalSpeech} from './local-speech.mjs';
+import {createTailnetAccess, tailnetCookieName} from './tailnet-access.mjs';
 
 const root = fileURLToPath(new URL('../public/', import.meta.url));
 const assets = new Map([['/', ['index.html', 'text/html']], ['/app.mjs', ['app.mjs', 'text/javascript']],
@@ -90,9 +91,10 @@ function sameKey(expected, actual) {
     timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(actual, 'hex'));
 }
 
-function cookieKey(header) {
-  const matches = (header ?? '').split(';').map(item => item.trim()).filter(item => item.startsWith('personal_hq='));
-  return matches.length === 1 ? matches[0].slice('personal_hq='.length) : null;
+function cookieKey(header, name = 'personal_hq') {
+  const prefix = `${name}=`;
+  const matches = (header ?? '').split(';').map(item => item.trim()).filter(item => item.startsWith(prefix));
+  return matches.length === 1 ? matches[0].slice(prefix.length) : null;
 }
 
 async function writeSignIn(directory, url, key) {
@@ -136,7 +138,8 @@ async function checkedSocket(socket) {
 }
 
 export async function startOwnerApp({directory = defaultRuntime, port = 4328, socket, codex, plan, apiDevelopment = false, speech,
-  loopbackUrl, loopbackTokenFile} = {}) {
+  loopbackUrl, loopbackTokenFile, tailnet} = {}) {
+  const access = createTailnetAccess(tailnet, sessionAge);
   directory = resolve(directory);
   await ensurePrivateDirectory(directory);
   let loopback;
@@ -275,19 +278,28 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
     }
   }
 
-  async function respond(request, response) {
+  async function respond(request, response, remote) {
     response.setHeader('Cache-Control', 'no-store');
     response.setHeader('X-Content-Type-Options', 'nosniff');
     response.setHeader('Referrer-Policy', 'no-referrer');
     response.setHeader('Content-Security-Policy', browserPolicy);
-    if (request.headers.host !== host || !request.url?.startsWith('/') || request.url.startsWith('//')) {
+    const origin = remote ? access.origin : url;
+    const validHost = remote ? access.accepts(request) : request.headers.host === host &&
+      !Object.hasOwn(request.headers, 'x-forwarded-host') && !Object.hasOwn(request.headers, 'x-forwarded-proto');
+    if (!validHost || !request.url?.startsWith('/') || request.url.startsWith('//')) {
       throw error(403, 'このホストからはアクセスできません。');
     }
-    const target = new URL(request.url, url);
+    const target = new URL(request.url, origin);
+    if (target.origin !== origin) throw error(403, 'このホストからはアクセスできません。');
     const route = target.pathname;
-    const authenticated = Date.now() < expires && sameKey(session, cookieKey(request.headers.cookie));
+    const cookie = cookieKey(request.headers.cookie, remote ? tailnetCookieName : undefined);
+    const authenticated = remote ? access.authenticated(cookie) : Date.now() < expires && sameKey(session, cookie);
     const get = request.method === 'GET';
     const post = request.method === 'POST';
+    if (remote && (route === PLAN_AUTH_CALLBACK_PATH || route === '/api/chat/plan' ||
+        route.startsWith('/api/chat/plan/') || route === '/api/chat/live')) {
+      throw error(404, 'この接続からは利用できません。');
+    }
     if (get && route === PLAN_AUTH_CALLBACK_PATH && plan) {
       let result = 'connected';
       try { await plan.auth.complete(url, Date.now() < expires ? session : '', target.searchParams); }
@@ -307,10 +319,11 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       const enabled = native.canWrite === true && portfolio?.view.projects.some(project => project.codexWrite) === true &&
         await Promise.resolve(native.subscriptionReady?.()).catch(() => false) === true;
       return send(response, 200, {authenticated, capabilities: {chatImport: true, codexWrite: enabled,
-        executionSettings: authenticated, executionActivity: authenticated, chatgptPlan: authenticated && Boolean(plan),
-        apiDevelopment: authenticated && apiEnabled, localSpeech: authenticated && await speechService.available()}});
+        executionSettings: authenticated, executionActivity: authenticated, chatgptPlan: !remote && authenticated && Boolean(plan),
+        apiDevelopment: authenticated && apiEnabled, localSpeech: authenticated && await speechService.available(),
+        tailnetPairing: !remote && authenticated && Boolean(access), tailnetSignIn: remote}});
     }
-    if (post && route === '/api/session') {
+    if (post && route === '/api/session' && !remote) {
       if (!['null', url].includes(request.headers.origin)) throw error(403, 'ログイン元を確認できません。');
       const form = new URLSearchParams(await body(request, 256));
       if (!key || form.getAll('key').length !== 1 || !sameKey(key, form.get('key'))) throw error(403, 'サインイン用のファイルが無効です。');
@@ -322,8 +335,27 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       response.end();
       return;
     }
+    if (post && access && route === '/api/access/redeem') {
+      if (!remote || request.headers.origin !== origin) throw error(403, 'サインイン元を確認できません。');
+      const {code} = await jsonBody(request, 256) ?? {};
+      const token = access.redeem(code);
+      if (!token) throw error(403, '接続コードが無効か、期限切れです。');
+      return send(response, 200, {authenticated: true}, {'Set-Cookie':
+        `${tailnetCookieName}=${token}; Secure; HttpOnly; SameSite=Strict; Path=/; Max-Age=${sessionAge}`});
+    }
     if (!authenticated) throw error(401, 'サインインが必要です。');
-    if (!get && (!post || request.headers.origin !== url)) throw error(403, 'この画面から操作してください。');
+    if (!get && (!post || request.headers.origin !== origin)) throw error(403, 'この画面から操作してください。');
+    if (post && access && ['/api/access/pair', '/api/access/revoke'].includes(route)) {
+      if (remote) throw error(403, 'ホスト端末で操作してください。');
+      if (route === '/api/access/pair') return send(response, 200, access.pair());
+      access.revoke();
+      return send(response, 200, {revoked: true});
+    }
+    if (post && remote && route === '/api/access/end') {
+      access.end(cookie);
+      return send(response, 200, {authenticated: false}, {'Set-Cookie':
+        `${tailnetCookieName}=; Secure; HttpOnly; SameSite=Strict; Path=/; Max-Age=0`});
+    }
     if (get && route === '/api/codex/models') return send(response, 200, await native.models());
     if (get && route === '/api/usage') {
       const subscription = await Promise.resolve(native.usage?.()).catch(() => null);
@@ -449,8 +481,8 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
     throw error(404, '見つかりませんでした。');
   }
 
-  const server = http.createServer({requestTimeout: 30000, headersTimeout: 10000, maxHeaderSize: 8192}, (request, response) => {
-    respond(request, response).catch(problem => {
+  const makeServer = remote => http.createServer({requestTimeout: 30000, headersTimeout: 10000, maxHeaderSize: 8192}, (request, response) => {
+    respond(request, response, remote).catch(problem => {
       if (response.destroyed) return;
       if (response.headersSent) { response.destroy(); return; }
       const status = typeof problem?.status === 'number' ? problem.status : 500;
@@ -458,13 +490,20 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
         ...(problem.code === 'CODEX_IMAGE_MODEL_UNAVAILABLE' ? {code: problem.code} : {})});
     });
   });
+  const server = makeServer(false);
+  const proxyServer = access && makeServer(true);
+  const servers = proxyServer ? [server, proxyServer] : [server];
+  const listen = (listener, listenPort) => new Promise((done, fail) => {
+    listener.once('error', fail);
+    listener.listen(listenPort, '127.0.0.1', () => { listener.off('error', fail); done(); });
+  });
   async function close() {
     closing ??= (async () => {
       for (const controller of liveRequests) controller.abort();
       speechTask?.controller.abort();
       await speechTask?.pending.catch(() => {});
       await apiWork.close();
-      await new Promise(done => server.close(done));
+      await Promise.all(servers.map(listener => new Promise(done => listener.close(done))));
       operations.close();
       await native.close?.();
       chats.close();
@@ -473,22 +512,24 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
     return closing;
   }
   try {
-    await new Promise((done, fail) => {
-      server.once('error', fail);
-      server.listen(port, '127.0.0.1', () => { server.off('error', fail); done(); });
-    });
+    await listen(server, port);
     host = `127.0.0.1:${server.address().port}`;
     url = `http://${host}`;
     signInFile = await writeSignIn(directory, url, key);
-    return {url, signInFile, close};
+    if (!proxyServer) return {url, signInFile, close};
+    await listen(proxyServer, access.port);
+    return {url, signInFile, close, tailnetUrl: access.origin, tailnetTarget: `http://127.0.0.1:${proxyServer.address().port}`};
   } catch (problem) { await close(); throw problem; }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  const {HQ_TAILNET_ORIGIN: origin, HQ_TAILNET_LOGIN: login, HQ_TAILNET_PROXY_PORT: proxyPort} = process.env;
+  const tailnet = [origin, login, proxyPort].some(value => value !== undefined)
+    ? {origin, login, port: /^[1-9]\d{0,4}$/.test(proxyPort ?? '') ? Number(proxyPort) : NaN} : undefined;
   const app = await startOwnerApp({directory: process.env.HQ_PRIVATE_DIRECTORY, port: Number(process.env.HQ_PORT ?? 4328),
     socket: process.env.HQ_CODEX_SOCKET, plan: process.env.HQ_CHATGPT_PLAN === '1', apiDevelopment: process.env.HQ_API_EXECUTION === '1',
-    loopbackUrl: process.env.HQ_CODEX_LOOPBACK_URL, loopbackTokenFile: process.env.HQ_CODEX_LOOPBACK_TOKEN_FILE});
-  console.log(JSON.stringify({url: app.url, signInFile: app.signInFile}));
+    loopbackUrl: process.env.HQ_CODEX_LOOPBACK_URL, loopbackTokenFile: process.env.HQ_CODEX_LOOPBACK_TOKEN_FILE, tailnet});
+  console.log(JSON.stringify({url: app.url, signInFile: app.signInFile, ...(app.tailnetTarget && {tailnetTarget: app.tailnetTarget})}));
   if (process.argv.includes('--open') && process.platform === 'darwin') {
     spawn('/usr/bin/open', [app.signInFile], {stdio: 'ignore'}).on('error', () => {});
   }

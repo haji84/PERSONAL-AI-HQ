@@ -19,7 +19,7 @@ const stateLabels = {
 };
 const dom = {};
 for (const id of [
-  'gate', 'gate-title', 'gate-description', 'gate-retry', 'shell', 'navigation',
+  'gate', 'gate-title', 'gate-description', 'gate-retry', 'gate-tailnet', 'gate-code', 'gate-connect', 'shell', 'navigation',
   'project-select', 'theme-button', 'page-title', 'page-summary', 'refresh-button', 'notice', 'content',
 ]) dom[id] = document.getElementById(id);
 const prefsKey = 'personal-ai-hq/preferences/v1';
@@ -226,9 +226,11 @@ function gate(title, description, canRetry) {
   dom.gate.hidden = false;
   dom['gate-title'].textContent = title;
   dom['gate-description'].textContent = description;
+  dom['gate-tailnet'].hidden = true;
   dom['gate-retry'].hidden = !canRetry;
 }
 function endSession() {
+  requestSequence++;
   stopSpeech();
   for (const stop of runViewCleanups) stop();
   clearTimeout(activityTimer);
@@ -238,7 +240,10 @@ function endSession() {
   ui.attachmentDrafts.clear();
   ui.portfolio = null;
   dom.content.replaceChildren();
-  gate('サインイン', 'この端末のサインイン用ファイルを開いてください。', true);
+  if (ui.capabilities.tailnetSignIn === true) {
+    gate('遠隔サインイン', 'ホスト端末のダッシュボードで発行した接続コードを入力してください。', false);
+    dom['gate-tailnet'].hidden = false;
+  } else gate('サインイン', 'この端末のサインイン用ファイルを開いてください。', true);
 }
 function activityPanel() {
   const section = node('section', 'stack');
@@ -577,6 +582,37 @@ function usagePanel() {
   } else area.body.append(node('p', 'small muted', '公式画面での残高・期限の確認記録がありません。'));
   return area.root;
 }
+function tailnetPanel() {
+  const area = panel('遠隔接続');
+  const status = node('p', 'small muted');
+  status.setAttribute('role', 'status');
+  const actions = node('div', 'run-actions');
+  const paired = node('div', 'stack');
+  const remote = ui.capabilities.tailnetSignIn === true;
+  const run = async (path, accept) => {
+    const buttons = actions.querySelectorAll('button');
+    for (const control of buttons) control.disabled = true;
+    status.textContent = '';
+    paired.replaceChildren();
+    try { accept(await api(path, {method: 'POST'})); }
+    catch (error) { status.textContent = error.message; }
+    finally { for (const control of buttons) control.disabled = false; }
+  };
+  if (remote) {
+    actions.append(button('この端末からサインアウト', () => run('/api/access/end', endSession)));
+  } else {
+    actions.append(button('接続コードを発行', () => run('/api/access/pair', result => {
+      const address = link(result.url, result.url);
+      if (address) paired.append(address);
+      paired.append(node('p', 'small muted', '接続コード'), node('code', '', result.code));
+      status.textContent = '有効期限 ' + time(result.expiresAt);
+    }), false), button('すべての遠隔接続を終了', () => run('/api/access/revoke', () => {
+      status.textContent = '遠隔接続と未使用の接続コードを無効にしました。';
+    })));
+  }
+  area.body.append(actions, paired, status);
+  return area.root;
+}
 function dashboard() {
   const groups = [
     ['全プロジェクト', () => true],
@@ -616,6 +652,7 @@ function dashboard() {
   projects.root.append(searchWrap, message, list);
   filterProjects(search.value);
   left.append(projects.root);
+  if (ui.capabilities.tailnetPairing === true || ui.capabilities.tailnetSignIn === true) left.append(tailnetPanel());
   right.append(projectDetail(), usagePanel());
 
   const devices = panel('実行端末');
@@ -2291,7 +2328,7 @@ async function refresh() {
   } catch (error) {
     if (id !== requestSequence) return;
     if (ui.portfolio) setNotice(error.message, true);
-    else if (dom['gate-title'].textContent !== 'サインイン') gate('情報を取得できません', error.message, true);
+    else if (error.status !== 401) gate('情報を取得できません', error.message, true);
   } finally {
     if (id === requestSequence) dom['refresh-button'].disabled = false;
   }
@@ -2300,17 +2337,32 @@ async function activate() {
   gate('接続を確認しています', '', false);
   try {
     const session = await api('/api/session');
+    ui.capabilities = session?.capabilities ?? {};
     if (session?.authenticated !== true) {
       endSession();
       return;
     }
-    ui.capabilities = session.capabilities ?? {};
     await refresh();
   } catch (error) {
-    if (dom['gate-title'].textContent !== 'サインイン') gate('接続できません', error.message, true);
+    if (error.status !== 401) gate('接続できません', error.message, true);
   }
 }
 
+dom['gate-tailnet'].addEventListener('submit', async event => {
+  event.preventDefault();
+  const input = dom['gate-code'];
+  const submit = dom['gate-connect'];
+  if (submit.disabled) return;
+  submit.disabled = true;
+  try {
+    await api('/api/access/redeem', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({code: input.value})});
+    input.value = '';
+    await activate();
+  } catch (error) {
+    dom['gate-description'].textContent = error.message;
+  } finally { submit.disabled = false; }
+});
 dom['gate-retry'].addEventListener('click', activate);
 dom['project-select'].addEventListener('change', event => selectProject(event.target.value));
 dom['refresh-button'].addEventListener('click', refresh);

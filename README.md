@@ -36,6 +36,14 @@ Codexの書き込みは指定作業先のワークスペースに制限されま
 
 Windowsで既存の公式App Serverを接続する場合は、その端末の `ws://127.0.0.1:ポート` を `HQ_CODEX_LOOPBACK_URL` に指定します。App Serverの `capability-token` 認証と同じトークンを、本人専用実行ディレクトリ内の既存ファイルから `HQ_CODEX_LOOPBACK_TOKEN_FILE` に絶対パスで指定します。トークンはTCP接続の受け手が現在の実行ユーザーで、対象のCodex実行ファイルと一致した後に送ります。案件の権限とアカウントの照合後に操作できます。環境変数を設定しない通常起動は、従来の履歴閲覧を提供します。
 
+## 既存Tailscaleから利用する
+
+本人の既存tailnetで HTTPS の Tailscale Serve を使える場合は、アプリ起動時に `HQ_TAILNET_ORIGIN` にServeの正確な公開先（例 `https://machine.example.ts.net`）、`HQ_TAILNET_LOGIN` に許可する本人のログイン名、`HQ_TAILNET_PROXY_PORT` に未使用のループバックポートを指定できます。すべて省略した通常起動では遠隔用ポートを開きません。
+
+既存のServe設定を確認し、専用ポートを指す `tailnetTarget` にだけHTTPSプロキシを設定します。アプリはServe、Funnel、tailnetのポリシーを設定しません。本人のログイン、HTTPSのホストとプロキシヘッダーが一致するリクエストだけを受け付けます。Funnel経由は拒否します。 [Tailscale Serve](https://tailscale.com/docs/features/tailscale-serve)
+
+ホスト端末で通常どおりサインインし、ダッシュボードの「接続コードを発行」を選びます。スマートフォンで表示のHTTPS URLを開き、5分以内にコードを1回使います。遠隔接続のCookieはローカル用と別です。遠隔端末からのサインアウトと、ホスト側からの全遠隔セッションの失効に対応します。失効後の新しいリクエストは拒否し、すでに受理した開発は継続します。ChatGPTプランの接続と実送信はホスト端末のローカル画面で行います。
+
 ## ChatGPTプランと案件別の実行経路
 
 Macの日本語システム音声が利用できる場合は、チャットにある保存済みの回答を「読み上げ」で再生できます。再生は同じ画面で停止できます。音声はMac内で生成し、一時ファイルは生成後に削除します。
