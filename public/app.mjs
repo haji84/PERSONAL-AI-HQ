@@ -82,6 +82,7 @@ const chatSourceLabels = {'chatgpt-export': 'ChatGPTの書き出し', 'chatgpt-l
   'api-development': '通常APIの開発', 'codex-history': 'Codex'};
 let requestSequence = 0;
 let portfolioPollRunning = false;
+let dashboardExecutionVersion = 0;
 let mounted = 0;
 let pendingScroll;
 let activityTimer;
@@ -772,10 +773,13 @@ function executionSettings(project) {
         save.disabled = true;
         estimates.clear('実行設定の保存を確認中…');
         try {
-          current = await api(path, {method: 'POST', headers: {'Content-Type': 'application/json'},
+          const saved = await api(path, {method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({revision: current.revision, settings: editor.value()})});
-          if (!isCurrent()) return;
+          if (resources.get(key)?.value?.revision > saved.revision || !ui.portfolio) return;
+          current = saved;
           resources.set(key, {value: current});
+          applyDashboardExecution(project, current.executionSummary);
+          if (!isCurrent()) return;
           editor.apply(current.settings);
           status.textContent = 'この案件の実行設定を保存しました。';
         } catch (error) { if (isCurrent()) status.textContent = error.message; }
@@ -1276,6 +1280,71 @@ function tailnetPanel() {
   area.body.append(actions, paired, status);
   return area.root;
 }
+const dashboardExecutionTimers = new WeakMap();
+const executionRouteLabels = {subscription: 'Codex', api: '通常API'};
+const executionStopLabels = {
+  paused: stateLabels.paused, approval: stateLabels.approval, limit: stateLabels.limit,
+  blocked: '障害の確認が必要', offline: stateLabels.offline, waiting: stateLabels.waiting,
+  completed: stateLabels.completed, 'scope-required': '作業先の登録待ち', 'api-disabled': 'API経路を利用できません',
+  unconfirmed: '実行状況の確認が必要', interrupted: activityLabels.interrupted,
+  cancelled: activityLabels.cancelled, failed: activityLabels.failed, 'settings-unavailable': '実行設定の確認が必要',
+};
+
+function dashboardProjectRow(projectId) {
+  return [...dom.content.querySelectorAll('[data-dashboard-project]')].find(row => row.dataset.dashboardProject === projectId);
+}
+
+function paintDashboardExecution(element, project) {
+  clearTimeout(dashboardExecutionTimers.get(element));
+  if (project.registration === 'github' || !project.executionSummary) {
+    element.hidden = true;
+    return;
+  }
+  const summary = project.executionSummary;
+  const mode = Object.hasOwn(executionModeLabels, summary.mode) && executionModeLabels[summary.mode];
+  const source = summary.modeSource === 'default' ? '（共通既定）' : '';
+  const modeLabel = mode && ['saved', 'default'].includes(summary.modeSource) ? mode + source : '不明';
+  const route = Object.hasOwn(executionRouteLabels, summary.route) && executionRouteLabels[summary.route];
+  const now = Date.now();
+  const observed = Date.parse(summary.observedAt);
+  const lastConfirmed = Date.parse(summary.observedUntil);
+  const activeUntil = Date.parse(summary.activeUntil);
+  const verified = route && ['active','observed'].includes(summary.routeState) && observed <= now && now < lastConfirmed;
+  const active = verified && summary.routeState === 'active' && now < activeUntil;
+  const routeLabel = active ? route + ' · 実行中' : verified ? route + ' · 確認 ' + time(summary.observedAt) : '不明';
+  const reason = Object.hasOwn(executionStopLabels, summary.stopReason) && executionStopLabels[summary.stopReason];
+  const execution = ['設定 ' + modeLabel, '経路 ' + routeLabel, reason !== statusLabel(project.state) && reason].filter(Boolean);
+  element.replaceChildren(node('span', '', execution.join(' · ')));
+
+  const formal = project.measurements?.formalCompletion;
+  const remaining = project.schedule?.remainingMinutes;
+  const progress = [];
+  if (Number.isFinite(formal) && formal >= 0 && formal <= 100) {
+    progress.push('正式達成率 ' + new Intl.NumberFormat('ja-JP', {maximumFractionDigits: 1}).format(formal) + '%');
+  }
+  if (remaining && [remaining.optimistic, remaining.standard, remaining.cautious]
+    .every(value => Number.isFinite(value) && value >= 0)) progress.push('全体の残り ' + estimateLabel(remaining));
+  if (progress.length) element.append(node('span', '', progress.join(' · ')));
+  element.hidden = false;
+
+  if (verified) {
+    const until = active ? Math.min(activeUntil, lastConfirmed) : lastConfirmed;
+    const timer = setTimeout(() => {
+      if (element.isConnected) paintDashboardExecution(element, project);
+    }, until - now);
+    dashboardExecutionTimers.set(element, timer);
+  }
+}
+
+function applyDashboardExecution(projectId, summary) {
+  const project = projectList().find(item => item.id === projectId);
+  if (!project || project.registration === 'github' || !summary) return;
+  project.executionSummary = summary;
+  dashboardExecutionVersion++;
+  const element = dashboardProjectRow(projectId)?.querySelector('[data-execution-summary]');
+  if (element) paintDashboardExecution(element, project);
+}
+
 function dashboard() {
   const groups = [
     ['全プロジェクト', () => true],
@@ -1303,8 +1372,16 @@ function dashboard() {
     list.replaceChildren();
     const result = projectList().filter(item => matches(query, item.name, item.goal, item.summary));
     for (const item of result) {
-      list.append(listItem(rowButton(text(item.name), item.summary ?? item.goal, item.id === ui.project,
-        () => selectProject(item.id, matchMedia('(max-width: 870px)').matches), chip(item.state))));
+      const row = rowButton(text(item.name), item.summary ?? item.goal, item.id === ui.project,
+        () => selectProject(item.id, matchMedia('(max-width: 870px)').matches), chip(item.state));
+      row.dataset.dashboardProject = item.id;
+      if (item.registration !== 'github') {
+        const execution = node('span', 'property-value small muted');
+        execution.dataset.executionSummary = '';
+        row.firstElementChild.append(execution);
+        paintDashboardExecution(execution, item);
+      }
+      list.append(listItem(row));
     }
     message.hidden = result.length > 0;
     if (!message.hidden) message.textContent = query ? '一致するプロジェクトがありません。' : '取得できるプロジェクトがありません。';
@@ -3415,29 +3492,35 @@ function canRefreshVisibleDashboard() {
 async function refreshVisibleDashboard() {
   if (portfolioPollRunning || !canRefreshVisibleDashboard()) return;
   const generation = requestSequence;
-  const isCurrent = () => generation === requestSequence && canRefreshVisibleDashboard();
+  const executionVersion = dashboardExecutionVersion;
+  const isCurrent = () => generation === requestSequence &&
+    executionVersion === dashboardExecutionVersion && canRefreshVisibleDashboard();
   portfolioPollRunning = true;
   try {
     const latest = await api('/api/portfolio', {signal: AbortSignal.timeout(6500)});
     if (!isCurrent()) return;
     dom['page-summary'].textContent = dashboardSummary();
     if (JSON.stringify(latest) === JSON.stringify(ui.portfolio)) return;
+    const focusedProject = document.activeElement?.dataset?.dashboardProject;
     rememberScroll();
     ui.portfolio = latest;
     updateProjectSelect();
     render(true, true);
+    if (focusedProject) dashboardProjectRow(focusedProject)?.focus({preventScroll: true});
   } catch {
     if (isCurrent()) dom['page-summary'].textContent = dashboardSummary() + ' · 更新できません。前回の情報を表示しています。';
   } finally { portfolioPollRunning = false; }
 }
 async function refresh() {
   const id = ++requestSequence;
+  const executionVersion = dashboardExecutionVersion;
   dom['refresh-button'].disabled = true;
   const onPage = !dom.shell.hidden;
   if (onPage) setNotice('情報を取得しています。');
   try {
     const portfolio = await api('/api/portfolio');
     if (id !== requestSequence) return;
+    if (executionVersion !== dashboardExecutionVersion) { setNotice(); return; }
     if (onPage) rememberScroll();
     ui.portfolio = portfolio;
     resources.clear();

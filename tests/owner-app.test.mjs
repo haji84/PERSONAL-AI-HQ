@@ -391,6 +391,7 @@ test('GitHub registration promotes only a fresh eligible candidate and preserves
   }
   assert.equal(portfolio.githubRegistration.status, 'ready');
   assert.equal(portfolio.projects.find(row => row.id === 'github-12').registrationAvailable, true);
+  assert.equal(portfolio.projects.find(row => row.id === 'github-12').executionSummary,undefined);
   assert.equal(portfolio.projects.find(row => row.id === 'github-13').registrationAvailable, false);
   assert.equal((await post('github-11')).status, 409);
   assert.equal((await post('github-13')).status, 409);
@@ -409,6 +410,143 @@ test('GitHub registration promotes only a fresh eligible candidate and preserves
   assert.equal(saved.projects[1].repository, 'https://github.com/fixture-owner/discovered');
   assert.equal(saved.projects[1].state, 'waiting');
   assert.equal(saved.projects[1].enableCodexWrite, undefined);
+});
+
+test('portfolio separates saved modes, accepted route evidence and authoritative stop reasons', async t => {
+  const {directory,start} = await runtimeFixture(t);
+  const checkout = id => join(directory,'workspaces',id);
+  const fixed = {observedAt:new Date().toISOString(), projects:[
+    {id:'managed',name:'Managed',state:'unknown',cwd:checkout('managed'),enableCodexWrite:true},
+    {id:'uncertain-status',name:'Unrecognized response',cwd:checkout('uncertain-status'),enableCodexWrite:true},
+    {id:'stale',name:'Stale',cwd:checkout('stale')},
+    {id:'paused',name:'Paused',state:'paused',cwd:checkout('paused')},
+    {id:'api-approved',name:'API receipt',cwd:checkout('api-approved')},
+    {id:'api-pending',name:'API intent',cwd:checkout('api-pending')},
+    {id:'removed-scope',name:'Changed workspace',cwd:checkout('different')},
+  ]};
+  for (const id of ['managed','uncertain-status']) {
+    await mkdir(checkout(id),{recursive:true,mode:0o700});
+    await writeFile(join(checkout(id),'.hq-owned-workspace'),id+'\n');
+  }
+  await writeFile(join(directory,'portfolio.json'),JSON.stringify(fixed),{mode:0o600});
+  let providerCalls = 0, observerCalls = 0, listener;
+  const app = await start({codex:{
+    canWrite:true, subscriptionReady:async()=>true,
+    models:async()=>({accountType:'chatgpt',data:[{id:'current',isDefault:true,reasoningEfforts:[]}]}),
+    onEvent(fn) { listener=fn; return ()=>{}; },
+    async submit(input) {
+      providerCalls++;
+      if (input.workspace === checkout('uncertain-status')) {
+        assert.ok(input.onThread('unknown-thread'));
+        return {turn:{id:'unknown-turn',status:'unrecognized'}};
+      }
+      assert.ok(input.onThread('managed-thread'));
+      return {turn:{id:'managed-turn',status:'inProgress'}};
+    },
+    async findSubmission() { observerCalls++; return null; },
+    async readActivity() { observerCalls++; return null; },
+  }});
+  const date = new Date(Date.now()-2_000).toISOString();
+  const past = new Date(Date.now()-20*60_000).toISOString();
+  const operationFields = ['stale','paused','removed-scope'];
+  const db = new DatabaseSync(join(directory,'conversations.sqlite'));
+  try {
+    const insert=db.prepare('INSERT INTO codex_operations(project,id,workspace,fingerprint,phase,threadId,turnId,createdAt,updatedAt,startedAt) VALUES (?,?,?,?,?,?,?,?,?,?)');
+    for (const id of operationFields) {
+      const seen=id==='stale' ? past : date;
+      insert.run(id,'saved-job',checkout(id),'0'.repeat(64),'running','old-thread','old-turn',seen,seen,seen);
+    }
+  } finally { db.close(); }
+  const storePath=join(directory,'execution-policy.json');
+  const store=new ExecutionStore(storePath,{authorityId:'personal-ai-hq-local'});
+  for (const id of ['paused','api-approved','api-pending']) store.updateSettings(id,0,{mode:'api-only'});
+  const state=JSON.parse(await readFile(storePath,'utf8'));
+  for (const id of ['api-approved','api-pending']) {
+    state.projects[id].operations['route-work']={route:'api',status:'running',reservedMicros:500_000,costMicros:0,
+      model:'stored-model',executorId:'owner-mac-responses',executionId:'private-execution-id',taskId:'route-work',
+      settingsRevision:1,organizationId:'private-test-org',instructionDigest:'a'.repeat(64),fingerprint:'b'.repeat(64),
+      createdAt:date,dispatchedAt:date,
+      ...(id==='api-approved' && {providerReceipts:[{id:'resp_PrivateReceipt',observedAt:date,inputTokens:22,outputTokens:10,accountedMicros:5}]}),
+    };
+  }
+  await writeFile(storePath,JSON.stringify(state),{mode:0o600});
+  assert.equal((await fetch(app.url+'/api/portfolio')).status,401);
+  const cookie=await login(app);
+  const snapshot=async()=> {
+    const response=await fetch(app.url+'/api/portfolio',{headers:{cookie}});
+    assert.equal(response.status,200);
+    return response.json();
+  };
+  const byId=(view,id)=>view.projects.find(project=>project.id===id).executionSummary;
+  const post=(route,body)=>fetch(app.url+route,{method:'POST',headers:{cookie, Origin:app.url,'Content-Type':'application/json'},
+    body:JSON.stringify(body)});
+  const fileBefore=await readFile(storePath,'utf8');
+  let view=await snapshot();
+  assert.equal(byId(view,'managed').mode,'subscription-only');
+  assert.equal(byId(view,'managed').modeSource,'default');
+  assert.equal(byId(view,'managed').routeState,'unknown');
+  assert.equal(byId(view,'stale').routeState,'unknown');
+  assert.equal(byId(view,'stale').stopReason,'unconfirmed');
+  assert.equal(byId(view,'paused').mode,'api-only');
+  assert.equal(byId(view,'paused').modeSource,'saved');
+  assert.equal(byId(view,'paused').route,'subscription');
+  assert.equal(byId(view,'paused').routeState,'observed');
+  assert.equal(byId(view,'paused').stopReason,'paused');
+  assert.equal(byId(view,'api-approved').route,'api');
+  assert.equal(byId(view,'api-approved').routeState,'observed');
+  assert.equal(byId(view,'api-approved').stopReason,'unconfirmed');
+  assert.equal(byId(view,'api-pending').routeState,'unknown');
+  assert.equal(byId(view,'removed-scope').routeState,'unknown');
+  assert.equal(JSON.stringify(view).includes('PrivateReceipt'),false);
+  assert.equal(JSON.stringify(view).includes('private-test-org'),false);
+  assert.equal(JSON.stringify(view).includes(checkout('managed')),false);
+  assert.equal(await readFile(storePath,'utf8'),fileBefore);
+  assert.equal(providerCalls,0);
+  assert.equal(observerCalls,0);
+
+  const cancellation = new DatabaseSync(join(directory,'conversations.sqlite'));
+  try { cancellation.prepare("UPDATE codex_operations SET phase='cancelled',updatedAt=? WHERE project='stale'").run(date); }
+  finally { cancellation.close(); }
+  const changedLocally=byId(await snapshot(),'stale');
+  assert.equal(changedLocally.routeState,'unknown');
+  assert.equal(changedLocally.observedAt,null);
+  assert.equal(changedLocally.stopReason,'cancelled');
+
+  const started=await post('/api/codex/run?project=managed',{id:'managed-fixture',prompt:'Isolated accepted route test'});
+  assert.equal(started.status,202);
+  for(let attempt=0;attempt<20;attempt++){
+    view=await snapshot();
+    if (byId(view,'managed').routeState==='active') break;
+    await delay(10);
+  }
+  assert.equal(byId(view,'managed').route,'subscription');
+  assert.equal(byId(view,'managed').routeState,'active');
+  assert.ok(Number.isFinite(Date.parse(byId(view,'managed').observedAt)));
+  const live=byId(view,'managed');
+  assert.equal(Date.parse(live.activeUntil)-Date.parse(live.observedAt),15000);
+  assert.equal(Date.parse(live.observedUntil)-Date.parse(live.observedAt),15*60*1000);
+  listener('turn/completed',{threadId:'managed-thread',turn:{id:'managed-turn',status:'completed'}});
+  view=await snapshot();
+  assert.equal(byId(view,'managed').routeState,'observed');
+  const update=await post('/api/execution/settings?project=managed',{revision:0,settings:{mode:'api-only'}});
+  assert.equal(update.status,200);
+  const summary=(await update.json()).executionSummary;
+  assert.equal(summary.mode,'api-only');
+  assert.equal(summary.modeSource,'saved');
+  assert.equal(summary.route,'subscription');
+  assert.equal(summary.routeState,'observed');
+  assert.equal(summary.stopReason,'api-disabled');
+  assert.equal((await post('/api/codex/run?project=uncertain-status',{id:'unknown-fixture',prompt:'Controlled unknown status'})).status,202);
+  for(let attempt=0;attempt<20;attempt++){
+    view=await snapshot();
+    if (byId(view,'uncertain-status').route) break;
+    await delay(10);
+  }
+  assert.equal(byId(view,'uncertain-status').route,'subscription');
+  assert.equal(byId(view,'uncertain-status').routeState,'observed');
+  assert.equal(byId(view,'uncertain-status').stopReason,'unconfirmed');
+  assert.equal(providerCalls,2);
+  assert.equal(observerCalls,0);
 });
 
 test('route estimates use the matching saved settings while preserving the original timeline and unknown costs', async t => {

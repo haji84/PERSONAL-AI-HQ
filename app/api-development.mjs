@@ -490,6 +490,18 @@ export function createApiDevelopment({directory, store, conversations, withProje
           models: authority.models.map(({id, reasoningEfforts}) => ({id, reasoningEfforts}))};
       } catch (cause) { return {available: false, reason: cause.code ?? 'API_AUTHORIZATION_REQUIRED', models: []}; }
     },
+    portfolioActivity(project, operation) {
+      if (operation?.route !== 'api' || !project.cwd.includes(join(directory,'workspaces',project.id))) return null;
+      const local = jobs.get(operation.executionId);
+      const phase = currentPhase(operation, local);
+      const receipts = operation.providerReceipts?.filter(receipt=>receipt.id !== null) ?? [];
+      const observed = receipts.at(-1)?.observedAt ?? null;
+      const reason = operation.status === 'cancelled' ? 'cancelled' :
+        phase === 'unconfirmed' || phase === 'interrupting' || phase === 'reserved' || (phase === 'running' && !observed)
+          ? 'unconfirmed' : ['failed','interrupted'].includes(phase) ? phase : null;
+      return {route:'api', createdAt:operation.createdAt, updatedAt:observedAt(operation),
+        observedAt:observed, active:phase === 'running' && Boolean(observed), reason};
+    },
     read(project, id) {
       if (id !== undefined && !taskKey.test(id)) throw problem(400, 'API_TASK_INVALID');
       return view(project.id, store.getWork(project.id, id).operation);

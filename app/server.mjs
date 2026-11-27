@@ -16,6 +16,7 @@ import {createCodexClient, emptyNativeActivity, isCodexLoopbackUrl, validEvidenc
 import {createOperations} from './operations.mjs';
 import {createExecutionAccess, executionHeld} from './execution-access.mjs';
 import {executionEstimates} from './execution-estimates.mjs';
+import {createPortfolioExecution, unknownExecution} from './portfolio-execution.mjs';
 import {createPlanAuth, PLAN_AUTH_CALLBACK_PATH} from './chatgpt-plan-auth.mjs';
 import {createChatGPTResponses} from './chatgpt-responses.mjs';
 import {ensurePrivateDirectory, readPrivateRuntimeToken} from './private-directory.mjs';
@@ -208,6 +209,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       if (chats.hasActiveLive(project.id)) throw error(409, 'ChatGPTの応答が終わるまで開始できません。');
       return act();
     })});
+  const portfolioExecution = createPortfolioExecution(directory,execution.store,operations,apiWork,apiEnabled);
   if (plan === true) {
     const auth = createPlanAuth({directory});
     plan = {auth, responses: createChatGPTResponses({auth})};
@@ -461,7 +463,10 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
     const portfolio = await readPortfolio(directory, github, portfolioRequest);
     if (portfolioRequest) {
       if (!signedIn()) throw error(401, 'サインインが必要です。');
-      return send(response, 200, {...portfolio.view, newProjectExecutionSettings:normalizeSettings()});
+      const summaries = portfolioExecution(portfolio.projects);
+      const projects = portfolio.view.projects.map(project=>portfolio.projects.has(project.id)
+        ? {...project,executionSummary:summaries.get(project.id) ?? unknownExecution} : project);
+      return send(response, 200, {...portfolio.view,projects,newProjectExecutionSettings:normalizeSettings()});
     }
     if (get && route === '/api/artifacts/file') return download(response, portfolio.artifacts.get(target.searchParams.get('id')));
     if (get && route === '/api/artifacts/work') {
@@ -521,10 +526,12 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       if (get) return send(response, 200, {...execution.settings(project), apiAvailable: apiEnabled && apiWork.capabilities(project).available});
       if (post) {
         const input = await jsonBody(request, 8192);
-        return send(response, 200, operations.updateExecution(project, () => {
+        const updated = operations.updateExecution(project, () => {
           if (chats.hasActiveLive(project.id)) throw error(409, 'ChatGPTの応答が終わってから設定を変更してください。');
           return execution.update(project, input);
-        }));
+        });
+        const summary = portfolioExecution(new Map([[project.id,project]])).get(project.id);
+        return send(response, 200, {...updated,executionSummary:summary ?? unknownExecution});
       }
     }
     if (get && ['/api/artifacts/work/file', '/api/execution/api/artifact'].includes(route)) {

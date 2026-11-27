@@ -147,9 +147,7 @@ export function readCurrentProject(directory, id) {
   return rows.length === 1 ? normalizeProject(rows[0], date(raw.observedAt)) : null;
 }
 
-export function readProjectInitialExecution(directory, id) {
-  const rows = readDefinition(directory).projects.filter(row => row?.id === id);
-  const row = rows.length === 1 ? rows[0] : null;
+function initialExecution(row) {
   if (!row || (row.registrationRequestId === undefined && row.initialExecution === undefined &&
       row.registrationFingerprint === undefined)) return null;
   const initial = row.initialExecution;
@@ -157,13 +155,39 @@ export function readProjectInitialExecution(directory, id) {
     if (typeof row.registrationRequestId === 'string' && requestKey.test(row.registrationRequestId) &&
         typeof row.registrationFingerprint === 'string' && /^[a-f0-9]{64}$/.test(row.registrationFingerprint) &&
         date(initial?.updatedAt) && initial.settings && isDeepStrictEqual(normalizeSettings(initial.settings), initial.settings) &&
-        initial.sha256 === digest([id, initial.updatedAt, orderedSettings(initial.settings)])) {
+        initial.sha256 === digest([row.id, initial.updatedAt, orderedSettings(initial.settings)])) {
       return {updatedAt:initial.updatedAt, settings:initial.settings};
     }
   } catch (error) {
     if (!(error instanceof TypeError)) throw error;
   }
   throw registrationError(409, 'この案件の初回実行設定を照合できません。');
+}
+
+export function readProjectInitialExecution(directory, id) {
+  const rows = readDefinition(directory).projects.filter(row => row?.id === id);
+  return initialExecution(rows.length === 1 ? rows[0] : null);
+}
+
+export function readProjectExecutionBindings(directory, ids) {
+  const raw = readDefinition(directory);
+  const observedAt = date(raw.observedAt);
+  const wanted = new Set(ids);
+  const found = new Map();
+  const ambiguous = new Set();
+  for (const row of raw.projects) {
+    if (!wanted.has(row?.id) || ambiguous.has(row.id)) continue;
+    if (found.has(row.id)) {
+      found.delete(row.id);
+      ambiguous.add(row.id);
+      continue;
+    }
+    const project = normalizeProject(row, observedAt);
+    let initial;
+    try { initial = initialExecution(row); } catch { /* An invalid initial policy is not a default. */ }
+    found.set(row.id, {project, initial});
+  }
+  return found;
 }
 
 function saveRegistration(file, before, raw) {

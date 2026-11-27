@@ -30,6 +30,8 @@ const validProviderReceipt = receipt => receipt !== null && typeof receipt === '
     receipt.id.length >= 6 && receipt.id.length <= 128 && !/[^A-Za-z0-9]/.test(receipt.id.slice(5)))) &&
   [receipt.inputTokens, receipt.outputTokens, receipt.accountedMicros].every(count => Number.isSafeInteger(count) && count >= 0) &&
   typeof receipt.observedAt === 'string' && Number.isFinite(Date.parse(receipt.observedAt));
+const lastOperation = operations => operations.reduce((latest, item) =>
+  !latest || item.createdAt >= latest.createdAt ? item : latest, null);
 const settingFields = Object.keys(normalizeSettings());
 const emptyProject = initial => ({
   revision: 0, settings: initial?.settings ?? normalizeSettings(), updatedAt: initial?.updatedAt,
@@ -145,8 +147,7 @@ export class ExecutionStore {
   getWork(projectId, taskId) {
     const project = this.#project(this.#read(), projectId);
     const operations = Object.values(project.operations);
-    const operation = taskId === undefined ? operations.reduce((latest, item) =>
-      !latest || item.createdAt >= latest.createdAt ? item : latest, null)
+    const operation = taskId === undefined ? lastOperation(operations)
       : Object.hasOwn(project.operations, id(taskId)) ? project.operations[taskId] : null;
     const checkpointOperation = project.checkpoint
       ? operations.find(item => item.checkpointVersion === project.checkpoint.version) ?? null : null;
@@ -154,6 +155,23 @@ export class ExecutionStore {
       .sort((a, b) => a.checkpointVersion - b.checkpointVersion) : [];
     return clone({operation, checkpoint: project.checkpoint, checkpointOperation, verifiedApiOperations, settledApiMicros: project.spentMicros,
       busy: operations.some(item => active.has(item.status))});
+  }
+
+  portfolioPolicies(bindings) {
+    const results = new Map();
+    let data;
+    try { data = this.#read(); } catch { return results; }
+    for (const [projectId, {initial}] of bindings) {
+      try {
+        const project = Object.hasOwn(data.projects, projectId) ? this.#project(data, projectId)
+          : initial === undefined ? null : emptyProject(initial);
+        if (!project) continue;
+        results.set(projectId, {mode:project.settings.mode,
+          modeSource:project.revision || project.updatedAt ? 'saved' : 'default',
+          operation:lastOperation(Object.values(project.operations))});
+      } catch { /* A corrupt project must not hide other projects or invent its mode. */ }
+    }
+    return results;
   }
 
   findExecution(projectId, executionId) {

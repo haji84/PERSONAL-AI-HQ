@@ -156,14 +156,24 @@ export function createOperations(directory, native, execution, {prepareHandover}
     VALUES (?,?,?,?,?,'sending',?) ON CONFLICT(project,id) DO NOTHING`);
   const resolveSteering = db.prepare(`UPDATE codex_steering SET phase=?,updatedAt=? WHERE project=? AND id=? AND phase<>'accepted'`);
   const reconciled = new Map();
+  const verifiedRunning = new Map();
   const interruptRequests = new Set();
   const cancellationChecks = new Set();
   let closed = false;
 
-  function advance(row, state, turnId, startedAt = null) {
+  function advance(row, state, turnId, startedAt = null, observedRunning = true) {
     if (closed || !row) return;
-    change.run(state, turnId ?? null, timestamp(), startedAt, row.project, row.id);
-    if (state === 'running') void dispatchCancellation(byId.get(row.project, row.id));
+    const observedAt = timestamp();
+    const changed = change.run(state, turnId ?? null, observedAt, startedAt, row.project, row.id).changes;
+    if (state === 'running') {
+      const current = byId.get(row.project, row.id);
+      if (observedRunning && changed && current?.phase === 'running' && current.turnId && !current.cancellationRequestedAt) {
+        verifiedRunning.set(row.project, {operationId:row.id, turnId:current.turnId, observedAt});
+      }
+      void dispatchCancellation(current);
+    } else if (changed && verifiedRunning.get(row.project)?.operationId === row.id) {
+      verifiedRunning.delete(row.project);
+    }
   }
   function response(row) {
     if (!row) return null;
@@ -188,7 +198,13 @@ export function createOperations(directory, native, execution, {prepareHandover}
     }
     if (method === 'item/agentMessage/delta' && typeof value.delta === 'string') {
       const row = byTurn.get(value.threadId, value.turnId);
-      if (row && active.has(row.phase)) append.run(value.delta.slice(0, 4000), timestamp(), row.project, row.id);
+      if (row && active.has(row.phase)) {
+        const observedAt = timestamp();
+        append.run(value.delta.slice(0, 4000), observedAt, row.project, row.id);
+        if (row.phase === 'running' && !row.cancellationRequestedAt) {
+          verifiedRunning.set(row.project, {operationId:row.id, turnId:row.turnId, observedAt});
+        }
+      }
       return;
     }
     if (method !== 'turn/started' && method !== 'turn/completed') return;
@@ -321,6 +337,22 @@ export function createOperations(directory, native, execution, {prepareHandover}
       if (row && (!project.cwd.includes(row.workspace) || (receipt && row.handoverReceipt !== receipt))) return {operation: null};
       return {operation: response(await runtimeResult(row))};
     },
+    portfolioActivity(project, now) {
+      const row = latestScoped.get(project.id, JSON.stringify(project.cwd));
+      if (!row) return null;
+      const live = verifiedRunning.get(project.id);
+      const age = now - Date.parse(live?.observedAt);
+      const state = visiblePhase(row);
+      const running = project.codexWrite && native.canWrite && state === 'running' &&
+        live?.operationId === row.id && live.turnId === row.turnId && age >= 0 && age <= observationWindowMs;
+      if (live && age > observationWindowMs) verifiedRunning.delete(project.id);
+      const accepted = nativeThreadId.test(row.threadId ?? '') && nativeThreadId.test(row.turnId ?? '') && row.startedAt;
+      const routeObservedAt = running ? live.observedAt : accepted && row.startedAt;
+      const reason = ['failed','interrupted','cancelled'].includes(state) ? state :
+        active.has(row.phase) && !running ? 'unconfirmed' : null;
+      return {route:'subscription', createdAt:row.createdAt, observedAt:routeObservedAt || null,
+        updatedAt:row.updatedAt, active:Boolean(running), liveAgeMs:observationWindowMs, reason};
+    },
     async readActivity(project) {
       const row = await runtimeResult(latestScoped.get(project.id, JSON.stringify(project.cwd)));
       if (!row) return {activity: null};
@@ -444,7 +476,8 @@ export function createOperations(directory, native, execution, {prepareHandover}
           readyForTurn && maySubmit() && (!beginsHandover || stillCurrent?.() === true) &&
           setThread.run(id, timestamp(), project.id, input.id).changes === 1,
       }).then(result => {
-        advance(row, phase(result.turn.status) ?? 'running', result.turn.id, timestamp());
+        const observed = phase(result.turn.status);
+        advance(row, observed ?? 'running', result.turn.id, timestamp(), observed === 'running');
       }).catch(error => {
         if (!closed) {
           const current = byId.get(project.id, input.id);
