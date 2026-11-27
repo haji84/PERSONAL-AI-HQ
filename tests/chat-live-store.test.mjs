@@ -1,22 +1,42 @@
 import assert from 'node:assert/strict';
-import {mkdtemp, rm} from 'node:fs/promises';
+import {mkdtemp, realpath, rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
-import {join} from 'node:path';
+import {basename, dirname, join} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
 import test from 'node:test';
 import {createChatStore} from '../app/chat-store.mjs';
 
 const request = {id: 'request-1', model: 'fixture-model', prompt: '新しい質問'};
 
-async function directory(t) {
-  const path = await mkdtemp(join(tmpdir(), 'hq-live-chat-test-'));
-  t.after(() => rm(path, {recursive: true, force: true}));
-  return path;
+async function fixture(t) {
+  const temp = await realpath(tmpdir());
+  const path = await mkdtemp(join(temp, 'hq-live-chat-test-'));
+  const opened = new Set();
+  const keep = entry => {
+    opened.add(entry);
+    return entry;
+  };
+  function close(entry) {
+    entry.close();
+    opened.delete(entry);
+  }
+  t.after(async () => {
+    for (const entry of Array.from(opened).reverse()) close(entry);
+    const target = await realpath(path);
+    assert.equal(dirname(target), temp);
+    assert.ok(basename(target).startsWith('hq-live-chat-test-'));
+    await rm(target, {recursive: true, force: true});
+  });
+  return {
+    database: () => keep(new DatabaseSync(join(path, 'conversations.sqlite'))),
+    store: options => keep(createChatStore(path, options)),
+    close,
+  };
 }
 
 test('migrates the existing SQLite file, branches a reviewed export, and leaves its source untouched', async t => {
-  const path = await directory(t);
-  const old = new DatabaseSync(join(path, 'conversations.sqlite'));
+  const unit = await fixture(t);
+  const old = unit.database();
   const original = [
     {role: 'user', text: '元の質問', createdAt: null},
     {role: 'assistant', text: '元の返答', createdAt: null},
@@ -26,9 +46,8 @@ test('migrates the existing SQLite file, branches a reviewed export, and leaves 
     modified REAL NOT NULL, messages TEXT NOT NULL, PRIMARY KEY(project,id))`);
   old.prepare('INSERT INTO conversations VALUES (?,?,?,?,?,?)').run('example', 'export-1', 'タイトル',
     '2026-11-01T00:00:00.000Z', 1, JSON.stringify(original));
-  old.close();
-  const store = createChatStore(path);
-  t.after(() => store.close());
+  unit.close(old);
+  const store = unit.store();
   assert.throws(() => store.beginLive('other', {...request, conversationId: 'export-1'}), {status: 404});
   const {turn, messages, duplicate} = store.beginLive('example', {...request, conversationId: 'export-1'});
   assert.equal(duplicate, false);
@@ -46,16 +65,15 @@ test('migrates the existing SQLite file, branches a reviewed export, and leaves 
 });
 
 test('replays persisted turn IDs after restart, preserves interrupted partials and never auto-sends', async t => {
-  const path = await directory(t);
+  const unit = await fixture(t);
   let time = Date.now();
-  const first = createChatStore(path, {now: () => time});
+  const first = unit.store({now: () => time});
   const {turn} = first.beginLive('one', request);
   assert.equal(turn.status, 'in_progress');
   first.persistLiveText('one', request.id, '途中');
-  first.close();
+  unit.close(first);
 
-  const second = createChatStore(path, {now: () => time});
-  t.after(() => second.close());
+  const second = unit.store({now: () => time});
   assert.equal(second.readLive('one', request.id).status, 'in_progress');
   time += 10 * 60 * 1000;
   const resumed = second.beginLive('one', request);
@@ -71,10 +89,9 @@ test('replays persisted turn IDs after restart, preserves interrupted partials a
 });
 
 test('serializes turns by conversation across connections and does not replace a terminal outcome', async t => {
-  const path = await directory(t);
-  const one = createChatStore(path);
-  const two = createChatStore(path);
-  t.after(() => { two.close(); one.close(); });
+  const unit = await fixture(t);
+  const one = unit.store();
+  const two = unit.store();
   const {turn} = one.beginLive('example', request);
   const next = {...request, id: 'request-2', conversationId: turn.conversationId, prompt: '続き'};
   assert.throws(() => two.beginLive('example', next), {status: 409});
@@ -90,10 +107,9 @@ test('serializes turns by conversation across connections and does not replace a
 });
 
 test('reserves only after a synchronous routing check and can inspect active turns under a write lock', async t => {
-  const path = await directory(t);
-  const store = createChatStore(path);
-  const routing = new DatabaseSync(join(path, 'conversations.sqlite'));
-  t.after(() => { routing.close(); store.close(); });
+  const unit = await fixture(t);
+  const store = unit.store();
+  const routing = unit.database();
 
   let policyChecks = 0;
   assert.throws(() => store.beginLive('project', request, () => {
