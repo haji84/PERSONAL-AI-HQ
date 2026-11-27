@@ -7,10 +7,22 @@ import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { prepareApiWorkspace, readCommittedEvidence } from '../app/api-workspace.mjs';
+import { canonicalApiWorkspacePath, prepareApiWorkspace, readCommittedEvidence } from '../app/api-workspace.mjs';
 
 const macTest = process.platform === 'darwin' ? test : test.skip;
 const digest = (text) => createHash('sha256').update(text).digest('hex');
+
+test('workspace paths can be bound to a canonical local Windows drive', () => {
+  const windows = path.win32;
+  const local = 'C:\\Users\\Owner\\保護 Work';
+  assert.equal(canonicalApiWorkspacePath(local, windows), local);
+  for (const invalid of [
+    '\\\\host\\share\\workspace', '\\\\?\\C:\\work', 'C:relative', 'C:/work', 'C:\\work\\..\\other',
+    'C:\\work\\file:stream', 'C:\\work\\other.', 'C:\\work\\NUL.txt', 'C:\\work\\COM¹.txt', 'C:\\work\\CONIN$',
+  ]) assert.throws(() => canonicalApiWorkspacePath(invalid, windows), /canonical/i, invalid);
+  assert.equal(canonicalApiWorkspacePath('/Users/Owner/work', path.posix), '/Users/Owner/work');
+  assert.throws(() => canonicalApiWorkspacePath('/Users/Owner/work\\other', path.posix), /canonical/i);
+});
 
 async function fixture(t, extra = '', expected = 2) {
   const root = await realpath(await mkdtemp(path.join(tmpdir(), 'hq-api-test-')));

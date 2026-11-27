@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
-import { constants } from 'node:fs';
+import { constants, lstatSync, realpathSync } from 'node:fs';
 import { lstat, mkdir, open, realpath, writeFile } from 'node:fs/promises';
-import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, resolve, win32 } from 'node:path';
 import { promisify } from 'node:util';
 
 const execute = promisify(execFile);
@@ -13,6 +13,9 @@ $currentSid = $identity.User.Value
 $trusted = @($currentSid, 'S-1-5-18', 'S-1-5-32-544')
 function Test-Private($acl) {
   if ($acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $currentSid) { return $false }
+  $descriptor = [System.Security.AccessControl.RawSecurityDescriptor]::new($acl.GetSecurityDescriptorBinaryForm(), 0)
+  if ($null -eq $descriptor.DiscretionaryAcl -or
+      -not ($descriptor.ControlFlags -band [System.Security.AccessControl.ControlFlags]::DiscretionaryAclPresent)) { return $false }
   foreach ($rule in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
     if ($rule.AccessControlType -eq 'Allow' -and $rule.IdentityReference.Value -notin $trusted) { return $false }
   }
@@ -57,6 +60,93 @@ if (-not (Test-Private ([IO.Directory]::GetAccessControl($directory.FullName))) 
     -not (Test-Private ([IO.File]::GetAccessControl($file.FullName)))) { throw 'File is not private' }
 [Console]::Out.Write('private')
 `;
+
+const windowsWorkspaceCheck = String.raw`
+$ErrorActionPreference = 'Stop'
+${windowsOwnerACL}
+function Read-ExactChild([string]$parent, [string]$name, [bool]$isDirectory) {
+  $exact = $null
+  foreach ($entry in [IO.DirectoryInfo]::new($parent).EnumerateFileSystemInfos()) {
+    if ([string]::Equals($entry.Name, $name, [StringComparison]::OrdinalIgnoreCase)) {
+      if ($null -ne $exact -or -not [string]::Equals($entry.Name, $name, [StringComparison]::Ordinal)) { throw 'Ambiguous entry' }
+      $exact = $entry
+    }
+  }
+  if ($null -eq $exact -or -not $exact.Exists -or
+      ($exact.Attributes -band ([IO.FileAttributes]::ReparsePoint -bor [IO.FileAttributes]::Device)) -or
+      ($isDirectory -ne ($exact -is [IO.DirectoryInfo]))) { throw 'Invalid entry' }
+  return $exact
+}
+function Assert-OwnedEntry($item, [bool]$isDirectory) {
+  $acl = if ($isDirectory) { [IO.Directory]::GetAccessControl($item.FullName) }
+         else { [IO.File]::GetAccessControl($item.FullName) }
+  if (-not (Test-Private $acl)) { throw 'Entry is not private' }
+}
+$directory = $env:PERSONAL_AI_HQ_WORKSPACE_CHECK
+$drive = [IO.Path]::GetPathRoot($directory)
+if ([IO.DriveInfo]::new($drive).DriveType -ne [IO.DriveType]::Fixed) { throw 'Nonlocal drive' }
+$parent = $drive
+foreach ($name in $directory.Substring($drive.Length).Split([char]92)) {
+  $workspace = Read-ExactChild $parent $name $true
+  $parent = $workspace.FullName
+}
+Assert-OwnedEntry $workspace $true
+$checkedDirectories = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+$files = [string]$env:PERSONAL_AI_HQ_WORKSPACE_FILES
+if ($files.Length -gt 0) {
+  foreach ($relative in $files.Split([char]10)) {
+    $parent = $workspace.FullName
+    $parts = $relative.Split([char]47)
+    for ($index = 0; $index -lt $parts.Length; $index++) {
+      $isDirectory = $index -lt ($parts.Length - 1)
+      $path = [IO.Path]::Combine($parent, $parts[$index])
+      if (-not $isDirectory -or -not $checkedDirectories.Contains($path)) {
+        $item = Read-ExactChild $parent $parts[$index] $isDirectory
+        Assert-OwnedEntry $item $isDirectory
+        if ($isDirectory) { [void]$checkedDirectories.Add($path) }
+      }
+      $parent = $path
+    }
+  }
+}
+[Console]::Out.Write('private')
+`;
+
+export function isOrdinaryWindowsPathComponent(name) {
+  return name.length > 0 && name.length <= 255 && name.isWellFormed() &&
+    !/[<>:"/\\|?*\x00-\x1f\x7f-\x9f]/u.test(name) && !name.endsWith('.') && !name.endsWith(' ') &&
+    !/^(?:con|prn|aux|nul|clock\$|conin\$|conout\$|(?:com|lpt)[0-9¹²³])$/iu.test(name.split('.', 1)[0].trimEnd());
+}
+
+function validWindowsDirectory(directory) {
+  return typeof directory === 'string' && /^[A-Za-z]:\\/.test(directory) && directory.length <= 4096 &&
+    directory.slice(3).split('\\').every(isOrdinaryWindowsPathComponent);
+}
+
+export async function assertWindowsPrivateWorkspace(directory, relativeFiles, signal) {
+  const rejected = () => new Error('A private Windows workspace is required');
+  const systemRoot = process.env.SystemRoot;
+  if (process.platform !== 'win32' || !validWindowsDirectory(directory) || !validWindowsDirectory(systemRoot) ||
+      !Array.isArray(relativeFiles) || relativeFiles.length > 64) throw rejected();
+  const files = [...new Set(relativeFiles)];
+  if (files.some(file => typeof file !== 'string' || file.length > 240 ||
+      !file.split('/').every(isOrdinaryWindowsPathComponent))) throw rejected();
+  try {
+    signal?.throwIfAborted();
+    if (realpathSync.native(directory) !== directory) throw rejected();
+    const { stdout } = await execute(powershell(), ['-NoProfile', '-NonInteractive', '-Command', windowsWorkspaceCheck], {
+      cwd: systemRoot, windowsHide: true, timeout: 10_000, maxBuffer: 1024, signal,
+      env: { SystemRoot: systemRoot, WINDIR: systemRoot, SystemDrive: systemRoot.slice(0, 2),
+        PERSONAL_AI_HQ_WORKSPACE_CHECK: directory, PERSONAL_AI_HQ_WORKSPACE_FILES: files.join('\n') },
+    });
+    signal?.throwIfAborted();
+    if (stdout !== 'private' || files.some(file => {
+      const target = win32.join(directory, file);
+      const info = lstatSync(target);
+      return !info.isFile() || info.nlink !== 1 || realpathSync.native(target) !== target;
+    })) throw rejected();
+  } catch { throw rejected(); }
+}
 
 export async function ensurePrivateDirectory(input) {
   const directory = resolve(input);

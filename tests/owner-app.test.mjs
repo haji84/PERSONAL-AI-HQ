@@ -7,6 +7,7 @@ import {basename, dirname, join, resolve} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
 import test from 'node:test';
 import {setTimeout as delay} from 'node:timers/promises';
+import {prepareArtifactEvidenceReadback} from '../app/api-workspace.mjs';
 import {startOwnerApp} from '../app/server.mjs';
 import {createChatStore} from '../app/chat-store.mjs';
 import {ExecutionStore} from '../app/execution-store.mjs';
@@ -1475,7 +1476,8 @@ test('Codex chat context pins only exact existing conversation handoffs and pres
   assert.equal(submits,3);
 });
 
-test('Codex chat context includes only committed artifacts attested for the exact turn', {skip:!process.getuid}, async t => {
+test('Codex chat context includes only committed artifacts attested for the exact turn',
+  {skip:!process.getuid && process.platform!=='win32'}, async t => {
   const {directory, start} = await runtimeFixture(t);
   const checkout = join(directory,'workspaces','example');
   await mkdir(checkout,{recursive:true,mode:0o700});
@@ -1484,9 +1486,10 @@ test('Codex chat context includes only committed artifacts attested for the exac
   await Promise.all(Object.entries(fixture).map(([name,value])=>writeFile(join(checkout,name),value,{mode:0o600})));
   const git = args => execFileSync('git',['-C',checkout,...args],{encoding:'utf8',stdio:['ignore','pipe','ignore']}).trim();
   git(['init','-q']);
+  git(['config','core.autocrlf','false']);
   git(['add','--','requirements.txt','verification.txt','artifact.txt']);
   git(['-c','user.name=Test','-c','user.email=test@example.test','-c','commit.gpgsign=false',
-    '-c','core.hooksPath=/dev/null','commit','-qm','isolated fixture']);
+    '-c','core.hooksPath='+(process.platform==='win32'?'NUL':'/dev/null'),'commit','-qm','isolated fixture']);
   const digest = text => createHash('sha256').update(text).digest('hex');
   const operationId = 'recorded-operation';
   const now = '2026-11-28T00:00:00.000Z';
@@ -1519,10 +1522,28 @@ test('Codex chat context includes only committed artifacts attested for the exac
   const correct = await read('verified-turn');
   assert.equal(correct.coverage.artifactEvidence,'verified');
   assert.deepEqual(correct.artifacts,[{path:'artifact.txt',sha256:digest(fixture['artifact.txt']),observedAt:now}]);
+  const listPath=app.url+'/api/artifacts/work?source=codex&project=example';
+  assert.equal((await fetch(listPath)).status,401);
+  const list=await fetch(listPath,{headers:{cookie}});
+  assert.equal(list.status,200);
+  const {artifacts}=await list.json();
+  assert.equal(artifacts.length,1);
+  const artifactUrl=app.url+artifacts[0].href;
+  const download=await fetch(artifactUrl,{headers:{cookie}});
+  assert.equal(download.status,200);
+  assert.equal(await download.text(),fixture['artifact.txt']);
+  await writeFile(join(checkout,'.hq-owned-workspace'),'other-project\n');
+  assert.equal((await fetch(artifactUrl,{headers:{cookie}})).status,404);
+  await writeFile(join(checkout,'.hq-owned-workspace'),fixture['.hq-owned-workspace']);
   const other = await read('other-turn');
   assert.equal(other.coverage.artifactEvidence,'unpublished');
   assert.deepEqual(other.artifacts,[]);
+  const readback = await prepareArtifactEvidenceReadback({checkout,head:project.nativeHandover.checkoutHead,
+    files:project.nativeHandover.artifacts,workspaceProject:'example',signal:AbortSignal.timeout(12000)});
+  assert.equal(readback?.(),true);
   await writeFile(join(checkout,'artifact.txt'),'Changed without attestation');
+  assert.equal(readback(),false);
+  assert.equal((await fetch(artifactUrl,{headers:{cookie}})).status,404);
   const changed = await read('verified-turn');
   assert.equal(changed.coverage.artifactEvidence,'unverified');
   assert.deepEqual(changed.artifacts,[]);

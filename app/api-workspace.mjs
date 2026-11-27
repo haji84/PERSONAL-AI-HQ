@@ -1,8 +1,10 @@
-import { execFileSync, spawn } from 'node:child_process';
+import { execFile, execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { closeSync, constants, fstatSync, openSync, readSync, realpathSync } from 'node:fs';
 import { access, lstat, mkdir, open, readdir, realpath, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { promisify } from 'node:util';
+import { assertWindowsPrivateWorkspace, isOrdinaryWindowsPathComponent } from './private-directory.mjs';
 
 const SANDBOX = '/usr/bin/sandbox-exec';
 const MAX_FILES = 24;
@@ -13,6 +15,9 @@ const VERIFY_TIMEOUT_MS = 15_000;
 const MAX_RUNNER_OUTPUT = 16 * 1024;
 const UTF8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 const hash = (bytes) => createHash('sha256').update(bytes).digest('hex');
+const windows = process.platform === 'win32';
+const workspaceMarker = '.hq-owned-workspace';
+const execute = promisify(execFile);
 
 function sourcePath(input) {
   if (typeof input !== 'string' || input.length > 240) throw new Error('Invalid API source path');
@@ -20,20 +25,27 @@ function sourcePath(input) {
   const reserved = /(?:^|[._-])(?:credential[s]?|secret[s]?|token[s]?|private[-_]key[s]?|id_rsa|id_ed25519)(?:[._-]|$)/i;
   if (
     !components.every((part) => /^[A-Za-z0-9_][A-Za-z0-9._-]*$/.test(part) && !reserved.test(part))
+    || (windows && !components.every(isOrdinaryWindowsPathComponent))
     || /\.(?:key|pem|pfx|p12|crt|cer|sqlite[0-9]*|db|log)$/i.test(input)
   ) throw new Error('Invalid API source path');
   return input;
 }
 
-function absolute(input) {
-  if (typeof input !== 'string' || !path.isAbsolute(input) || path.normalize(input) !== input || /[\x00-\x1f\x7f"\\]/.test(input)) {
-    throw new Error('API workspace paths must be absolute and canonical');
+export function canonicalApiWorkspacePath(input, platformPath = path) {
+  const invalid = () => new Error('API workspace paths must be absolute and canonical');
+  if (typeof input !== 'string' || !platformPath.isAbsolute(input) ||
+      platformPath.normalize(input) !== input || /[\x00-\x1f\x7f"]/.test(input)) throw invalid();
+  if (platformPath.sep === '\\') {
+    const names = input.slice(3);
+    if (!/^[A-Za-z]:\\/.test(input) || (names && !names.split('\\').every(isOrdinaryWindowsPathComponent))) throw invalid();
+  } else if (input.includes('\\')) {
+    throw invalid();
   }
   return input;
 }
 
 async function canonicalDirectory(input) {
-  const directory = absolute(input);
+  const directory = canonicalApiWorkspacePath(input);
   const stat = await lstat(directory);
   if (!stat.isDirectory() || await realpath(directory) !== directory) {
     throw new Error('API workspace directory must exist without aliases');
@@ -111,7 +123,6 @@ export async function readBoundedWorkspaceFile(root, relative, maxBytes) {
 }
 
 export function readOnlyGitInvocation(checkout, args) {
-  const windows = process.platform === 'win32';
   const env = {
     PATH: windows ? process.env.PATH : '/usr/bin:/bin',
     ...(windows && process.env.SystemRoot && {SystemRoot:process.env.SystemRoot}),
@@ -128,6 +139,18 @@ function git(checkout, args) {
     return execFileSync(command.executable, command.args, {env:command.env,
       stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: MAX_FILE_BYTES + 1024, timeout: 3000});
   } catch {
+    throw new Error('Could not read the approved API source from Git');
+  }
+}
+
+async function readWindowsGit(checkout, args, signal) {
+  try {
+    const command = readOnlyGitInvocation(checkout, args);
+    const {stdout} = await execute(command.executable, command.args, {env: command.env, encoding: 'buffer',
+      windowsHide: true, maxBuffer: MAX_FILE_BYTES + 1024, timeout: 3000, signal});
+    return stdout;
+  } catch {
+    signal?.throwIfAborted();
     throw new Error('Could not read the approved API source from Git');
   }
 }
@@ -176,28 +199,43 @@ function makeEntries(files, testPaths) {
   return entries;
 }
 
-function checkoutHead(checkout) {
-  if (git(checkout, ['rev-parse', '--show-toplevel']).toString('utf8').replace(/\r?\n$/, '') !== checkout) {
+function requireCheckoutRoot(checkout, output) {
+  const root = output.toString('utf8').replace(/\r?\n$/, '');
+  if ((windows ? path.normalize(root) : root) !== checkout) {
     throw new Error('API workspace checkout must be the canonical Git worktree root');
   }
-  const head = git(checkout, ['rev-parse', '--verify', 'HEAD^{commit}']).toString('utf8').trim();
+}
+
+function checkedHead(output) {
+  const head = output.toString('utf8').trim();
   if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(head)) throw new Error('Invalid Git HEAD for API workspace');
   return head;
 }
 
-async function committedFile(checkout, baseSha, name, tree, { ownerUid } = {}) {
+function checkoutHead(checkout) {
+  requireCheckoutRoot(checkout, git(checkout, ['rev-parse', '--show-toplevel']));
+  return checkedHead(git(checkout, ['rev-parse', '--verify', 'HEAD^{commit}']));
+}
+
+async function windowsCheckoutHead(checkout, signal) {
+  requireCheckoutRoot(checkout, await readWindowsGit(checkout, ['rev-parse', '--show-toplevel'], signal));
+  return checkedHead(await readWindowsGit(checkout, ['rev-parse', '--verify', 'HEAD^{commit}'], signal));
+}
+
+async function committedFile(checkout, baseSha, name, tree, { ownerUid, signal } = {}) {
   const [mode, actualPath] = tree.split('\t');
   if (!/^100(?:644|755) blob [a-f0-9]{40,64}$/.test(mode) || actualPath !== name + '\0') {
     throw new Error('API source must be a regular Git HEAD file');
   }
   const file = await exactFile(checkout, name);
   if (ownerUid !== undefined && file.stat.uid !== ownerUid) throw new Error('API evidence file must belong to the checkout owner');
-  const bytes = git(checkout, ['cat-file', 'blob', `${baseSha}:${name}`]);
+  const readGit = windows ? readWindowsGit : git;
+  const bytes = await readGit(checkout, ['cat-file', 'blob', `${baseSha}:${name}`], signal);
   if (!bytes.equals(await diskBytes(file))) throw new Error('Approved API source has been modified since Git HEAD');
   return bytes;
 }
 
-export async function readCommittedEvidence({ checkout, paths, signal, includeBytes = false }) {
+export async function readCommittedEvidence({ checkout, paths, signal, includeBytes = false, workspaceProject }) {
   signal?.throwIfAborted();
   if (!Array.isArray(paths) || paths.length === 0 || paths.length > MAX_FILES) {
     throw new Error('A bounded list of committed API evidence paths is required');
@@ -206,45 +244,72 @@ export async function readCommittedEvidence({ checkout, paths, signal, includeBy
   if (new Set(names.map((name) => name.toLowerCase())).size !== names.length) {
     throw new Error('Committed API evidence paths must be distinct and unaliased');
   }
+  const root = await canonicalDirectory(checkout);
   const ownerUid = process.getuid?.();
-  if (ownerUid === undefined || (await canonicalDirectory(checkout)).uid !== ownerUid) {
+  if (windows) {
+    await checkWindowsEvidenceScope(checkout, names, workspaceProject, signal);
+  } else if (ownerUid === undefined || root.uid !== ownerUid) {
     throw new Error('API evidence checkout must belong to the current user');
   }
-  const head = checkoutHead(checkout);
+  const readHead = windows ? windowsCheckoutHead : checkoutHead;
+  const readGit = windows ? readWindowsGit : git;
+  const head = await readHead(checkout, signal);
   const files = [];
   let size = 0;
   for (const name of names) {
     signal?.throwIfAborted();
-    const tree = git(checkout, ['ls-tree', '-z', head, '--', name]).toString('utf8');
-    const bytes = await committedFile(checkout, head, name, tree, { ownerUid });
+    const tree = await readGit(checkout, ['ls-tree', '-z', head, '--', name], signal);
+    const bytes = await committedFile(checkout, head, name, tree.toString('utf8'), { ownerUid, signal });
     size += bytes.length;
     if (size > MAX_WORKSPACE_BYTES) throw new Error('Committed API evidence exceeds its size limit');
     files.push({ path: name, sha256: hash(bytes), ...(includeBytes ? {bytes} : {}) });
   }
   signal?.throwIfAborted();
-  if (checkoutHead(checkout) !== head) throw new Error('API evidence Git HEAD changed during readback');
+  if (await readHead(checkout, signal) !== head) throw new Error('API evidence Git HEAD changed during readback');
+  signal?.throwIfAborted();
   return { head, files };
 }
+
+function checkedEvidenceBytes(checkout, name, ownerUid, maxBytes) {
+  const filename = path.join(checkout, name);
+  if (realpathSync(filename) !== filename) throw new Error('API evidence path changed');
+  const fd = openSync(filename, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+  try {
+    const before = fstatSync(fd, { bigint: true });
+    if (!before.isFile() || (ownerUid !== undefined && before.uid !== BigInt(ownerUid)) ||
+        before.nlink !== 1n || before.size > BigInt(maxBytes)) throw new Error('API evidence file is outside its scope');
+    const buffer = Buffer.alloc(Number(before.size) + 1);
+    const length = readSync(fd, buffer, 0, buffer.length, 0);
+    const after = fstatSync(fd, { bigint: true });
+    if (BigInt(length) !== before.size || before.ctimeNs !== after.ctimeNs || before.mtimeNs !== after.mtimeNs) {
+      throw new Error('API evidence changed during readback');
+    }
+    return buffer.subarray(0, length);
+  } finally { closeSync(fd); }
+}
+
+async function checkWindowsEvidenceScope(checkout, names, workspaceProject, signal) {
+  if (typeof workspaceProject !== 'string' || !workspaceProject || workspaceProject.length > 100) {
+    throw new Error('API evidence workspace requires an approved project');
+  }
+  await assertWindowsPrivateWorkspace(checkout, [workspaceMarker, ...names], signal);
+  if (!workspaceMarkerMatches(checkout, workspaceProject)) {
+    throw new Error('API evidence workspace does not match the approved project');
+  }
+}
+
+const workspaceMarkerMatches = (checkout, project) =>
+  checkedEvidenceBytes(checkout, workspaceMarker, undefined, 100).toString('utf8').trim() === project;
+const evidenceEntries = files => Array.from(files, ({path: name, sha256}) => ({name: sourcePath(name), sha256}));
+const matchingEvidence = (checkout, evidence, owner) => evidence.every(({name, sha256}) =>
+  hash(checkedEvidenceBytes(checkout, name, owner, MAX_FILE_BYTES)) === sha256);
 
 // The Git blobs were already checked. At dispatch, make sure the same revision and working bytes are still present.
 export function checkedEvidenceIsCurrent({ checkout, head, files, requireClean = false }) {
   try {
     const owner = process.getuid?.();
-    if (owner === undefined || realpathSync(absolute(checkout)) !== checkout || checkoutHead(checkout) !== head) return false;
-    const buffer = Buffer.alloc(MAX_FILE_BYTES + 1);
-    for (const file of files) {
-      const filename = path.join(checkout, sourcePath(file.path));
-      if (realpathSync(filename) !== filename) return false;
-      const fd = openSync(filename, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-      try {
-        const before = fstatSync(fd, { bigint: true });
-        if (!before.isFile() || before.uid !== BigInt(owner) || before.nlink !== 1n || before.size > BigInt(MAX_FILE_BYTES)) return false;
-        const length = readSync(fd, buffer, 0, buffer.length, 0);
-        const after = fstatSync(fd, { bigint: true });
-        if (BigInt(length) !== before.size || before.ctimeNs !== after.ctimeNs || before.mtimeNs !== after.mtimeNs ||
-            hash(buffer.subarray(0, length)) !== file.sha256) return false;
-      } finally { closeSync(fd); }
-    }
+    if (owner === undefined || realpathSync(canonicalApiWorkspacePath(checkout)) !== checkout) return false;
+    if (checkoutHead(checkout) !== head || !matchingEvidence(checkout, evidenceEntries(files), owner)) return false;
     if (requireClean) {
       const index = git(checkout, ['ls-files', '-v', '-z']).toString('utf8').split('\0');
       if (index.some(entry => entry && !entry.startsWith('H '))) return false;
@@ -254,6 +319,23 @@ export function checkedEvidenceIsCurrent({ checkout, head, files, requireClean =
     }
     return checkoutHead(checkout) === head;
   } catch { return false; }
+}
+
+export async function prepareArtifactEvidenceReadback({ checkout, head, files, workspaceProject, signal }) {
+  if (!windows) return () => checkedEvidenceIsCurrent({checkout, head, files});
+  try {
+    const evidence = evidenceEntries(files);
+    const names = evidence.map(({name}) => name);
+    await checkWindowsEvidenceScope(checkout, names, workspaceProject, signal);
+    if (await windowsCheckoutHead(checkout, signal) !== head) return null;
+    // The caller checks working bytes after the last asynchronous read, even when listing several projects.
+    return () => {
+      try {
+        return !signal?.aborted && workspaceMarkerMatches(checkout, workspaceProject) &&
+          matchingEvidence(checkout, evidence);
+      } catch { return false; }
+    };
+  } catch { return null; }
 }
 
 async function snapshot(checkout, baseSha, entries, signal) {
@@ -449,8 +531,8 @@ export async function prepareApiWorkspace({ checkout, jobRoot, files, testPaths,
   }
   signal?.throwIfAborted();
   await access(SANDBOX, constants.X_OK);
-  const node = absolute(await realpath(process.execPath));
-  const parent = await canonicalDirectory(path.dirname(absolute(jobRoot)));
+  const node = canonicalApiWorkspacePath(await realpath(process.execPath));
+  const parent = await canonicalDirectory(path.dirname(canonicalApiWorkspacePath(jobRoot)));
   if (parent.uid !== process.getuid() || (parent.mode & 0o077) !== 0 || jobRoot === checkout || jobRoot.startsWith(checkout + '/')) {
     throw new Error('API job directory must be outside the checkout with a private owner-only parent');
   }
