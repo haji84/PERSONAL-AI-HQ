@@ -39,6 +39,7 @@ const iso = value => Number.isFinite(value) && value >= 0 && value < 25340230080
 export const validEvidenceCursor = value => typeof value === 'string' && value.length > 0 &&
   value.length <= evidenceCursorLimit && !/[\x00-\x1f\x7f]/u.test(value);
 export const validEvidenceTarget = value => typeof value === 'string' && handoverItemId.test(value);
+export const validCodexRecordId = value => typeof value === 'string' && threadId.test(value);
 
 const exactEvidenceEntry = (entry, turn) => entry?.turnId === turn && validEvidenceTarget(entry.item?.id);
 
@@ -637,8 +638,8 @@ export function createCodexClient({command, socket, loopback} = {}) {
       return readEvidence(scope, id, turnId, cursor, item);
     },
     async readHandoverTurn(workspace, id, turnId, clientId) {
-      if (typeof workspace !== 'string' || !workspace || typeof turnId !== 'string' || !threadId.test(turnId) ||
-          typeof clientId !== 'string' || !threadId.test(clientId)) throw unverified();
+      if (typeof workspace !== 'string' || !workspace || !validCodexRecordId(turnId) ||
+          !validCodexRecordId(clientId)) throw unverified();
       const {rpc, thread} = await scopedThread([workspace], id);
       if (!canReadHandover(thread)) throw unverified();
       const latest = await latestCompletedTurn(rpc, id, turnId);

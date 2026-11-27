@@ -398,13 +398,13 @@ export function createApiDevelopment({directory, store, conversations, withProje
     const artifacts = checkpoint.artifacts.map(({path, sha256}) => ({path, sha256}));
     const stamp = digest({source, checkpoint, requirements, goal: owned.current.goal, status: owned.current.state,
       revision, settings, apiCheckpoint: work.checkpoint, settledApiMicros: work.settledApiMicros});
-    return {owned, source, checkpoint, requirements, verification, artifacts, stamp, settings, revision,
+    return {owned, source, checkpoint, requirements, verification, artifacts, stamp, settings, revision, work,
       settledApiMicros: work.settledApiMicros};
   }
 
   async function inspectNativeHandover(project, threadId, exceptOperation) {
     if (typeof threadId !== 'string' || !taskKey.test(threadId)) throw problem(404, 'API_TASK_NOT_FOUND');
-    const {owned, source, checkpoint, requirements, verification, artifacts, stamp, settings, revision, settledApiMicros} =
+    const {owned, source, checkpoint, requirements, verification, artifacts, stamp, settings, revision, settledApiMicros, work} =
       nativeHandoverState(project, threadId, exceptOperation);
     const files = [requirements, verification, ...artifacts];
     const git = await checkedEvidence(owned.checkout, files.map(file => file.path), AbortSignal.timeout(12000), 'NATIVE_HANDOVER_GIT_CHANGED');
@@ -414,8 +414,8 @@ export function createApiDevelopment({directory, store, conversations, withProje
     const turn = await readHandoverTurn(owned.checkout, threadId, source.turnId, source.id);
     if (turn?.threadId !== threadId || turn.turnId !== source.turnId || !Array.isArray(turn.messages) ||
         digest(turn.messages) !== checkpoint.transcriptSha256) throw problem(409, 'HANDOVER_CONVERSATION_UNVERIFIED');
-    function assertCurrent() {
-      if (nativeHandoverState(project, threadId, exceptOperation).stamp !== stamp ||
+    function assertCurrent(currentOperation = exceptOperation) {
+      if (nativeHandoverState(project, threadId, currentOperation).stamp !== stamp ||
           !checkedEvidenceIsCurrent({checkout: owned.checkout, head: git.head, files, requireClean: true})) {
         throw problem(409, 'NATIVE_HANDOVER_GIT_CHANGED');
       }
@@ -428,7 +428,8 @@ export function createApiDevelopment({directory, store, conversations, withProje
       previousApiReceipt: source.handoverReceipt, checkoutHead: git.head, requirements, artifacts, verification,
       stopState: owned.current.state, settingsRevision: revision, apiBudgetUsd: settings.apiBudgetUsd ?? null,
       settledApiMicros, messages: turn.messages};
-    return {proof, assertCurrent, files, context};
+    const anchor = digest({checkout: owned.checkout, source, checkpoint, requirements, goal: owned.current.goal, apiCheckpoint: work.checkpoint});
+    return {proof, assertCurrent, files, context, anchor, work};
   }
 
   async function approvedNativeOrigin(project, origin, exceptOperation) {
@@ -442,6 +443,21 @@ export function createApiDevelopment({directory, store, conversations, withProje
   return {
     async previewHandover(project, receipt) { return (await inspectHandover(project, receipt)).proof; },
     async previewNativeHandover(project, threadId) { return (await inspectNativeHandover(project, threadId)).proof; },
+    async prepareRealtimeNativeHandover(project, threadId, exceptOperation) {
+      const checked = await inspectNativeHandover(project, threadId, exceptOperation);
+      const {proof, work} = checked;
+      const operationId = proof.receipt;
+      const history = checked.context.messages.map(({role, text}) => ({role, text}));
+      if (!history.length) throw problem(409, 'HANDOVER_CONVERSATION_UNVERIFIED');
+      const predecessor = work.checkpointOperation;
+      if (work.checkpoint && (predecessor?.route !== 'api' || predecessor.status !== 'completed' ||
+          predecessor.executionId !== checked.context.previousApiReceipt || predecessor.artifactsHash !== work.checkpoint.artifactsHash)) {
+        throw problem(409, 'HANDOVER_REQUIRED');
+      }
+      return {history, turnId: checked.context.turnId, anchor: {threadId, operationId, fingerprint: checked.anchor},
+        origin: {threadId, operationId, review: digest(['realtime-voice', proof.review])},
+        handoverReadback: work.checkpoint ?? undefined, assertCurrent: checked.assertCurrent};
+    },
     async prepareNativeHandover(project, {receipt, review}, workspace, exceptOperation) {
       const state = await inspectHandover(project, receipt, exceptOperation);
       if (state.checkout !== workspace || state.proof.review !== review) throw problem(409, 'HANDOVER_RECEIPT_STALE');

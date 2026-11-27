@@ -4,7 +4,7 @@ import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { moneyMicros, normalizeSettings, resolveExecution, verifyHandover } from './execution-policy.mjs';
 import {maximumRealtimeCostMicros, normalizeRealtimeCostConfig, realtimeResponseMicros, realtimeTranscriptionMicros} from './realtime-cost.mjs';
-import {realtimeArchiveId, validRealtimeContinuation} from './realtime-history.mjs';
+import {realtimeArchiveId, validRealtimeContinuation, validRealtimeNativeReference} from './realtime-history.mjs';
 
 const active = new Set(['reserved', 'running', 'uncertain', 'awaiting_settlement']);
 const terminals = new Set(['completed', 'failed', 'interrupted', 'cancelled']);
@@ -52,7 +52,8 @@ function realtimeArchiveProof(project, archiveId) {
     (operation.realtimeVoice.continuation ? operation.realtimeVoice.continuation.id === archiveId : operation.executionId === first))
     .map(operation => ({id: operation.executionId, model: operation.model, startedAt: operation.dispatchedAt,
       completedAt: operation.completedAt, scopeDigest: operation.realtimeVoice.scopeDigest,
-      continuation: operation.realtimeVoice.continuation, transcriptDigest: operation.voiceSettlement?.transcriptDigest}))
+      continuation: operation.realtimeVoice.continuation, nativeAnchor: operation.realtimeVoice.nativeAnchor,
+      transcriptDigest: operation.voiceSettlement?.transcriptDigest}))
     .sort((first, second) => first.id.localeCompare(second.id));
   return {turns, review: digest(turns)};
 }
@@ -65,14 +66,24 @@ function realtimeAdmission(project, task, context) {
       !hashPattern.test(scope?.scopeDigest ?? '') || task?.route !== 'api' || task.stage !== 'consultation' ||
       task.model !== config.model || task.reasoningEffort !== 'none') return denial('REALTIME_VOICE_AUTHORITY_REQUIRED');
   if (project.settings.mode === 'hybrid' && project.settings.stageRoutes.consultation !== 'api') return denial('ROUTE_NOT_ALLOWED');
-  const {continuation, archiveLedgerReview} = scope;
+  const {continuation, archiveLedgerReview, nativeOrigin, nativeAnchor} = scope;
   if (continuation !== undefined && (!validRealtimeContinuation(continuation) ||
       !hashPattern.test(archiveLedgerReview ?? '') || realtimeArchiveProof(project, continuation.id).review !== archiveLedgerReview)) {
     return denial('REALTIME_VOICE_HISTORY_CHANGED');
   }
+  if (!validVoiceNativeContext(scope)) return denial('HANDOVER_REQUIRED');
   return {allowed: true, realtimeVoice: {config, scopeDigest: scope.scopeDigest,
-    ...(continuation ? {continuation, archiveLedgerReview} : {})}, context: {...context,
+    ...(continuation ? {continuation, archiveLedgerReview} : {}), ...(nativeOrigin ? {nativeOrigin} : {}),
+    ...(nativeAnchor ? {nativeAnchor} : {})}, context: {...context,
     safety: {...context.safety, api: {...context.safety?.api, maxRequestCostUsd: cost / 1_000_000}}}};
+}
+
+function validVoiceNativeContext({continuation, nativeOrigin, nativeAnchor}) {
+  if (nativeOrigin === undefined && nativeAnchor === undefined) return true;
+  if (!validRealtimeNativeReference(nativeAnchor, 'fingerprint')) return false;
+  if (continuation) return nativeOrigin === undefined;
+  return validRealtimeNativeReference(nativeOrigin) && nativeOrigin.threadId === nativeAnchor.threadId &&
+    nativeOrigin.operationId === nativeAnchor.operationId;
 }
 
 function realtimeUsage(usage, kind) {
@@ -207,6 +218,7 @@ export class ExecutionStore {
           operation.providerReceipts !== undefined || operation.checkpointVersion !== undefined)) error('STATE_INVALID');
       if (operation.realtimeVoice?.continuation !== undefined && (!validRealtimeContinuation(operation.realtimeVoice.continuation) ||
           !hashPattern.test(operation.realtimeVoice.archiveLedgerReview ?? ''))) error('STATE_INVALID');
+      if (operation.kind === realtimeKind && !validVoiceNativeContext(operation.realtimeVoice)) error('STATE_INVALID');
       if (operation.voiceSettlement?.transcriptDigest !== undefined && !hashPattern.test(operation.voiceSettlement.transcriptDigest)) error('STATE_INVALID');
       if (operation.route === 'api') { try { id(operation.organizationId); } catch { error('STATE_INVALID'); } }
     }
@@ -403,9 +415,10 @@ export class ExecutionStore {
     if (nativeOrigin !== undefined && (!validNativeOrigin(nativeOrigin) || request.task?.route !== 'api' ||
         !['consultation', 'design'].includes(request.task.stage))) error('INVALID_NATIVE_ORIGIN');
     const continuation = kind === realtimeKind ? context.realtimeVoice?.continuation : undefined;
+    const voiceOrigin = kind === realtimeKind ? context.realtimeVoice?.nativeOrigin : undefined;
     if (continuation !== undefined && !validRealtimeContinuation(continuation)) error('INVALID_EXECUTION_KIND');
     const fingerprint = digest({ instructionDigest: request.instructionDigest, task: request.task ?? {}, nativeOrigin,
-      ...(kind ? {kind} : {}), ...(continuation ? {continuation} : {}) });
+      ...(kind ? {kind} : {}), ...(continuation ? {continuation} : {}), ...(voiceOrigin ? {voiceOrigin} : {}) });
     return this.#change(data => {
       const project = this.#project(data, request.projectId, {create:true});
       const prior = project.operations[request.taskId];

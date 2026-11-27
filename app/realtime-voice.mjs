@@ -36,12 +36,13 @@ function providerSocket(url, options) {
 }
 
 export async function openRealtimeVoice({key, organization, project, model, voice, transcriptionModel, maxOutputTokens,
-  maxInputSeconds, history = [], authorize, connect = providerSocket, signal, timeoutMs = 30000, lifetimeMs = 180000}) {
+  maxInputSeconds, history = [], authorize, beforeContext, connect = providerSocket, signal, timeoutMs = 30000, lifetimeMs = 180000}) {
   if (![key, organization, project].every(value => typeof value === 'string' && /^[\x21-\x7e]{1,512}$/.test(value)) ||
       ![model, voice, transcriptionModel].every(value => typeof value === 'string' && tokenName.test(value)) ||
       !boundedInteger(maxOutputTokens, 1, 4096) || !boundedInteger(maxInputSeconds, 1, 60) ||
       !boundedInteger(timeoutMs, 100, 120000) || !boundedInteger(lifetimeMs, timeoutMs, 300000) ||
-      typeof authorize !== 'function' || typeof connect !== 'function') throw error('REALTIME_VOICE_INVALID_CONFIGURATION');
+      typeof authorize !== 'function' || typeof connect !== 'function' ||
+      (beforeContext !== undefined && typeof beforeContext !== 'function')) throw error('REALTIME_VOICE_INVALID_CONFIGURATION');
   const restore = validateRealtimeHistory(history);
   if (!restore) throw error('REALTIME_VOICE_INVALID_HISTORY');
   const hasHistory = restore.length > 0;
@@ -74,7 +75,7 @@ export async function openRealtimeVoice({key, organization, project, model, voic
   let priorItemId = null;
   let pendingItem;
   const lifetime = setTimeout(() => close('REALTIME_VOICE_SESSION_EXPIRED'), lifetimeMs);
-  const opening = setTimeout(() => close(phase === 'restoring' ? 'REALTIME_VOICE_CONTEXT_UNVERIFIED' :
+  const opening = setTimeout(() => close(['checking-context', 'restoring'].includes(phase) ? 'REALTIME_VOICE_CONTEXT_UNVERIFIED' :
     'REALTIME_VOICE_CONNECTION_FAILED'), timeoutMs);
   lifetime.unref();
   opening.unref();
@@ -136,6 +137,22 @@ export async function openRealtimeVoice({key, organization, project, model, voic
     pendingItem = {id: 'item_' + randomBytes(16).toString('base64url'), type: 'message', role, status: 'completed',
       content: [{type: role === 'user' ? 'input_text' : 'output_text', text}]};
     send({type: 'conversation.item.create', item: pendingItem, ...(priorItemId ? {previous_item_id: priorItemId} : {})});
+  }
+
+  function restoreHistory() {
+    if (!hasHistory || beforeContext === undefined) {
+      if (hasHistory) phase = 'restoring';
+      restoreNext();
+      return;
+    }
+    phase = 'checking-context';
+    Promise.resolve().then(() => {
+      if (phase === 'checking-context') return beforeContext();
+    }).then(() => {
+      if (phase !== 'checking-context') return;
+      phase = 'restoring';
+      restoreNext();
+    }).catch(() => close('REALTIME_VOICE_CONTEXT_UNVERIFIED'));
   }
 
   function checkHistoryEvent(message) {
@@ -250,8 +267,7 @@ export async function openRealtimeVoice({key, organization, project, model, voic
       case 'session.updated':
         if (phase !== 'configuring' || !checkSession(message.session)) throw error('REALTIME_VOICE_CONFIGURATION_UNVERIFIED');
         if (hasHistory && message.session.truncation !== 'disabled') throw error('REALTIME_VOICE_CONTEXT_UNVERIFIED');
-        if (hasHistory) phase = 'restoring';
-        restoreNext();
+        restoreHistory();
         return;
       case 'conversation.item.added':
       case 'conversation.item.done':

@@ -1,9 +1,11 @@
 import {createHash} from 'node:crypto';
 import {readBoundApiAuthority, verifiedApiCredit} from './api-authority.mjs';
+import {validCodexRecordId} from './codex.mjs';
 import {executionHeld} from './execution-access.mjs';
 import {readCurrentProject} from './portfolio.mjs';
 import {hasPublishedRealtimeCeilings} from './realtime-cost.mjs';
-import {realtimeArchiveId, realtimeArchiveReview, realtimeTranscriptDigest, validRealtimeContinuation} from './realtime-history.mjs';
+import {realtimeArchiveId, realtimeArchiveReview, realtimeNativeId, realtimeTranscriptDigest,
+  validRealtimeContinuation, validRealtimeNativeReference} from './realtime-history.mjs';
 import {openRealtimeVoice, validateRealtimeHistory} from './realtime-voice.mjs';
 
 const kind = 'realtime-voice';
@@ -17,13 +19,19 @@ const problem = (status, code) => Object.assign(new Error(code), {status, code})
 const sha = value => createHash('sha256').update(value).digest('hex');
 const safeReason = cause => typeof cause?.code === 'string' && /^[A-Z0-9_]{1,64}$/.test(cause.code)
   ? cause.code : 'REALTIME_VOICE_UNAVAILABLE';
+const sameNativeReference = (first, second, hashKey = 'review') =>
+  ['threadId', 'operationId', hashKey].every(key => first?.[key] === second?.[key]);
+const nativePolicyBinding = policy => sha(JSON.stringify(policy.context.realtimeVoice));
 
 function decodeInput(input) {
-  const continuation = input?.continuation;
+  const {continuation, nativeOrigin} = input ?? {};
   if (continuation !== undefined && !validRealtimeContinuation(continuation)) throw problem(400, 'REALTIME_VOICE_TASK_INVALID');
+  if (nativeOrigin !== undefined && (continuation !== undefined || !validRealtimeNativeReference(nativeOrigin))) {
+    throw problem(400, 'REALTIME_VOICE_TASK_INVALID');
+  }
   if (!taskId(input?.id) || !Number.isSafeInteger(input.revision) || input.revision < 0 ||
       typeof input.pcm !== 'string' || input.pcm.length > 4 * Math.ceil(maxAudioBytes / 3) ||
-      Object.keys(input).length !== (continuation === undefined ? 3 : 4)) throw problem(400, 'REALTIME_VOICE_INVALID_AUDIO');
+      Object.keys(input).length !== (continuation || nativeOrigin ? 4 : 3)) throw problem(400, 'REALTIME_VOICE_INVALID_AUDIO');
   const audio = Buffer.from(input.pcm, 'base64');
   if (audio.length > maxAudioBytes || audio.length < bytesPerSecond / 10 || audio.length % 2 ||
       audio.toString('base64') !== input.pcm) throw problem(400, 'REALTIME_VOICE_INVALID_AUDIO');
@@ -33,12 +41,12 @@ function decodeInput(input) {
 const transcriptMessages = result => [{role: 'user', text: result.inputTranscript},
   {role: 'assistant', text: result.outputTranscript}].filter(message => message.text.trim());
 
-export function createRealtimeExecution({directory, store, conversations, withProjectWorkLock, hasNativeWork,
+export function createRealtimeExecution({directory, store, conversations, withProjectWorkLock, hasNativeWork, prepareNativeHandover,
   getKey = () => process.env.OPENAI_API_KEY, readAuthority, connect}) {
   const jobs = new Map();
   let closing = false;
 
-  function verifiedHistory(projectId, reference, scopeDigest, model) {
+  function verifiedHistory(projectId, reference, scopeDigest, model, nativeAnchor) {
     const id = typeof reference === 'string' ? reference : reference.id;
     if (!realtimeArchiveId.test(id)) throw problem(400, 'REALTIME_VOICE_TASK_INVALID');
     const archived = conversations.readRealtime(projectId, id);
@@ -52,7 +60,8 @@ export function createRealtimeExecution({directory, store, conversations, withPr
     let previous;
     for (const group of archived.groups) {
       const turn = byId.get(group.id);
-      if (!turn?.transcriptDigest || turn.scopeDigest !== scopeDigest || turn.model !== model || group.messages.length !== 2) throw invalid();
+      if (!turn?.transcriptDigest || turn.scopeDigest !== scopeDigest || turn.model !== model || group.messages.length !== 2 ||
+          !sameNativeReference(turn.nativeAnchor, nativeAnchor, 'fingerprint')) throw invalid();
       if (group.messages.some(message => message.createdAt !== (message.role === 'user' ? turn.startedAt : turn.completedAt))) {
         throw invalid();
       }
@@ -65,18 +74,15 @@ export function createRealtimeExecution({directory, store, conversations, withPr
       previous = turn;
     }
     if (archived.importedAt !== previous?.completedAt) throw invalid();
-    const history = validateRealtimeHistory(archived.messages.map(({role, text}) => ({role, text})));
-    if (!history) throw problem(409, 'REALTIME_VOICE_HISTORY_LIMIT');
     return {continuation: {id, review: archived.review}, archiveLedgerReview: proof.review,
-      contextCount: history.length, history};
+      history: archived.messages.map(({role, text}) => ({role, text}))};
   }
 
-  function scope(project, signedIn, reference) {
+  function voicePolicy(project, signedIn) {
     if (!signedIn()) throw problem(401, 'REALTIME_VOICE_SIGN_IN_REQUIRED');
     if (process.platform !== 'darwin') throw problem(409, 'API_RUNTIME_UNSUPPORTED');
     const current = readCurrentProject(directory, project.id);
     if (!current || executionHeld(current.state) || closing) throw problem(409, 'EXECUTION_HELD');
-    if (hasNativeWork(current)) throw problem(409, 'HANDOVER_REQUIRED');
     const key = getKey();
     if (typeof key !== 'string' || !/^[\x21-\x7e]{1,512}$/.test(key)) throw problem(409, 'API_AUTHORIZATION_REQUIRED');
     const now = Date.now();
@@ -89,12 +95,53 @@ export function createRealtimeExecution({directory, store, conversations, withPr
     const task = {route: 'api', stage: 'consultation', model: config.model, reasoningEffort: 'none'};
     const scopeDigest = sha(JSON.stringify([project.id, current.cwd, current.goal, current.handoverRequirements,
       authority.organization, authority.providerProject, authority.ledgerBinding]));
-    const archived = reference === undefined ? null : verifiedHistory(project.id, reference, scopeDigest, config.model);
-    const context = {now, realtimeVoice: {config, scopeDigest,
-      ...(archived ? {continuation: archived.continuation, archiveLedgerReview: archived.archiveLedgerReview} : {})}, capabilities: {api: {available: true,
+    const context = {now, realtimeVoice: {config, scopeDigest}, capabilities: {api: {available: true,
       executorId: 'owner-mac-realtime-voice', defaultModel: config.model, models: [{id: config.model, reasoningEfforts: ['none']}]}},
     safety: {authorized: true, status: 'ready', allowedRoutes: ['api'], api: verifiedApiCredit(authority)}};
-    return {key, authority, config, task, context, archived};
+    return {key, authority, config, task, context, current};
+  }
+
+  async function loadNativeSource(project, signedIn, {reference, thread, turn, origin} = {}, operation) {
+    if (reference === undefined && thread === undefined && origin === undefined) return undefined;
+    voicePolicy(project, signedIn);
+    const archiveId = typeof reference === 'string' ? reference : reference?.id;
+    if (archiveId !== undefined && !realtimeArchiveId.test(archiveId)) throw problem(400, 'REALTIME_VOICE_TASK_INVALID');
+    const startOfArchive = archiveId && store.getRealtimeArchive(project.id, archiveId).turns
+      .find(turn => turn.id === archiveId.slice('realtime/'.length));
+    const anchor = startOfArchive?.nativeAnchor;
+    const threadId = origin?.threadId ?? thread ?? anchor?.threadId;
+    if (threadId === undefined) return undefined;
+    if (typeof threadId !== 'string' || !realtimeNativeId.test(threadId) ||
+        (thread !== undefined && !validCodexRecordId(turn))) throw problem(400, 'REALTIME_VOICE_TASK_INVALID');
+    const checked = await prepareNativeHandover(project, threadId, operation);
+    const binding = nativePolicyBinding(voicePolicy(project, signedIn));
+    const reviewed = {...checked.origin, review: sha(JSON.stringify([checked.origin.review, binding]))};
+    if ((turn !== undefined && checked.turnId !== turn) || (origin && !sameNativeReference(reviewed, origin)) ||
+        (anchor && !sameNativeReference(checked.anchor, anchor, 'fingerprint'))) {
+      throw problem(409, 'HANDOVER_RECEIPT_STALE');
+    }
+    return {...checked, origin: reviewed, binding};
+  }
+
+  function scope(project, signedIn, reference, native, operation) {
+    const policy = voicePolicy(project, signedIn);
+    const {current, config, context} = policy;
+    if (native) {
+      if (native.binding !== nativePolicyBinding(policy)) throw problem(409, 'HANDOVER_RECEIPT_STALE');
+      native.assertCurrent(operation);
+    }
+    else if (hasNativeWork(current)) throw problem(409, 'HANDOVER_REQUIRED');
+    const archived = reference === undefined ? null :
+      verifiedHistory(project.id, reference, context.realtimeVoice.scopeDigest, config.model, native?.anchor);
+    const history = validateRealtimeHistory([...(native?.history ?? []), ...(archived?.history ?? [])]);
+    if (!history) throw problem(409, 'REALTIME_VOICE_HISTORY_LIMIT');
+    if (archived) Object.assign(context.realtimeVoice, {continuation: archived.continuation, archiveLedgerReview: archived.archiveLedgerReview});
+    if (native) {
+      context.realtimeVoice.nativeAnchor = native.anchor;
+      if (!archived) context.realtimeVoice.nativeOrigin = native.origin;
+      if (native.handoverReadback) context.handoverReadback = native.handoverReadback;
+    }
+    return {...policy, archived, history};
   }
 
   function view(operation, projectId) {
@@ -129,8 +176,11 @@ export function createRealtimeExecution({directory, store, conversations, withPr
     let result;
     let outcome;
     let confirmedTranscript = false;
+    const reference = operation.realtimeVoice.continuation;
+    const origin = operation.realtimeVoice.nativeOrigin;
+    let native;
     function fresh() {
-      const current = scope(project, signedIn, initial.archived?.continuation);
+      const current = scope(project, signedIn, reference, native, operation);
       if (current.key !== initial.key) throw problem(409, 'DISPATCH_CONTEXT_CHANGED');
       return current.context;
     }
@@ -153,13 +203,26 @@ export function createRealtimeExecution({directory, store, conversations, withPr
     };
     try {
       signal.throwIfAborted();
+      if (operation.realtimeVoice.nativeAnchor) native = await loadNativeSource(project, signedIn, {reference, origin}, operation);
+      signal.throwIfAborted();
       const dispatch = store.markDispatched(project.id, operation.taskId, operation.executionId, fresh());
       if (!dispatch.allowed) throw problem(409, dispatch.code);
       marked = true;
       const {organization, providerProject} = initial.authority;
       const {model, voice, transcriptionModel, maxOutputTokens, maxInputSeconds} = initial.config;
       job.voice = await openRealtimeVoice({key: initial.key, organization, project: providerProject, model, voice,
-        transcriptionModel, maxOutputTokens, maxInputSeconds, signal, connect, history: initial.archived?.history,
+        transcriptionModel, maxOutputTokens, maxInputSeconds, signal, connect, history: initial.history,
+        beforeContext: native ? async () => {
+          try {
+            signal.throwIfAborted();
+            native = await loadNativeSource(project, signedIn, {reference, origin}, operation);
+            signal.throwIfAborted();
+            if (!check()) throw problem(409, job.reason ?? 'HANDOVER_REQUIRED');
+          } catch (cause) {
+            job.reason ??= safeReason(cause);
+            throw cause;
+          }
+        } : undefined,
         authorize(stage) {
           if (!check()) return false;
           if (stage === 'input') inputAdmitted = true;
@@ -220,33 +283,47 @@ export function createRealtimeExecution({directory, store, conversations, withPr
   }
 
   return {
-    available(project, signedIn, continuationId) {
+    async available(project, signedIn, {conversation, thread, turn} = {}) {
       try {
-        const {config, task, context, archived} = scope(project, signedIn, continuationId);
+        const native = await loadNativeSource(project, signedIn, {reference: conversation, thread, turn});
+        const {config, task, context, archived, history} = scope(project, signedIn, conversation, native);
         const result = store.previewRealtime(project.id, task, context);
         if (!result.allowed) throw problem(409, result.code);
         return {available: true, route: 'api', model: config.model, maxInputSeconds: config.maxInputSeconds,
           reservedMicros: result.reservedMicros,
           revision: store.getSettings(project.id).revision,
-          ...(archived ? {continuation: archived.continuation, contextCount: archived.contextCount} : {})};
+          ...(archived ? {continuation: archived.continuation} : {}),
+          ...(native && !archived ? {nativeOrigin: native.origin, nativeTurnId: native.turnId} : {}),
+          ...(native ? {nativeContextCount: native.history.length} : {}),
+          ...(history.length ? {contextCount: history.length} : {})};
       } catch (cause) { return {available: false, reason: safeReason(cause)}; }
     },
     read(project, id) { return {turn: view(read(project, id), project.id)}; },
-    start(project, input, {signedIn, emit}) {
+    async start(project, input, {signedIn, emit}) {
       if (!signedIn()) throw problem(401, 'REALTIME_VOICE_SIGN_IN_REQUIRED');
       const audio = decodeInput(input);
       const instructionDigest = sha(audio);
-      const admission = withProjectWorkLock(project, () => {
+      const replay = () => {
+        if (!signedIn()) throw problem(401, 'REALTIME_VOICE_SIGN_IN_REQUIRED');
         const previous = store.getWork(project.id, input.id).operation;
-        if (previous) {
-          if (previous.kind !== kind || previous.instructionDigest !== instructionDigest || previous.settingsRevision !== input.revision ||
-              previous.realtimeVoice.continuation?.id !== input.continuation?.id ||
-              previous.realtimeVoice.continuation?.review !== input.continuation?.review) {
-            throw problem(409, 'TASK_ID_CONFLICT');
-          }
-          return {replayed: true, turn: view(previous, project.id)};
+        if (!previous) return null;
+        if (previous.kind !== kind || previous.instructionDigest !== instructionDigest || previous.settingsRevision !== input.revision ||
+            previous.realtimeVoice.continuation?.id !== input.continuation?.id ||
+            previous.realtimeVoice.continuation?.review !== input.continuation?.review ||
+            !sameNativeReference(previous.realtimeVoice.nativeOrigin, input.nativeOrigin)) {
+          throw problem(409, 'TASK_ID_CONFLICT');
         }
-        const current = scope(project, signedIn, input.continuation);
+        return {replayed: true, turn: view(previous, project.id)};
+      };
+      const duplicate = replay();
+      if (duplicate) return duplicate;
+      let native;
+      try { native = await loadNativeSource(project, signedIn, {reference: input.continuation, origin: input.nativeOrigin}); }
+      catch (cause) { const concurrent = replay(); if (concurrent) return concurrent; throw cause; }
+      const admission = withProjectWorkLock(project, () => {
+        const concurrent = replay();
+        if (concurrent) return concurrent;
+        const current = scope(project, signedIn, input.continuation, native);
         if (audio.length > current.config.maxInputSeconds * bytesPerSecond) throw problem(400, 'REALTIME_VOICE_INVALID_AUDIO');
         const {task, context} = current;
         const prepared = store.prepareDispatch({projectId: project.id, taskId: input.id, expectedRevision: input.revision,
@@ -259,7 +336,7 @@ export function createRealtimeExecution({directory, store, conversations, withPr
       const controller = new AbortController();
       const job = {controller, stopping: false, stop() { job.stopping = true; controller.abort(); }};
       jobs.set(operation.executionId, job);
-      job.done = Promise.resolve().then(() => run(project, job, operation, current, audio, signedIn, emit))
+      job.done = new Promise(resolve => setImmediate(resolve)).then(() => run(project, job, operation, current, audio, signedIn, emit))
         .finally(() => jobs.delete(operation.executionId));
       return {replayed: false, turn: view(operation, project.id), done: job.done, disconnect: () => job.stop()};
     },

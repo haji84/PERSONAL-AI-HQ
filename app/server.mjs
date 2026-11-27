@@ -234,7 +234,8 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
     completedNativeSource: operations.completedSource, readHandoverTurn: (...args) => native.readHandoverTurn?.(...args),
     withProjectWorkLock});
   const realtime = createRealtimeExecution({directory, store: execution.store, conversations: chats, withProjectWorkLock,
-    hasNativeWork: operations.hasNativeWork, getKey: apiOptions.getKey, readAuthority: apiOptions.readAuthority,
+    hasNativeWork: operations.hasNativeWork, prepareNativeHandover: apiWork.prepareRealtimeNativeHandover,
+    getKey: apiOptions.getKey, readAuthority: apiOptions.readAuthority,
     connect: apiOptions.realtimeConnect});
   const portfolioExecution = createPortfolioExecution(directory,execution.store,operations,apiWork,apiEnabled);
   if (plan === true) {
@@ -332,7 +333,13 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       if (response.writableLength > 1024 * 1024) throw error(409, '音声の受信が遅れています。');
       response.write(`data: ${JSON.stringify(event)}\n\n`);
     }
-    const stream = realtime.start(project, input, {signedIn, emit});
+    const canRespond = () => !response.destroyed && signedIn();
+    const stream = await realtime.start(project, input, {signedIn: canRespond, emit});
+    if (!canRespond()) {
+      stream.disconnect?.();
+      if (response.destroyed) return;
+      throw error(401, 'サインインが必要です。');
+    }
     response.writeHead(200, {'Content-Type': 'text/event-stream; charset=utf-8'});
     if (stream.replayed) {
       emit({type: 'done', replayed: true, turn: stream.turn});
@@ -676,8 +683,11 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
     }
     if (route === '/api/chat/realtime' || route === '/api/chat/realtime/interrupt') {
       const conversations = target.searchParams.getAll('conversation');
-      if (target.searchParams.getAll('project').length !== 1 || target.searchParams.getAll('id').length > 1 || conversations.length > 1 ||
-          (conversations.length && (route !== '/api/chat/realtime' || !get || target.searchParams.has('id')))) {
+      const threads = target.searchParams.getAll('thread');
+      const turns = target.searchParams.getAll('turn');
+      const contexts = conversations.length + threads.length;
+      if (target.searchParams.getAll('project').length !== 1 || target.searchParams.getAll('id').length > 1 || contexts > 1 || turns.length !== threads.length ||
+          (contexts && (route !== '/api/chat/realtime' || !get || target.searchParams.has('id')))) {
         throw error(400, '対象の音声操作を一件指定してください。');
       }
       if (!signedIn()) throw error(401, 'サインインが必要です。');
@@ -685,7 +695,11 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
         return send(response, 200, realtime.read(project, target.searchParams.get('id')));
       }
       if (!apiEnabled) throw error(409, apiMessages.API_AUTHORIZATION_REQUIRED);
-      if (get && route === '/api/chat/realtime') return send(response, 200, realtime.available(project, signedIn, conversations[0]));
+      if (get && route === '/api/chat/realtime') {
+        const ready = await realtime.available(project, signedIn, {conversation: conversations[0], thread: threads[0], turn: turns[0]});
+        if (!signedIn()) throw error(401, 'サインインが必要です。');
+        return send(response, 200, ready);
+      }
       if (post && route === '/api/chat/realtime' && !target.searchParams.has('id')) {
         return realtimeChat(project, await jsonBody(request, realtimeBodyLimit), response, signedIn);
       }

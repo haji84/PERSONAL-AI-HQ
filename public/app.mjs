@@ -2135,8 +2135,11 @@ async function chatEvents(response, visit) {
 
 const realtimeConversationId = /^realtime\/[a-f0-9-]{36}$/;
 const realtimeContinueLabel = 'この音声会話を続ける';
+const realtimeCodexLabel = 'このCodex結果を音声で相談';
+const realtimeProof = /^[a-f0-9]{64}$/;
+let realtimeCodexIntent;
 
-function realtimeComposer(project, onConversation) {
+function realtimeComposer(project, onConversation, openFromCodex = false) {
   const area = panel('音声会話（API）');
   const readOnly = ui.capabilities.realtimeVoice !== true;
   const status = node('p', 'small muted', readOnly ? '保存済みの音声受付を確認できます。' : '音声APIの利用条件を確認しています。');
@@ -2156,7 +2159,7 @@ function realtimeComposer(project, onConversation) {
   const openHistory = button('音声の履歴を開く', () => { if (archive) onConversation(archive); });
   const continueHistory = button(realtimeContinueLabel, () => continueConversation(archive));
   const newConversation = button('新しい音声会話に切り替える', () => {
-    if (active() && phase === 'idle' && !checking && continuationId) changeContinuation(undefined);
+    if (active() && phase === 'idle' && !checking && context) changeContext(undefined);
   });
   const contextStatus = node('p', 'small muted');
   const outputMode = node('select');
@@ -2187,25 +2190,29 @@ function realtimeComposer(project, onConversation) {
   let turnId;
   let archive;
   let archiveCanContinue = false;
-  let continuationId;
-  let continuationNeedsSelection = false;
+  let context;
+  let contextNeedsSelection = false;
   let permissionCheck;
   let checking = false;
   let interrupting = false;
-  const continuationReasons = {
+  const contextReasons = {
+    HANDOVER_REQUIRED: '音声相談に使う前の開発経路と共有条件を照合してください。',
+    HANDOVER_RECEIPT_STALE: 'Codexの実行記録または共有条件が変わりました。スレッドを読み直して結果を選び直してください。',
+    NATIVE_HANDOVER_CHECKPOINT_REQUIRED: 'Codex結果の確認済みの実行記録と共有許可が必要です。',
+    NATIVE_HANDOVER_GIT_CHANGED: 'Codexが使った要求や成果物が変わりました。Gitの記録を照合してください。',
+    HANDOVER_CONVERSATION_UNVERIFIED: 'Codexの完了結果と共有対象の発言を照合できません。',
     REALTIME_VOICE_HISTORY_NOT_FOUND: '選んだ音声会話が見つかりません。履歴を確認してください。',
     REALTIME_VOICE_HISTORY_CHANGED: '音声会話の履歴が変わりました。利用条件を確認し直してください。',
     REALTIME_VOICE_HISTORY_UNVERIFIED: '選んだ音声会話の履歴を照合できません。',
-    REALTIME_VOICE_HISTORY_LIMIT: 'この音声会話は引き継げる履歴の上限に達しました。',
+    REALTIME_VOICE_HISTORY_LIMIT: '音声APIに引き継げる発言数の上限に達しました。',
     REALTIME_VOICE_CONTEXT_UNVERIFIED: '過去の発言を音声APIに引き継げたことを確認できません。',
     REALTIME_VOICE_TRANSCRIPT_UNAVAILABLE: '音声と応答の確定字幕が揃っていないため、続きには引き継げません。',
   };
   const reasons = {
-    ...continuationReasons,
+    ...contextReasons,
     REALTIME_VOICE_AUTHORITY_REQUIRED: 'この案件の音声APIの利用条件を確認してください。',
     REALTIME_VOICE_TARIFF_UNVERIFIED: '公式モデルと料金の上限を確認できません。',
     API_CREDIT_UNVERIFIED: '追加費用ゼロの条件と有効な組織残高を確認できません。',
-    HANDOVER_REQUIRED: '前の開発経路の記録を照合する必要があります。',
     ROUTE_NOT_ALLOWED: 'この案件の実行設定では、音声APIを利用できません。',
     PROJECT_BUSY: '進行中の作業または確認待ちの使用量があります。',
     PROJECT_BUDGET_REQUIRED: 'この案件のAPI上限を設定してください。',
@@ -2228,22 +2235,27 @@ function realtimeComposer(project, onConversation) {
     stop.disabled = interrupting;
     mode.hidden = !permission?.available;
     outputMode.disabled = receiving;
-    refresh.hidden = readOnly || phase !== 'idle' || continuationNeedsSelection;
+    refresh.hidden = readOnly || phase !== 'idle' || contextNeedsSelection;
     refresh.disabled = checking || Boolean(permissionCheck);
     check.hidden = !ui.realtimeTurns.has(project) || phase !== 'idle';
     check.disabled = checking || Boolean(permissionCheck);
     openHistory.hidden = !archive || receiving;
     continueHistory.hidden = readOnly || phase !== 'idle' || !archiveCanContinue ||
-      (archive === continuationId && !continuationNeedsSelection);
+      (archive === context?.conversation && !contextNeedsSelection);
     continueHistory.disabled = checking;
-    newConversation.hidden = readOnly || phase !== 'idle' || !continuationId;
+    newConversation.hidden = readOnly || phase !== 'idle' || !context;
     newConversation.disabled = checking;
-    contextStatus.hidden = !continuationId;
-    contextStatus.textContent = continuationNeedsSelection ?
-      '続ける音声会話を選び直すか、新しい音声会話に切り替えてください。' :
-      permission?.continuation ?
-        `選んだ音声会話を続けます。送信すると過去の発言${permission.contextCount}件も音声APIに渡ります。` :
-        '選んだ音声会話の履歴を使います。録音の前に利用条件を確認してください。';
+    contextStatus.hidden = !context;
+    const source = context?.thread ? `選んだCodex結果「${context.title}」を使います。` : '選んだ音声会話を続けます。';
+    let contextDetail = '録音の前に利用条件を確認してください。';
+    if (permission?.continuation) {
+      const native = permission.nativeContextCount ? `（Codexの発言${permission.nativeContextCount}件を含む）` : '';
+      contextDetail = `送信すると過去の発言${permission.contextCount}件${native}も音声APIに渡ります。`;
+    } else if (permission?.nativeOrigin) {
+      contextDetail = `送信するとCodexの発言${permission.nativeContextCount}件も音声APIに渡ります。`;
+    }
+    contextStatus.textContent = contextNeedsSelection ?
+      '続ける音声会話や相談するCodex結果を選ぶか、新しい音声会話に切り替えてください。' : source + contextDetail;
     inputText.hidden = !inputText.textContent;
     answer.hidden = !answer.textContent;
   }
@@ -2261,28 +2273,38 @@ function realtimeComposer(project, onConversation) {
     return `${permission.model} · 最大${permission.maxInputSeconds}秒 · 1回の予約上限 ${usd.format(permission.reservedMicros / 1e6)}`;
   }
 
-  function changeContinuation(id) {
-    continuationId = id;
-    continuationNeedsSelection = false;
+  function changeContext(next) {
+    context = next;
+    contextNeedsSelection = false;
     permission = undefined;
     status.textContent = '音声APIの利用条件を確認しています。';
     void sync();
   }
 
-  function continueConversation(id) {
-    if (!active() || readOnly || !realtimeConversationId.test(id ?? '')) return;
+  function selectContext(id, next) {
+    if (!active() || readOnly) return;
     if (phase !== 'idle' || checking) {
       setNotice('現在の音声操作を終えてから、続ける会話を選んでください。', true);
       return;
     }
     if (ui.chatIds.get(project) !== id) onConversation(id);
-    changeContinuation(id);
+    changeContext(next);
     area.root.scrollIntoView({block: 'nearest'});
   }
 
+  function continueConversation(conversation) {
+    if (realtimeConversationId.test(conversation ?? '')) selectContext(conversation, {conversation});
+  }
+
+  function consultCodex(thread, turn, title) {
+    if (thread && typeof turn === 'string' && turn) {
+      selectContext(`codex/${thread}`, {thread, turn, title: text(title, '完了結果')});
+    }
+  }
+
   function conversationChanged(id) {
-    if (!continuationId || id === continuationId) return;
-    continuationNeedsSelection = true;
+    if (!context || id === (context.conversation ?? `codex/${context.thread}`)) return;
+    contextNeedsSelection = true;
     permission = undefined;
     permissionCheck?.abort();
     permissionCheck = undefined;
@@ -2297,25 +2319,33 @@ function realtimeComposer(project, onConversation) {
   }
 
   async function sync(report = true) {
-    if (readOnly || phase !== 'idle' || continuationNeedsSelection) return;
+    if (readOnly || phase !== 'idle' || contextNeedsSelection) return;
     permissionCheck?.abort();
     const controller = new AbortController();
     permissionCheck = controller;
-    const conversation = continuationId;
+    const {conversation, thread, turn} = context ?? {};
     paint();
     try {
-      const next = await api(apiPath(base, {project, conversation}),
+      const next = await api(apiPath(base, {project, conversation, thread, turn}),
         {signal: AbortSignal.any([controller.signal, lifetime.signal])});
       if (!active() || permissionCheck !== controller) return;
-      const validContext = conversation ? next.continuation?.id === conversation &&
-        /^[a-f0-9]{64}$/.test(next.continuation.review ?? '') &&
-        Number.isSafeInteger(next.contextCount) && next.contextCount > 0 : !next.continuation;
-      permission = next.available && !validContext ? {available: false, reason: 'REALTIME_VOICE_HISTORY_UNVERIFIED'} : next;
-      if (report || (continuationId && !permission.available)) status.textContent = allowedText();
+      const validContext = Number.isSafeInteger(next.contextCount) && next.contextCount >= 0;
+      const nativeCount = next.nativeContextCount;
+      const validNativeCount = Number.isSafeInteger(nativeCount) && nativeCount > 0 && nativeCount <= next.contextCount;
+      const validReview = thread ? !next.continuation && next.nativeOrigin?.threadId === thread && next.nativeTurnId === turn &&
+        typeof next.nativeOrigin.operationId === 'string' && next.nativeOrigin.operationId.length > 0 &&
+        realtimeProof.test(next.nativeOrigin.review ?? '') && validContext && validNativeCount && nativeCount === next.contextCount :
+        !next.nativeOrigin && (conversation ? next.continuation?.id === conversation &&
+          realtimeProof.test(next.continuation.review ?? '') && validContext && next.contextCount > 0 &&
+          (nativeCount === undefined || validNativeCount) : !next.continuation);
+      const invalidReason = !thread ? 'REALTIME_VOICE_HISTORY_UNVERIFIED' :
+        next.nativeTurnId === turn ? 'HANDOVER_CONVERSATION_UNVERIFIED' : 'HANDOVER_RECEIPT_STALE';
+      permission = next.available && !validReview ? {available: false, reason: invalidReason} : next;
+      if (report || (context && !permission.available)) status.textContent = allowedText();
     } catch (error) {
       if (permissionCheck !== controller) return;
       permission = undefined;
-      if (active() && (report || continuationId)) status.textContent = reasons[error.code] ?? reasons[error.message] ?? error.message;
+      if (active() && (report || context)) status.textContent = reasons[error.code] ?? reasons[error.message] ?? error.message;
     } finally {
       if (permissionCheck === controller) {
         permissionCheck = undefined;
@@ -2399,9 +2429,10 @@ function realtimeComposer(project, onConversation) {
 
   async function send() {
     if (!active() || phase !== 'prepared' || !pcm || !permission?.available || document.hidden) return;
-    const selectedContext = continuationId;
-    const continuation = permission.continuation;
-    if (selectedContext !== continuation?.id) return;
+    const selectedContext = context;
+    const {continuation, nativeOrigin} = permission;
+    if (selectedContext?.conversation !== continuation?.id || selectedContext?.thread !== nativeOrigin?.threadId ||
+        (nativeOrigin && permission.nativeTurnId !== selectedContext.turn)) return;
     const controller = new AbortController();
     upload = controller;
     const playback = audio;
@@ -2411,7 +2442,8 @@ function realtimeComposer(project, onConversation) {
     ui.realtimeTurns.set(project, turnId);
     storeTab();
     const payload = JSON.stringify({id: turnId, revision: permission.revision, pcm: bytesBase64(pcm),
-      ...(continuation && {continuation: {id: continuation.id, review: continuation.review}})});
+      ...(continuation && {continuation: {id: continuation.id, review: continuation.review}}),
+      ...(nativeOrigin && {nativeOrigin: {threadId: nativeOrigin.threadId, operationId: nativeOrigin.operationId, review: nativeOrigin.review}})});
     let contextRecheckRequired = false;
     pcm = undefined;
     status.textContent = '音声APIの受付を確認しています。';
@@ -2423,7 +2455,7 @@ function realtimeComposer(project, onConversation) {
       if (!response.ok) {
         const problem = await response.json().catch(() => null);
         const reason = problem?.code ?? problem?.error;
-        contextRecheckRequired = Object.hasOwn(continuationReasons, reason);
+        contextRecheckRequired = Object.hasOwn(contextReasons, reason);
         throw new Error(reasons[reason] ?? problem?.error ?? '音声応答を開始できませんでした。');
       }
       let done = false;
@@ -2434,11 +2466,15 @@ function realtimeComposer(project, onConversation) {
         if (event.type === 'transcript' && !interrupting && typeof event.text === 'string') answer.textContent += event.text;
         if (event.type === 'done') {
           done = true;
-          contextRecheckRequired = Object.hasOwn(continuationReasons, event.turn?.reason);
+          contextRecheckRequired = Object.hasOwn(contextReasons, event.turn?.reason);
           if (typeof event.inputTranscript === 'string') inputText.textContent = event.inputTranscript;
           if (typeof event.outputTranscript === 'string') answer.textContent = event.outputTranscript;
           showTurn(event.turn);
-          if (archive && archive === selectedContext && ui.chatIds.get(project) === archive) onConversation(archive);
+          if (archive && archive === selectedContext?.conversation && ui.chatIds.get(project) === archive) onConversation(archive);
+          if (event.turn?.phase === 'completed' && selectedContext?.thread && selectedContext === context) {
+            permission = undefined;
+            contextNeedsSelection = true;
+          }
           if (event.turn?.phase !== 'completed') playback.stopPlayback();
         }
         paint();
@@ -2458,7 +2494,7 @@ function realtimeComposer(project, onConversation) {
         interrupting = false;
         discardAudio();
         phase = 'idle';
-        const recheck = contextRecheckRequired && selectedContext && selectedContext === continuationId;
+        const recheck = contextRecheckRequired && selectedContext && selectedContext === context;
         if (recheck) permission = undefined;
         if (active()) {
           paint();
@@ -2511,8 +2547,8 @@ function realtimeComposer(project, onConversation) {
   window.addEventListener('pagehide', leaveAudio);
   runViewCleanups.add(cleanup);
   paint();
-  void sync();
-  return {root: area.root, continueConversation, conversationChanged};
+  if (!openFromCodex) void sync();
+  return {root: area.root, continueConversation, consultCodex, conversationChanged};
 }
 
 function planComposer(project, onConversation) {
@@ -3047,6 +3083,8 @@ function syncChatDevelopment() {
 
 function chat() {
   const details = selectedProject();
+  const requestedVoice = realtimeCodexIntent?.project === details?.id ? realtimeCodexIntent : undefined;
+  realtimeCodexIntent = undefined;
   if (!details) return emptyProject();
   if (details.registration === 'github') return projectNeedsWorkspace();
   const project = details.id;
@@ -3132,6 +3170,14 @@ function chat() {
           if (detailIsCurrent()) realtime?.continueConversation(id);
         });
         destination.insertBefore(continueVoice, messages);
+      }
+      const voiceTurn = nativeId && asArray(result?.turns).at(-1);
+      if (nativeId && result?.thread?.id === nativeId && ui.capabilities.realtimeVoice === true &&
+          voiceTurn?.status === 'completed' && typeof voiceTurn.id === 'string' && voiceTurn.id) {
+        const consultVoice = button(realtimeCodexLabel, () => {
+          if (detailIsCurrent()) realtime?.consultCodex(nativeId, voiceTurn.id, conversation.title);
+        });
+        destination.insertBefore(consultVoice, messages);
       }
       const transfer = button('表示中のAI回答をCodexの下書きに追加', () => {
         const recent = asArray(conversation.messages).findLast(message => message.role === 'assistant');
@@ -3257,12 +3303,18 @@ function chat() {
     current.append(plan.root);
   }
   if (ui.capabilities.realtimeVoice === true || ui.realtimeTurns.has(project)) {
-    realtime = realtimeComposer(project, selectConversation);
+    realtime = realtimeComposer(project, selectConversation, Boolean(requestedVoice));
     current.append(realtime.root);
   }
   if (ui.capabilities.apiDevelopment === true) current.append(adviceHost);
   layout.append(collection.root, current, chatDevelopmentPanel(details));
   dom.content.append(layout);
+  if (requestedVoice && ui.capabilities.realtimeVoice === true) {
+    explicitSelection = true;
+    ui.chatIds.set(project, `codex/${requestedVoice.thread}`);
+    storeTab();
+    realtime.consultCodex(requestedVoice.thread, requestedVoice.turn, requestedVoice.title);
+  }
   showChatDetails();
   searchChats(search.value);
   if (selectedProject()?.codexScopes) {
@@ -4414,6 +4466,15 @@ function codex() {
       if (selected?.id === id && value.managed === true) {
         actions.append(button('このスレッドの操作を表示', () => {
           if (isCurrent() && destination.isConnected) showControls({id, title: text(selected.title, 'スレッド'), isCurrent});
+        }));
+      }
+      const voiceTurn = asArray(value?.turns).at(-1);
+      if (selected?.id === id && ui.capabilities.realtimeVoice === true &&
+          voiceTurn?.status === 'completed' && typeof voiceTurn.id === 'string' && voiceTurn.id) {
+        actions.append(button(realtimeCodexLabel, () => {
+          if (!isCurrent() || !destination.isConnected) return;
+          realtimeCodexIntent = {project, thread: id, turn: voiceTurn.id, title: selected.title};
+          location.hash = 'chat';
         }));
       }
       if (selected?.id === id && value.desktopThreadId === id && id.length === 36 &&

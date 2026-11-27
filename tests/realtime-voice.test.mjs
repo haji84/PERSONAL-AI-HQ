@@ -79,6 +79,25 @@ test('requires authorization before opening a socket and before accepting an aud
   assert.deepEqual(wire.map(event => event.type), ['session.update']);
 });
 
+test('abort during the final context readback cannot send any saved history later', async t => {
+  const {options, wire} = await fixture(t);
+  const controller = new AbortController();
+  const checking = Promise.withResolvers();
+  const confirmed = Promise.withResolvers();
+  const connection = openRealtimeVoice({...options, history: [{role: 'user', text: 'Scoped history'}], signal: controller.signal,
+    async beforeContext() {
+      checking.resolve();
+      await confirmed.promise;
+    }});
+  await checking.promise;
+  const rejected = assert.rejects(connection, {code: 'REALTIME_VOICE_CLOSED'});
+  controller.abort();
+  await rejected;
+  confirmed.resolve();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(wire.map(event => event.type), ['session.update']);
+});
+
 test('uses the GA voice exchange, streams scoped PCM, and waits for both usage receipts', async t => {
   const {options, wire, stages} = await fixture(t, (ws, event) => {
     if (event.type !== 'response.create') return;

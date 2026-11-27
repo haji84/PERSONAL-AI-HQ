@@ -2,10 +2,13 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {execFileSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
+import {once} from 'node:events';
+import {writeFileSync} from 'node:fs';
 import {copyFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile} from 'node:fs/promises';
 import {dirname, join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {setTimeout as wait} from 'node:timers/promises';
+import WebSocket, {WebSocketServer} from 'ws';
 import {startOwnerApp} from '../app/server.mjs';
 import {apiAuthorityFile} from '../app/api-authority.mjs';
 import {createChatStore} from '../app/chat-store.mjs';
@@ -26,7 +29,7 @@ async function authenticatedRequests(app) {
       ...(data ? {body: JSON.stringify(data)} : {})});
 }
 
-async function fixture(t, fetchImpl, {handover = false, auxiliary = [], codex = {}} = {}) {
+async function fixture(t, fetchImpl, {handover = false, auxiliary = [], codex = {}, realtimeConnect} = {}) {
   const directory = await realpath(await mkdtemp(join(tmpdir(), 'hq-api-app-')));
   let app, requests;
   const servers = new Set();
@@ -69,11 +72,16 @@ test('answer equals the required value', () => assert.equal(answer, 2));\n`);
       availableCreditUsd: 2, checkoutConfirmed: true, purchasedCreditUsd: 0, paidBillingEnabled: false, autoRechargeEnabled: false},
     models: [{id: modelId, contextTokens: 16000, outputTokens: 2000, inputUsdPerMillion: 2, outputUsdPerMillion: 8, reasoningEfforts: []}],
     projects: {[id]: {files: [{path: 'source.mjs', writable: true}], testPaths: ['check.test.mjs']}},
+    ...(realtimeConnect ? {realtimeVoice: {projects: [id], model: 'gpt-realtime-1.5', voice: 'marin', transcriptionModel: 'gpt-transcribe',
+      contextTokens: 32000, maxInputSeconds: 10, maxOutputTokens: 100, rates: {inputTextUsdPerMillion: 4,
+        inputAudioUsdPerMillion: 32, cachedTextUsdPerMillion: 0.4, cachedAudioUsdPerMillion: 0.4,
+        outputTextUsdPerMillion: 16, outputAudioUsdPerMillion: 64},
+      transcription: {type: 'duration', usdPerMinute: 0.0045, billingIncrementSeconds: 60}}} : {}),
   }), {mode: 0o600});
   async function open(enableExecution) {
     await app?.close();
     servers.delete(app);
-    app = await startOwnerApp({directory, port: 0, codex, apiDevelopment: enableExecution && {getKey: () => 'fixture-only', fetchImpl}});
+    app = await startOwnerApp({directory, port: 0, codex, apiDevelopment: enableExecution && {getKey: () => 'fixture-only', fetchImpl, realtimeConnect}});
     servers.add(app);
     requests = await authenticatedRequests(app);
   }
@@ -102,6 +110,207 @@ async function waitFor(call, target, taskId = instruction.id) {
   }
   assert.fail('Timed out waiting for API job');
 }
+
+test('the checked Codex result anchors a Realtime conversation without changing the existing development checkpoint',
+  {skip: process.platform !== 'darwin', timeout: 20000}, async t => {
+  const operationId = 'approved-codex-voice-fixture';
+  const threadId = 'voice-handoff-thread';
+  const turnId = 'v';
+  const prompt = '引き継いだ成果を確認して助言を残す';
+  const codexAnswer = '  テストは検証済みです。\n';
+  const messages = [{id: 'fixture-user', role: 'user', text: prompt},
+    {id: 'fixture-answer', role: 'assistant', text: codexAnswer}];
+  const model = 'gpt-realtime-1.5';
+  const route = '/api/chat/realtime';
+  let reads = 0;
+  let mismatchedRead;
+  let beforeSessionReady;
+  let beforeHistoryAck;
+  const codex = {canWrite: true, subscriptionReady: async () => true, onEvent: () => () => {},
+    models: async () => ({accountType: 'chatgpt', data: [{id: 'fixture-codex', isDefault: true, reasoningEfforts: []}]}),
+    usage: async () => ({ordinaryUsageAllowed: true, windows: [{usedPercent: 20}]}),
+    async submit(options) {
+      assert.equal(options.beforeThread(), true);
+      await options.beforeTurn?.();
+      assert.equal(options.onThread(threadId), true);
+      return {turn: {id: turnId, status: 'completed'}};
+    },
+    async readHandoverTurn(_checkout, thread, turn, operation) {
+      assert.deepEqual([thread, turn, operation], [threadId, turnId, operationId]);
+      return {threadId, turnId, messages: ++reads === mismatchedRead ? messages.slice(0, 1) : messages};
+    }};
+  const server = new WebSocketServer({host: '127.0.0.1', port: 0});
+  await once(server, 'listening');
+  t.after(async () => {
+    for (const socket of server.clients) socket.terminate();
+    await new Promise(resolve => server.close(resolve));
+  });
+  const wires = [];
+  const pcm = Buffer.alloc(4800, 7).toString('base64');
+  server.on('connection', socket => {
+    const events = [];
+    wires.push(events);
+    const responseId = 'resp_fixture_' + wires.length;
+    const inputId = 'item_input_' + wires.length;
+    const outputId = 'item_output_' + wires.length;
+    const send = event => socket.send(JSON.stringify(event));
+    send({type:'session.created', session:{model}});
+    socket.on('message', bytes => {
+      const event = JSON.parse(bytes);
+      events.push(event);
+      if (event.type === 'session.update') {
+        beforeSessionReady?.();
+        send({type:'session.updated', session:{...event.session, model}});
+      }
+      if (event.type === 'conversation.item.create') {
+        beforeHistoryAck?.();
+        send({type:'conversation.item.done', previous_item_id:event.previous_item_id ?? null, item:{...event.item,status:'completed'}});
+      }
+      if (event.type === 'input_audio_buffer.commit') {
+        send({type:'input_audio_buffer.committed', item_id:inputId});
+        send({type:'conversation.item.input_audio_transcription.completed', item_id:inputId, content_index:0,
+          usage:{type:'duration',seconds:0.1}, transcript:'今回の音声の指示'});
+      }
+      if (event.type === 'response.create') {
+        send({type:'response.created', response:{id:responseId}});
+        send({type:'response.output_audio.delta', response_id:responseId,item_id:outputId,output_index:0,content_index:0,delta:pcm});
+        send({type:'response.output_audio_transcript.done', response_id:responseId,item_id:outputId,output_index:0,content_index:0,
+          transcript:'今回の音声の回答'});
+        send({type:'response.done', response:{id:responseId,status:'completed',usage:{total_tokens:22,input_tokens:20,output_tokens:2,
+          input_token_details:{text_tokens:15,audio_tokens:5,cached_tokens:0},output_token_details:{text_tokens:0,audio_tokens:2}}}});
+      }
+    });
+  });
+  const f = await fixture(t, () => providerAnswer(2), {codex, handover:true,
+    realtimeConnect(url, options) {
+      assert.equal(url.href, 'wss://api.openai.com/v1/realtime?model=' + model);
+      return new WebSocket('ws://127.0.0.1:' + server.address().port, options);
+    }});
+  const {call, store, source, requirements, portfolio} = f;
+  const switchTo = (revision, mode) => call('/api/execution/settings', {data:{revision, settings:{mode, apiBudgetUsd:1.6}}});
+  assert.equal((await switchTo(0, 'api-only')).status, 200);
+  assert.equal((await call('/api/execution/api', {data: instruction})).status, 202);
+  await waitFor(call, 'completed');
+  const before = store.getWork(id);
+  const receipt = before.checkpointOperation.executionId;
+  const applied = 'export const answer = 2;\n';
+  await f.commitSource(applied);
+  assert.equal((await switchTo(1, 'subscription-only')).status, 200);
+  const subscribed = await (await call('/api/execution/handover', {query:{receipt}})).json();
+  assert.equal(subscribed.verified, true);
+  const accepted = await call('/api/codex/run', {data:{id:operationId,prompt,stage:'implementation',route:'subscription',
+    handover:{receipt,review:subscribed.review}}});
+  assert.equal(accepted.status, 202);
+  let turn;
+  for (let index = 0; index < 40 && turn?.phase !== 'completed'; index++) {
+    turn = (await (await call('/api/codex/run', {query:{id:operationId}})).json()).operation;
+    if (turn?.phase !== 'completed') await wait(25);
+  }
+  assert.equal(turn?.phase, 'completed');
+  assert.equal(turn.handoverReceipt, receipt);
+  assert.equal((await switchTo(2, 'api-only')).status, 200);
+  const voiceReady = (turn = turnId) => call(route, {query:{thread:threadId,turn}});
+  assert.equal((await (await voiceReady()).json()).reason, 'NATIVE_HANDOVER_CHECKPOINT_REQUIRED');
+  assert.equal((await (await call(route)).json()).reason, 'HANDOVER_REQUIRED');
+  const git = (...args) => execFileSync('/usr/bin/git', ['-C',dirname(source),...args], {encoding:'utf8'}).trim();
+  const verificationText = 'Owner fixture: Git and native transcript verified.\n';
+  await f.commitFiles([{path:'verification.md',text:verificationText}]);
+  const sha = bytes => createHash('sha256').update(bytes).digest('hex');
+  const checkpoint = {version:1,operationId,threadId,turnId,checkoutHead:git('rev-parse','HEAD'),
+    requirementsSha256:sha(await readFile(requirements)),transcriptSha256:sha(JSON.stringify(messages)),
+    artifacts:[{path:'source.mjs',sha256:sha(applied)}],verification:{path:'verification.md',sha256:sha(verificationText)},
+    effectsReconciled:true,shareConversation:true};
+  const definition = JSON.parse(await readFile(portfolio));
+  const setCheckpoint = value => {
+    definition.projects[0].nativeHandover = value;
+    return writeFile(portfolio, JSON.stringify(definition));
+  };
+  await setCheckpoint(checkpoint);
+  const found = await (await voiceReady()).json();
+  assert.deepEqual([found.available,found.nativeContextCount,found.contextCount,found.nativeOrigin.operationId],[true,2,2,operationId]);
+  assert.equal(found.nativeTurnId, turnId);
+  assert.equal((await call(route, {query:{thread:threadId}})).status, 400);
+  const staleTurn = await (await voiceReady('stale-displayed-native-turn')).json();
+  assert.deepEqual(staleTurn, {available:false,reason:'HANDOVER_RECEIPT_STALE'});
+  assert.equal(JSON.stringify(found).includes(prompt), false);
+  assert.equal(JSON.stringify(found).includes(codexAnswer.trim()), false);
+  const plainReceipt = await (await call('/api/execution/handover', {query:{thread:threadId}})).json();
+  const body = {id:'native-result-voice-turn',revision:found.revision,pcm,nativeOrigin:found.nativeOrigin};
+  const post = data => call(route, {data});
+  assert.equal((await post({...body,nativeOrigin:{...found.nativeOrigin,review:plainReceipt.review}})).status, 409);
+  const authorityPath = join(f.directory, apiAuthorityFile);
+  const authority = JSON.parse(await readFile(authorityPath));
+  await writeFile(authorityPath, JSON.stringify({...authority,providerProject:'different_provider_project'}));
+  const changedProvider = await post(body);
+  assert.equal(changedProvider.status, 409);
+  assert.match((await changedProvider.json()).error, /引継ぎを照合/);
+  await writeFile(authorityPath, JSON.stringify(authority));
+  const other = await call(route, {query:{thread:threadId,turn:turnId},project:'other-fixture'});
+  assert.equal(other.status, 200);
+  assert.equal((await other.json()).available, false);
+  assert.equal((await post({...body,nativeOrigin:undefined})).status, 409);
+  await setCheckpoint({...checkpoint,shareConversation:false});
+  assert.equal((await post(body)).status, 409);
+  await setCheckpoint(checkpoint);
+  await writeFile(source, 'Unverified checkout content.\n');
+  assert.equal((await (await voiceReady()).json()).reason, 'NATIVE_HANDOVER_GIT_CHANGED');
+  await writeFile(source, applied);
+  assert.equal(wires.length, 0);
+  const sse = async response => {
+    assert.equal(response.status, 200, response.status === 200 ? undefined : await response.text());
+    return JSON.parse((await response.text()).trim().split('\n\n').at(-1).slice('data: '.length));
+  };
+  mismatchedRead = reads + 2;
+  const changed = (await sse(await post({...body,id:'voice-native-readback-changed'}))).turn;
+  assert.equal(changed.phase, 'cancelled');
+  assert.equal(changed.reason, 'HANDOVER_CONVERSATION_UNVERIFIED');
+  assert.equal(wires.length, 0);
+  beforeSessionReady = () => {
+    beforeSessionReady = undefined;
+    mismatchedRead = reads + 1;
+  };
+  const changedAfterConnect = (await sse(await post({...body,id:'voice-native-after-connect-changed'}))).turn;
+  assert.equal(changedAfterConnect.reason, 'HANDOVER_CONVERSATION_UNVERIFIED');
+  assert.equal(changedAfterConnect.accountedMicros, 0);
+  assert.deepEqual(wires[0].map(event => event.type), ['session.update']);
+  beforeHistoryAck = () => {
+    beforeHistoryAck = undefined;
+    definition.projects[0].nativeHandover = {...checkpoint,shareConversation:false};
+    writeFileSync(portfolio, JSON.stringify(definition));
+  };
+  const revoked = (await sse(await post({...body,id:'voice-native-revoked'}))).turn;
+  assert.equal(revoked.reason, 'NATIVE_HANDOVER_CHECKPOINT_REQUIRED');
+  assert.equal(revoked.accountedMicros, 0);
+  assert.deepEqual(wires[1].map(event => event.type), ['session.update','conversation.item.create']);
+  await setCheckpoint(checkpoint);
+  const [first, duplicate] = await Promise.all([post(body).then(sse), post(body).then(sse)]);
+  const alternate = [first, duplicate].find(event => event.replayed !== true);
+  assert.equal([first,duplicate].filter(event => event.replayed === true).length, 1);
+  assert.equal(alternate.turn.phase, 'completed');
+  const archive = alternate.turn.conversationId;
+  const contextOf = wire => wire.filter(event => event.type === 'conversation.item.create')
+    .map(event => [event.item.role,event.item.content[0].text]);
+  assert.deepEqual(contextOf(wires[2]), [['user',prompt],['assistant',codexAnswer]]);
+  assert.equal(JSON.stringify(wires[2]).includes('verification.md'), false);
+  const stored = store.getWork(id);
+  assert.deepEqual(stored.checkpoint, before.checkpoint);
+  assert.equal(stored.checkpointOperation.executionId, receipt);
+  assert.equal(stored.settledApiMicros, before.settledApiMicros + alternate.turn.accountedMicros);
+  await f.open(true);
+  const continued = await (await call(route, {query:{conversation:archive}})).json();
+  assert.deepEqual([continued.available,continued.nativeContextCount,continued.contextCount],[true,2,4]);
+  assert.equal(continued.nativeOrigin, undefined);
+  const next = {id:'continued-native-voice-turn',revision:continued.revision,pcm,continuation:continued.continuation};
+  await setCheckpoint({...checkpoint,shareConversation:false});
+  assert.equal((await post(next)).status, 409);
+  await setCheckpoint(checkpoint);
+  const finished = (await sse(await post(next))).turn;
+  assert.equal(finished.conversationId, archive);
+  assert.deepEqual(contextOf(wires[3]), [['user',prompt],['assistant',codexAnswer],
+    ['user','今回の音声の指示'],['assistant','今回の音声の回答']]);
+  assert.equal(wires.length, 4);
+  assert.deepEqual(store.getWork(id).checkpoint, before.checkpoint);
+});
 
 test('owner API-only work repairs actual source in an isolated Mac and returns a verified artifact', {skip: process.platform !== 'darwin'}, async t => {
   let requests = 0;
