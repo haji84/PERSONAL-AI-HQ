@@ -3,8 +3,8 @@ import {closeSync, fsyncSync, lstatSync, openSync, readFileSync, renameSync, unl
 import {lstat, realpath} from 'node:fs/promises';
 import {isAbsolute, join, resolve} from 'node:path';
 import {isDeepStrictEqual} from 'node:util';
-import {deliveryProgress} from './progress.mjs';
-import {readDeliveryRecord} from './delivery-records.mjs';
+import {deliveryProgress, remainingEstimate, requirementProgress, taskHasOpenWork, taskIsVerified} from './progress.mjs';
+import {readDeliveryRecord, readPortfolioTaskRecords, tasksForRepository} from './delivery-records.mjs';
 import {normalizeSettings} from './execution-policy.mjs';
 
 export const projectKey = /^[a-z0-9][a-z0-9_.-]{0,79}$/i;
@@ -17,6 +17,7 @@ const digest = value => createHash('sha256').update(JSON.stringify(value)).diges
 const orderedSettings = settings => ({...settings, stageRoutes:Object.fromEntries(Object.entries(settings.stageRoutes).sort())});
 const states = new Set(['unknown', 'developing', 'researching', 'designing', 'verifying', 'fixing', 'integrating',
   'waiting', 'paused', 'approval', 'limit', 'blocked', 'completed', 'offline', 'delayed']);
+const taskStates = new Set(['active', 'pending', 'waiting', 'blocked', 'paused', 'approval', 'verified']);
 const text = (value, max = 500) => typeof value === 'string' ? value.trim().slice(0, max) : '';
 const date = value => typeof value === 'string' && Number.isFinite(Date.parse(value)) ? new Date(value).toISOString() : null;
 const strings = (value, limit = 20) => Array.isArray(value) ? value.slice(0, limit).map(item => text(item)).filter(Boolean) : [];
@@ -49,6 +50,30 @@ function apiCreditObservation(value) {
   return {balanceUsd, observedFrom, observedUntil, expiresOn: value.expiresOn};
 }
 
+function taskProgress(delivery) {
+  const tasks = delivery?.tasks;
+  if (!Array.isArray(tasks) || tasks.length > 400) return [];
+  const ids = tasks.map(task => task?.id);
+  if (new Set(ids).size !== ids.length || ids.some(id => typeof id !== 'string' || !projectKey.test(id))) return [];
+  const observedAt = date(delivery.observationAt);
+  return tasks.map(task => {
+    const counts = requirementProgress(task.requirements);
+    const verified = taskIsVerified(task, counts);
+    const progress = counts && (verified || counts.accepted < counts.total)
+      ? {accepted:counts.accepted, total:counts.total, percent:counts.formalCompletion} : null;
+    const rejectedCompletion = task.status === 'verified' && !verified;
+    const status = rejectedCompletion || !taskStates.has(task.status) ? 'unknown' : task.status;
+    const estimate = remainingEstimate(task.remainingMinutes);
+    const remainingMinutes = verified ? {optimistic:0, standard:0, cautious:0} :
+      estimate?.cautious === 0 && (rejectedCompletion || taskHasOpenWork(task)) ? null : estimate;
+    const device = text(task.device, 60);
+    return {id: task.id, title: text(task.title, 120) || task.id, status, progress, remainingMinutes,
+      ...(device && {device}),
+      observedAt: date(task.observedAt) ?? observedAt, remaining: strings(task.remaining),
+      blocker: text(task.blocker, 360), externalWait: task.externalWait === 'unknown', evidence: evidence(task.evidence)};
+  });
+}
+
 function normalizeProject(row, observedAt) {
   const {id} = row;
   const name = text(row.name, 100);
@@ -59,10 +84,13 @@ function normalizeProject(row, observedAt) {
   const delivery = row.delivery ? deliveryProgress(row.delivery) : null;
   const computed = delivery?.counts;
   const observed = date(row.observedAt) ?? observedAt;
-  const live = observed && Date.now() - Date.parse(observed) <= 15 * 60 * 1000;
+  const stateScope = text(row.stateScope, 60);
+  const age = Date.now() - Date.parse(observed);
+  const live = age >= 0 && age <= 15 * 60 * 1000;
   const needsFreshObservation = ['developing', 'researching', 'designing', 'verifying', 'fixing', 'integrating'].includes(row.state);
   return {id, name, goal: text(row.goal, 1500), state: states.has(row.state) && (!needsFreshObservation || live) ? row.state : 'unknown',
-    observedAt: observed, summary: text(row.summary, 1200), remaining: strings(row.remaining),
+    ...(stateScope && {stateScope}),
+    observedAt: observed, summary: text(row.summary, 1200), remaining: strings(row.remaining), tasks: taskProgress(row.delivery),
     handoverRequirements: typeof row.handoverRequirements === 'string' && row.handoverRequirements.length <= 240 ? row.handoverRequirements : null,
     nativeHandover: row.nativeHandover ?? null,
     evidence: evidence(row.evidence), repository: https(row.repository), cwd, codexScopes: cwd.length,
@@ -239,8 +267,18 @@ export async function readPortfolio(directory, githubProjects, refreshGithub = f
   const discovered = (github?.projects ?? []).map(row => ({...normalizeProject(row, observedAt), registration: 'github',
     registrationAvailable: row.registrationAvailable === true}));
   const related = raw.projects.filter(row => row.deliverySource).slice(0,8);
-  const deliveryRecords = new Map(refreshGithub ? await Promise.all(related.map(async row =>
-    [row.id, await readDeliveryRecord(row.deliverySource)])) : []);
+  const [deliveryEntries, taskRecords] = refreshGithub ? await Promise.all([
+    Promise.all(related.map(async row => [row.id, await readDeliveryRecord(row.deliverySource)])),
+    raw.taskProgressSource ? readPortfolioTaskRecords(raw.taskProgressSource) : null,
+  ]) : [[], null];
+  const deliveryRecords = new Map(deliveryEntries);
+  const visible = [...projects, ...discovered];
+  const taskMatches = new Map();
+  for (const row of projects) {
+    const record = tasksForRepository(taskRecords, row.repository);
+    if (record) taskMatches.set(record, (taskMatches.get(record) ?? 0) + 1);
+  }
+  const unmatchedTaskRecords = [...(taskRecords?.projects.values() ?? [])].filter(record => taskMatches.get(record) !== 1).length;
   const rawArtifacts = Array.isArray(raw.artifacts) ? raw.artifacts.slice(0, 150) : [];
   const artifacts = (await Promise.all(rawArtifacts.map(row => normalizeArtifact(row, byId, observedAt)))).filter(Boolean);
   if (new Set(artifacts.map(row => row.id)).size !== artifacts.length) throw new Error('Duplicate artifact');
@@ -254,7 +292,12 @@ export async function readPortfolio(directory, githubProjects, refreshGithub = f
     artifacts: new Map(artifacts.map(row => [row.id, row])),
     view: {observedAt, limits: scope, devices, apiCreditObservation: apiCreditObservation(raw.apiCreditObservation),
       ...(github && {githubRegistration: {status:github.status, observedAt:github.observedAt, count:github.count}}),
-      projects: [...projects, ...discovered].map(({cwd, handoverRequirements, nativeHandover, ...project}) => {
+      ...(refreshGithub && raw.taskProgressSource && {taskProgressSource: taskRecords ?
+        {status: 'current', observedAt: taskRecords.observedAt, evidence: taskRecords.source, unmatched: unmatchedTaskRecords} :
+        {status: 'unavailable'}}),
+      projects: visible.map(({cwd, handoverRequirements, nativeHandover, ...project}) => {
+        const tracking = byId.has(project.id) && tasksForRepository(taskRecords, project.repository);
+        if (!project.tasks.length && tracking && taskMatches.get(tracking) === 1) project.tasks = taskProgress(tracking);
         const deliveryRecord = deliveryRecords.get(project.id);
         if (deliveryRecord) {
           project.deliveryRecord = deliveryRecord;

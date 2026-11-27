@@ -970,6 +970,99 @@ function deliveryDuration(seconds) {
     (remainder || seconds === 0 ? remainder + '秒' : '');
 }
 
+function estimateLabel(estimate) {
+  if (!Number.isFinite(estimate?.standard)) return '見積もり未登録';
+  const duration = minutes => deliveryDuration(Math.round(minutes * 60));
+  return estimate.optimistic === estimate.cautious ? duration(estimate.standard) :
+    duration(estimate.optimistic) + '〜' + duration(estimate.cautious) + '（標準 ' + duration(estimate.standard) + '）';
+}
+
+function taskStatus(task) {
+  const age = Date.now() - Date.parse(task.observedAt);
+  if (task.status === 'active') return age >= 0 && age <= 15 * 60 * 1000
+    ? chip('developing') : chip('unknown', '前回は開発中');
+  if (task.status === 'pending') return chip('waiting', '未着手');
+  return chip(task.status);
+}
+
+function progressRow(task) {
+  const row = node('li', 'task-progress-row');
+  const work = node('div');
+  if (task.title) {
+    const title = node('p', 'task-title');
+    title.append(node('strong', '', task.title), taskStatus(task));
+    work.append(title);
+  }
+  if (!appendStrings(work, task.remaining)) work.append(node('p', 'small muted', '残作業の記録なし'));
+  if (task.blocker) work.append(node('p', 'small', task.blocker));
+  const metrics = node('dl', 'task-progress-facts');
+  const progress = task.progress;
+  const progressValue = progress && Number.isFinite(progress.percent)
+    ? progress.percent + '%（' + progress.accepted + '/' + progress.total + '件確認・残り' +
+      (progress.total - progress.accepted) + '件）' : '算定待ち';
+  const remainingTime = estimateLabel(task.remainingMinutes);
+  for (const [label, value] of [['進捗率', progressValue], ['残り作業時間', remainingTime]]) {
+    const entry = node('div');
+    entry.append(node('dt', 'small muted', label), node('dd', 'strong', value));
+    metrics.append(entry);
+  }
+  const context = node('p', 'small muted');
+  const notes = [];
+  if (task.device) notes.push(task.device);
+  if (task.externalWait === true) notes.push('待ち時間は未定');
+  if (task.observedAt) notes.push('記録 ' + time(task.observedAt));
+  if (notes.length) context.append(node('span', '', notes.join(' · ')));
+  for (const proof of asArray(task.evidence)) {
+    const source = link(proof.label, proof.url);
+    if (source) context.append(source);
+  }
+  row.append(work, metrics);
+  if (context.hasChildNodes()) row.append(context);
+  return row;
+}
+
+function developmentTasks() {
+  const area = panel('開発タスク');
+  const list = node('div', 'development-tasks');
+  const source = ui.portfolio?.taskProgressSource;
+  const development = new Set(['developing', 'researching', 'designing', 'verifying', 'fixing', 'integrating',
+    'waiting', 'approval', 'blocked', 'limit', 'delayed']);
+  for (const project of projectList()) {
+    const tasks = asArray(project.tasks).filter(task => task.status !== 'verified');
+    if (!tasks.length && !development.has(project.state)) continue;
+    const group = node('section', 'task-project');
+    const heading = node('div', 'task-project-heading');
+    const projectButton = button(project.name, () => selectProject(project.id, true));
+    const scopedState = project.stateScope && project.stateScope + ' · ' + stateLabels[statusKey(project.state)];
+    heading.append(projectButton, chip(project.state, scopedState || undefined));
+    const formal = project.measurements?.formalCompletion;
+    heading.append(node('span', 'small muted', Number.isFinite(formal) ? '案件全体 ' + formal + '%' : '案件全体の達成率は未確定'));
+    group.append(heading);
+    const entries = node('ul', 'task-progress-list');
+    if (tasks.length) for (const task of tasks) entries.append(progressRow(task));
+    else entries.append(progressRow({remaining: project.remaining,
+      blocker: 'タスク別の受入記録を取得できていません。', observedAt: project.observedAt,
+      remainingMinutes: project.schedule?.remainingMinutes}));
+    group.append(entries);
+    list.append(group);
+  }
+  if (list.children.length) area.body.append(list);
+  else if (source?.status !== 'unavailable') {
+    area.body.append(node('p', 'muted', '進行中または未完了と確認できた開発タスクはありません。'));
+  }
+  if (source?.status === 'current') {
+    const record = link(source.evidence?.label, source.evidence?.url);
+    if (record) area.body.append(node('p', 'small muted', '案件の観測 ' + time(source.observedAt) + ' '), record);
+    if (source.unmatched > 0) area.body.append(node('p', 'small muted',
+      '登録案件と照合できない進捗記録 ' + source.unmatched + '件'));
+  } else if (source?.status === 'unavailable') {
+    area.body.append(node('p', 'small muted', list.children.length
+      ? '案件の観測記録を取得できません。取得できた作業だけ表示しています。'
+      : '案件の観測記録を取得できないため、開発タスクを確認できません。'));
+  }
+  return area.root;
+}
+
 const reviewStatuses = {
   verified: ['確認済み', 'completed'], partial: ['一部確認', 'approval'],
   open: ['未確認', 'unknown'], blocked: ['保留', 'blocked'], reference: ['参照', 'unknown'],
@@ -1087,11 +1180,7 @@ function projectDetail() {
   }
   if (!record || m.estimateFinish || record.firstUsable) metric(facts, '完成予定', time(m.estimateFinish));
   if (project.schedule?.originalDueAt) metric(facts, '当初の完成予定', time(project.schedule.originalDueAt));
-  const remaining = project.schedule?.remainingMinutes;
-  if (Number.isFinite(remaining?.standard)) {
-    const minutes = new Intl.NumberFormat('ja-JP', {maximumFractionDigits: 1});
-    metric(facts, '残りの目安', `${minutes.format(remaining.optimistic)}〜${minutes.format(remaining.cautious)}分（標準 ${minutes.format(remaining.standard)}分）`);
-  }
+  metric(facts, '案件全体の残り作業時間', estimateLabel(project.schedule?.remainingMinutes));
   if (!record || Number.isFinite(m.activeMinutes)) {
     metric(facts, '累計実作業時間', Number.isFinite(m.activeMinutes) ? m.activeMinutes + '分' : null);
   }
@@ -1099,6 +1188,13 @@ function projectDetail() {
   detail.body.append(facts);
   if (record) detail.body.append(deliveryRecordDetails(record));
   if (record?.requirementsReview === true) detail.body.append(requirementsReview(project));
+  if (asArray(project.tasks).length) {
+    const tasks = node('details', 'scope-info');
+    const rows = node('ul', 'task-progress-list');
+    rows.append(...project.tasks.map(progressRow));
+    tasks.append(node('summary', '', 'この案件の開発タスク'), rows);
+    detail.body.append(tasks);
+  }
   if (project.schedule?.delayed === true) detail.body.append(node('p', 'notice-chip chip', '当初予定に対して遅延しています'));
   if (ui.capabilities.executionActivity === true) detail.body.append(activityPanel());
   if (asArray(project.remaining).length) {
@@ -1266,7 +1362,7 @@ function dashboard() {
     right.append(artifactsPanel.root);
   }
   split.append(left, right);
-  dom.content.append(statistics, split);
+  dom.content.append(statistics, developmentTasks(), split);
   const limits = asArray(ui.portfolio?.limits);
   if (limits.length) {
     const findings = node('details', 'scope-info');
@@ -3277,7 +3373,9 @@ function projectNeedsWorkspace() {
 }
 
 const screens = {dashboard, chat, codex, artifacts};
-const dashboardSummary = () => '案件データの観測 ' + time(ui.portfolio?.observedAt);
+const dashboardSummary = () => ui.portfolio?.taskProgressSource?.observedAt
+  ? '開発タスクの観測 ' + time(ui.portfolio.taskProgressSource.observedAt)
+  : '案件データの観測 ' + time(ui.portfolio?.observedAt);
 function render(restore = true, keepNotice = false) {
   if (dom.shell.hidden) return;
   abortLocalDictation();
