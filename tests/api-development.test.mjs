@@ -25,7 +25,7 @@ async function authenticatedRequests(app) {
       ...(data ? {body: JSON.stringify(data)} : {})});
 }
 
-async function fixture(t, fetchImpl, {handover = false, auxiliary = []} = {}) {
+async function fixture(t, fetchImpl, {handover = false, auxiliary = [], codex = {}} = {}) {
   const directory = await realpath(await mkdtemp(join(tmpdir(), 'hq-api-app-')));
   let app, requests;
   const servers = new Set();
@@ -54,7 +54,8 @@ test('answer equals the required value', () => assert.equal(answer, 2));\n`);
   git('commit', '--quiet', '-m', 'Fixture initial files');
   const portfolio = join(directory, 'portfolio.json');
   await writeFile(portfolio, JSON.stringify({projects: [
-    {id, name: 'API fixture', state: 'unknown', cwd: checkout, goal: '答えを2にする', ...(handover ? {handoverRequirements: 'GOAL.md'} : {})},
+    {id, name: 'API fixture', state: 'unknown', cwd: checkout, goal: '答えを2にする', enableCodexWrite: codex.canWrite === true,
+      ...(handover ? {handoverRequirements: 'GOAL.md'} : {})},
     {id: 'other-fixture', name: 'Another isolated fixture', state: 'unknown'},
   ]}), {mode: 0o600});
   const ledgerFile = join(directory, 'execution-policy.json');
@@ -71,7 +72,7 @@ test('answer equals the required value', () => assert.equal(answer, 2));\n`);
   async function open(enableExecution) {
     await app?.close();
     servers.delete(app);
-    app = await startOwnerApp({directory, port: 0, codex: {}, apiDevelopment: enableExecution && {getKey: () => 'fixture-only', fetchImpl}});
+    app = await startOwnerApp({directory, port: 0, codex, apiDevelopment: enableExecution && {getKey: () => 'fixture-only', fetchImpl}});
     servers.add(app);
     requests = await authenticatedRequests(app);
   }
@@ -216,6 +217,127 @@ test('API-to-Codex rehearsal checks a committed requirement, conversation and ap
   assert.equal((await call('/api/execution/handover', {query})).status, 409);
   assert.equal((await call('/api/execution/api', {data: instruction})).status, 409);
   assert.equal(requests, 1);
+});
+
+test('a verified API receipt starts one linked Codex thread and fences stale evidence before its turn', {skip: process.platform !== 'darwin'}, async t => {
+  const model = {id: 'fixture-codex', isDefault: true, reasoningEfforts: []};
+  let release;
+  let allowedUsage = true;
+  let mutateAtUsage;
+  let event;
+  let steerCalls = 0;
+  const firstThread = new Promise(resolve => { release = resolve; });
+  const attempted = [];
+  const submitted = [];
+  const codex = {canWrite: true, subscriptionReady: async () => true,
+    models: async () => ({accountType: 'chatgpt', data: [model]}),
+    async usage() {
+      const change = mutateAtUsage;
+      mutateAtUsage = undefined;
+      await change?.();
+      return {ordinaryUsageAllowed: allowedUsage, windows: [{usedPercent: 20}]};
+    },
+    onEvent(listener) { event = listener; return () => { event = null; }; },
+    async steer({turnId, beforeSteer, beforeSend}) {
+      await beforeSteer?.();
+      beforeSend();
+      steerCalls++;
+      return turnId;
+    },
+    async submit(options) {
+      assert.equal(options.beforeThread(), true);
+      attempted.push(options.requestId);
+      if (attempted.length === 1) await firstThread;
+      const failAtSend = options.requestId === 'handoff-usage-stopped';
+      if (failAtSend) allowedUsage = false;
+      if (options.requestId === 'handoff-last-moment') mutateAtUsage = () => writeFile(requirements, '利用枠照合中に変わった要求');
+      try { await options.beforeTurn?.(); }
+      finally { if (failAtSend) allowedUsage = true; }
+      assert.equal(options.onThread(options.knownId ?? 'linked-native-thread'), true);
+      submitted.push(options);
+      return {turn: {id: `turn-${submitted.length}`, status: options.requestId === 'handoff-same-thread' ? 'inProgress' : 'completed'}};
+    }};
+  let providerCalls = 0;
+  const {call, store, open, commitSource, requirements} = await fixture(t, async () => {
+    providerCalls++;
+    return providerAnswer(2);
+  }, {handover: true, codex});
+  const ran = async (operationId, phase) => {
+    for (let index = 0; index < 80; index++) {
+      const row = (await (await call('/api/codex/run', {query: {id: operationId}})).json()).operation;
+      if (row?.phase === phase) return row;
+      if (['failed', 'completed', 'unconfirmed'].includes(row?.phase)) assert.equal(row.phase, phase);
+      await wait(50);
+    }
+    assert.fail(`Codex operation did not become ${phase}`);
+  };
+  try {
+    assert.equal((await call('/api/execution/settings', {data: {revision: 0, settings: {mode: 'api-only', apiBudgetUsd: 1}}})).status, 200);
+    assert.equal((await call('/api/execution/api', {data: instruction})).status, 202);
+    await waitFor(call, 'completed');
+    await commitSource('export const answer = 2;\n');
+    const receipt = store.getWork(id, instruction.id).operation.executionId;
+    assert.equal((await call('/api/execution/settings', {data: {revision: 1, settings: {mode: 'subscription-only'}}})).status, 200);
+    await open(false);
+    const {review} = await (await call('/api/execution/handover', {query: {receipt}})).json();
+    assert.match(review, /^[a-f0-9]{64}$/);
+    const payload = {id: 'handoff-stale-turn', prompt: '現在の成果を引き継いで次の検証を行う', stage: 'implementation', route: 'subscription',
+      handover: {receipt, review}};
+    assert.equal((await call('/api/codex/run', {data: {...payload, handover: undefined}})).status, 409);
+    assert.equal((await call('/api/codex/run', {data: {...payload, handover: {receipt, review: 'f'.repeat(64)}}})).status, 409);
+    allowedUsage = false;
+    assert.equal((await call('/api/codex/run', {data: payload})).status, 409);
+    allowedUsage = true;
+    const original = await readFile(requirements);
+    assert.equal((await call('/api/codex/run', {data: payload})).status, 202);
+    await writeFile(requirements, '送信直前の未承認の変更');
+    release();
+    await ran(payload.id, 'failed');
+    assert.equal(submitted.length, 0);
+    await writeFile(requirements, original);
+    const later = {...payload, id: 'handoff-last-moment'};
+    assert.equal((await call('/api/codex/run', {data: later})).status, 202);
+    await ran(later.id, 'failed');
+    assert.equal(submitted.length, 0);
+    await writeFile(requirements, original);
+    const accepted = {...payload, id: 'handoff-valid-turn'};
+    const simultaneous = await Promise.all([call('/api/codex/run', {data: accepted}), call('/api/codex/run', {data: accepted})]);
+    assert.deepEqual(simultaneous.map(response => response.status), [202, 202]);
+    assert.equal((await simultaneous[0].json()).operation.id, (await simultaneous[1].json()).operation.id);
+    const row = await ran(accepted.id, 'completed');
+    assert.equal(row.handoverReceipt, receipt);
+    assert.equal(row.threadId, 'linked-native-thread');
+    assert.equal((await (await call('/api/codex/run', {data: accepted})).json()).operation.id, row.id);
+    assert.equal((await call('/api/codex/run', {data: {...accepted, id: 'handoff-duplicate-origin'}})).status, 409);
+    assert.equal(submitted.length, 1);
+    assert.match(submitted[0].prompt, /GOAL\.md/);
+    assert.match(submitted[0].prompt, /答えを2にする/);
+    assert.match(submitted[0].prompt, /実行確認/);
+    assert.match(submitted[0].prompt, /現在の成果を引き継いで次の検証を行う/);
+    await open(false);
+    const latest = await (await call('/api/codex/run', {query: {handoverReceipt: receipt}})).json();
+    assert.equal(latest.operation.id, row.id);
+    const continuation = {id: 'handoff-same-thread', resume: row.id, prompt: '次の確認を続ける'};
+    assert.equal((await call('/api/codex/run', {data: continuation})).status, 202);
+    const resumed = await ran(continuation.id, 'running');
+    assert.equal(resumed.handoverReceipt, receipt);
+    assert.equal(submitted[1].knownId, row.threadId);
+    assert.equal(submitted[1].prompt, continuation.prompt);
+    allowedUsage = false;
+    const steering = {id: 'handoff-blocked-steering', operationId: resumed.id, prompt: '追加確認'};
+    assert.equal((await call('/api/codex/steer', {data: steering})).status, 409);
+    assert.equal(steerCalls, 0);
+    allowedUsage = true;
+    event('turn/completed', {threadId: resumed.threadId, turn: {id: resumed.turnId, status: 'completed'}});
+    await ran(resumed.id, 'completed');
+    const denied = {...continuation, id: 'handoff-usage-stopped', resume: resumed.id};
+    assert.equal((await call('/api/codex/run', {data: denied})).status, 202);
+    await ran(denied.id, 'failed');
+    assert.equal((await call('/api/execution/settings', {data: {revision: 2, settings: {mode: 'api-only'}}})).status, 200);
+    await open(true);
+    assert.equal((await call('/api/execution/api', {data: {...instruction, id: 'reverse-without-handoff'}})).status, 409);
+    assert.equal(providerCalls, 1);
+  } finally { release(); }
 });
 
 test('readback preserves more retained files than a single API enrollment', {skip: process.platform !== 'darwin'}, async t => {

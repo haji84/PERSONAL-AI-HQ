@@ -1,6 +1,6 @@
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { constants } from 'node:fs';
+import { closeSync, constants, fstatSync, openSync, readSync, realpathSync } from 'node:fs';
 import { access, lstat, mkdir, open, readdir, realpath, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
@@ -198,6 +198,29 @@ export async function readCommittedEvidence({ checkout, paths, signal }) {
   signal?.throwIfAborted();
   if (checkoutHead(checkout) !== head) throw new Error('API evidence Git HEAD changed during readback');
   return { head, files };
+}
+
+// The Git blobs were already checked. At dispatch, make sure the same revision and working bytes are still present.
+export function checkedEvidenceIsCurrent({ checkout, head, files }) {
+  try {
+    const owner = process.getuid?.();
+    if (owner === undefined || realpathSync(absolute(checkout)) !== checkout || checkoutHead(checkout) !== head) return false;
+    const buffer = Buffer.alloc(MAX_FILE_BYTES + 1);
+    for (const file of files) {
+      const filename = path.join(checkout, sourcePath(file.path));
+      if (realpathSync(filename) !== filename) return false;
+      const fd = openSync(filename, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      try {
+        const before = fstatSync(fd, { bigint: true });
+        if (!before.isFile() || before.uid !== BigInt(owner) || before.nlink !== 1n || before.size > BigInt(MAX_FILE_BYTES)) return false;
+        const length = readSync(fd, buffer, 0, buffer.length, 0);
+        const after = fstatSync(fd, { bigint: true });
+        if (BigInt(length) !== before.size || before.ctimeNs !== after.ctimeNs || before.mtimeNs !== after.mtimeNs ||
+            hash(buffer.subarray(0, length)) !== file.sha256) return false;
+      } finally { closeSync(fd); }
+    }
+    return checkoutHead(checkout) === head;
+  } catch { return false; }
 }
 
 async function snapshot(checkout, baseSha, entries, signal) {

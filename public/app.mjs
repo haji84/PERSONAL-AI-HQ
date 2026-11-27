@@ -951,6 +951,56 @@ function importSection(project) {
   box.append(start);
   return box;
 }
+function mountChatHandoff(destination, project, conversation, isCurrent) {
+  const receipt = conversation.id.slice('api/'.length);
+  const proof = node('p', 'small muted');
+  proof.setAttribute('role', 'status');
+  proof.hidden = true;
+  let review = null;
+  let run;
+  const verify = button('Codexへの引継ぎを照合', async () => {
+    if (!isCurrent() || !proof.isConnected) return;
+    review = null;
+    run?.paint();
+    verify.disabled = true;
+    proof.hidden = false;
+    proof.textContent = '要求、会話、Git上の成果物を照合しています。';
+    try {
+      const result = await api(apiPath('/api/execution/handover', {project, receipt}), {signal: AbortSignal.timeout(14000)});
+      if (!isCurrent() || !proof.isConnected) return;
+      if (!result.verified || result.receipt !== receipt || !/^[a-f0-9]{64}$/.test(result.review ?? '')) {
+        proof.textContent = '引継ぎの照合結果を確認できませんでした。';
+        return;
+      }
+      review = result.review;
+      proof.textContent = `照合済み ${result.requirements.path} · 成果物 ${result.artifacts.length}件 · Git ${result.checkoutHead.slice(0, 12)}`;
+      run?.paint();
+    } catch (error) { if (isCurrent() && proof.isConnected) proof.textContent = error.message; }
+    finally { if (isCurrent() && proof.isConnected) verify.disabled = false; }
+  });
+  destination.append(verify, proof);
+  if (ui.capabilities.codexWrite !== true || selectedProject()?.codexWrite !== true) return;
+
+  const root = node('div', 'stack');
+  root.hidden = true;
+  const key = memoryKey('codex-handoff-draft', project, receipt);
+  const draft = node('textarea', 'draft');
+  draft.maxLength = 16000;
+  draft.value = ui.drafts.get(key) ?? '';
+  draft.addEventListener('input', () => { ui.drafts.set(key, draft.value); storeTab(); });
+  const label = node('label', 'picker');
+  label.append(node('span', '', 'Codexで続ける指示'), draft);
+  root.append(label);
+  destination.append(root);
+  run = mountCodexRun({root, body: root}, project, draft, key, () => ({route: 'subscription', stage: 'implementation'}), null, {
+    receipt, isCurrent, review: () => review,
+    invalidate() {
+      review = null;
+      if (isCurrent() && proof.isConnected) proof.textContent = '引継ぎの照合を更新してください。';
+    },
+  });
+  return run.cleanup;
+}
 function chat() {
   const project = ui.project;
   if (!project) return emptyProject();
@@ -965,7 +1015,10 @@ function chat() {
   let debounce;
   let nextThreadPage = null;
   let explicitSelection = Boolean(ui.chatIds.get(project));
+  let cleanupHandoff;
   function showChatDetails() {
+    cleanupHandoff?.();
+    cleanupHandoff = undefined;
     const id = ui.chatIds.get(project);
     if (!id) {
       readContainer.replaceChildren(node('p', 'muted', '履歴から会話を選んでください。'));
@@ -975,6 +1028,8 @@ function chat() {
     const detail = (offset, cursor) => nativeId ? apiPath('/api/codex/thread', {project, id: nativeId, cursor}) : apiPath('/api/chat', {project, id, offset});
     const key = memoryKey('chat-detail', project, id);
     fetchView(key, detail(0), readContainer, (result, destination) => {
+      cleanupHandoff?.();
+      cleanupHandoff = undefined;
       const conversation = nativeId ? {title: result?.thread?.title, source: 'codex-history', importedAt: result?.thread?.updatedAt,
         messages: asArray(result?.turns).flatMap(turn => asArray(turn.messages))} : result?.conversation;
       if (!conversation) {
@@ -1036,22 +1091,7 @@ function chat() {
       updateTransfer();
       destination.append(transfer);
       if (apiArchive && conversation.outcome === 'completed') {
-        const proof = node('p', 'small muted');
-        proof.setAttribute('role', 'status');
-        proof.hidden = true;
-        const verify = button('Codexへの引継ぎを照合', async () => {
-          verify.disabled = true;
-          proof.hidden = false;
-          proof.textContent = '要求、会話、Git上の成果物を照合しています。';
-          try {
-            const result = await api(apiPath('/api/execution/handover', {project, receipt: conversation.id.slice('api/'.length)}));
-            if (!proof.isConnected) return;
-            proof.textContent = result.verified ? `照合済み ${result.requirements.path} · 成果物 ${result.artifacts.length}件 · Git ${result.checkoutHead.slice(0, 12)}` :
-              '引継ぎの照合結果を確認できませんでした。';
-          } catch (error) { if (proof.isConnected) proof.textContent = error.message; }
-          finally { if (proof.isConnected) verify.disabled = false; }
-        });
-        destination.append(verify, proof);
+        cleanupHandoff = mountChatHandoff(destination, project, conversation, detailIsCurrent);
       }
     }, () => ui.chatIds.get(project) === id);
   }
@@ -1171,12 +1211,19 @@ const apiWorkMessages = {
   INTERRUPTED: 'API作業を中断しました。',
 };
 
-function mountCodexRun(area, project, draft, draftKey, choices, apiReady) {
+function mountCodexRun(area, project, draft, draftKey, choices, apiReady, handoff) {
   const apiMode = Boolean(apiReady);
   const runKey = apiMode ? memoryKey('api-work', project) : project;
+  const stateKey = handoff ? memoryKey('codex-handoff', project, handoff.receipt) : runKey;
   const path = apiMode ? '/api/execution/api' : '/api/codex/run';
-  const run = runStates.get(runKey) ?? {operation: null, known: false, busy: false, checking: false, message: ''};
-  runStates.set(runKey, run);
+  const run = runStates.get(stateKey) ?? {operation: null, known: false, busy: false, checking: false, message: ''};
+  runStates.set(stateKey, run);
+  const intentReceipt = intent => intent?.handover?.receipt ?? intent?.draftReceipt;
+  const intentDraftKey = intent => intentReceipt(intent) ? memoryKey('codex-handoff-draft', project, intentReceipt(intent)) : draftKey;
+  const currentIntent = () => {
+    const intent = ui.runIntents.get(runKey);
+    return !handoff || intentReceipt(intent) === handoff.receipt ? intent : undefined;
+  };
   const section = node('section', 'run-control');
   const caption = node('p', 'muted small', apiMode ? '許可済みのファイルを分離作業先で編集し、テストを実行します。'
     : '指示は、このプロジェクト専用の分離作業先で実行されます。');
@@ -1191,7 +1238,7 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady) {
   output.tabIndex = 0;
   const artifacts = node('ul', 'marked-list');
   const actions = node('div', 'run-actions');
-  const send = button(apiMode ? '通常APIで開発を開始' : '分離作業先に送信', () => submitNew(), false);
+  const send = button(handoff ? '引継いでCodexを開始' : apiMode ? '通常APIで開発を開始' : '分離作業先に送信', () => submitNew(), false);
   const resume = button('同じスレッドへ追加指示', () => submitNew(run.operation), true);
   const interrupt = button('中断を要求', async () => {
     if (run.busy || run.checking || !canInterrupt()) return;
@@ -1201,14 +1248,15 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady) {
   const steer = button('実行中のターンに追加指示', () => sendSteering(), true);
   const checkSteer = button('追加指示の状態を照合', () => requestSteering(false), true);
   const closeSteer = button('この確認を閉じる', () => {
+    if (!steeringIntent()) return;
     ui.steerIntents.delete(project);
     storeTab();
     run.steerMessage = '';
     paint();
   });
   const recover = button('同じ受付番号で再送', async () => {
-    const intent = ui.runIntents.get(runKey);
-    if (!run.busy && !run.checking && intent) await mutate(path, intent);
+    const intent = currentIntent();
+    if (!run.busy && !run.checking && intent && reviewMatches(intent)) await mutate(path, intent);
   }, true);
   const check = button('作業状態を確認', () => lookup(), true);
   actions.append(send, resume, steer, interrupt, recover, check, checkSteer, closeSteer);
@@ -1218,6 +1266,12 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady) {
 
   let timer;
   let disposed = false;
+  const isCurrent = () => !disposed && section.isConnected && (!handoff || handoff.isCurrent());
+  const reviewMatches = intent => !intent?.handover || intent.handover.review === handoff?.review();
+  function steeringIntent() {
+    const pending = apiMode ? null : ui.steerIntents.get(project);
+    return !handoff || pending?.operationId === run.operation?.id ? pending : null;
+  }
   function canInterrupt() {
     if (apiMode) return run.known && ['reserved', 'running', 'interrupting'].includes(run.operation?.phase);
     return run.known && ['running', 'interrupting', 'unconfirmed'].includes(run.operation?.phase) &&
@@ -1228,10 +1282,12 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady) {
       (!run.operation || finishedPhases.has(run.operation.phase));
   }
   function paint() {
-    if (disposed || !section.isConnected) return;
+    if (!isCurrent()) return;
     clearTimeout(timer);
     const phase = run.operation?.phase;
-    const intention = ui.runIntents.get(runKey);
+    const intention = currentIntent();
+    const continuation = Boolean(run.operation?.threadId && run.operation?.turnId);
+    if (handoff) area.root.hidden = !(handoff.review() || intention || run.operation || run.message);
     status.textContent = run.busy && intention ? '受付を確認中…' :
       run.known ? apiMode && phase === 'completed' ? '成果物の検証完了' : runPhases[phase] ?? '実行記録なし'
         : run.checking ? '照合中…' : '実行状態未確認';
@@ -1247,18 +1303,18 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady) {
       (apiReady() && !apiReady().available && (apiWorkMessages[apiReady().reason] || '通常APIの実行条件を確認できません。')));
     warning.textContent = run.message || apiNotice || '';
     warning.hidden = !warning.textContent;
-    const pendingSteering = apiMode ? null : ui.steerIntents.get(project);
+    const pendingSteering = steeringIntent();
     steeringStatus.textContent = run.steerMessage || (pendingSteering ? '追加指示の受付を照合できます。' : '');
     steeringStatus.hidden = apiMode || !steeringStatus.textContent;
-    send.hidden = !hasRoom();
-    resume.hidden = apiMode || !hasRoom() || !run.operation?.threadId || !run.operation?.turnId;
+    send.hidden = !hasRoom() || Boolean(handoff && (!handoff.review() || continuation));
+    resume.hidden = apiMode || !hasRoom() || !continuation;
     resume.textContent = phase === 'interrupted' ? '中断した作業を再開' : '同じスレッドへ追加指示';
     interrupt.hidden = !canInterrupt();
     interrupt.textContent = !apiMode && phase === 'interrupting' ? '同じターンの中断を再要求' : '中断を要求';
-    steer.hidden = apiMode || !run.known || phase !== 'running' || !run.operation?.turnId || Boolean(pendingSteering);
+    steer.hidden = apiMode || !run.known || phase !== 'running' || !run.operation?.turnId || ui.steerIntents.has(project);
     checkSteer.hidden = !pendingSteering;
     closeSteer.hidden = !pendingSteering || !run.known || !finishedPhases.has(phase);
-    recover.hidden = !intention;
+    recover.hidden = !intention || !reviewMatches(intention);
     for (const action of [send, resume, steer, interrupt, recover, check, checkSteer, closeSteer]) {
       action.disabled = run.busy || run.checking;
     }
@@ -1288,16 +1344,18 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady) {
     if (!result || !Object.hasOwn(result, 'operation')) throw new Error('作業状態を取得できませんでした。');
     const operation = result?.operation;
     if (operation && (operation.project !== project || !operation.id ||
-      !Object.hasOwn(runPhases, operation.phase) || (expected && operation.id !== expected))) {
+      !Object.hasOwn(runPhases, operation.phase) || (expected && operation.id !== expected) ||
+      (handoff && operation.handoverReceipt !== handoff.receipt))) {
       throw new Error('対象の作業状態を照合できませんでした。');
     }
     if (operation) {
-      const intent = ui.runIntents.get(runKey);
+      const intent = currentIntent();
       if (intent?.id === operation.id) {
         ui.runIntents.delete(runKey);
-        if (text(ui.drafts.get(draftKey), '').trim() === intent.prompt) {
-          ui.drafts.delete(draftKey);
-          run.clearDraft = intent.prompt;
+        const key = intentDraftKey(intent);
+        if (text(ui.drafts.get(key), '').trim() === intent.prompt) {
+          ui.drafts.delete(key);
+          if (key === draftKey) run.clearDraft = intent.prompt;
         }
         storeTab();
       }
@@ -1308,13 +1366,13 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady) {
   }
 
   async function lookup() {
-    if (run.busy || run.checking || disposed) return;
+    if (run.busy || run.checking || !isCurrent()) return;
     run.checking = true;
     run.onChange?.();
-    const id = ui.runIntents.get(runKey)?.id ??
+    const id = currentIntent()?.id ??
       (run.operation && !finishedPhases.has(run.operation.phase) ? run.operation.id : undefined);
     try {
-      const response = await api(apiPath(path, {project, id}), {signal: AbortSignal.timeout(9000)});
+      const response = await api(apiPath(path, {project, id, handoverReceipt: handoff?.receipt}), {signal: AbortSignal.timeout(9000)});
       accept(response, id);
     } catch (error) {
       run.known = false;
@@ -1326,24 +1384,26 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady) {
   }
 
   async function mutate(endpoint, payload) {
-    if (run.busy || run.checking || disposed) return;
+    if (run.busy || run.checking || !isCurrent()) return;
     run.busy = true;
     run.message = '';
     run.onChange?.();
     try {
+      const {draftReceipt, ...request} = payload;
       const result = await api(apiPath(endpoint, {project}), {
-        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(12000),
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(request),
+        signal: AbortSignal.timeout(payload.handover ? 16000 : 12000),
       });
       if (!result?.operation) throw new Error('作業の受付結果を照合できませんでした。');
       accept(result, payload.id);
     } catch (error) {
-      const confirmedRejection = [400, 403, 413].includes(error.status) || apiMode && error.status === 409;
+      const confirmedRejection = [400, 403, 413].includes(error.status) || (apiMode || payload.handover) && error.status === 409;
       if (endpoint === path && confirmedRejection && ui.runIntents.get(runKey)?.id === payload.id) {
         ui.runIntents.delete(runKey);
+        if (payload.handover) handoff?.invalidate();
         storeTab();
       }
-      run.known = apiMode && confirmedRejection;
+      run.known = Boolean((apiMode || payload.handover) && confirmedRejection);
       run.message = error.message + ' 作業状態を確認してください。';
     } finally {
       run.busy = false;
@@ -1352,21 +1412,24 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady) {
   }
 
   async function requestSteering(submit) {
-    const intent = ui.steerIntents.get(project);
-    if (!intent || run.busy || run.checking || disposed) return;
+    const intent = steeringIntent();
+    if (!intent || run.busy || run.checking || !isCurrent()) return;
     run.busy = true;
     run.steerMessage = '追加指示の受付を照合中…';
     paint();
     try {
       const path = apiPath('/api/codex/steer', {project, id: submit ? undefined : intent.id});
-      const options = submit ? {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(intent)} : {};
+      const {draftReceipt, ...request} = intent;
+      const options = submit ? {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(request)} : {};
       const {steering} = await api(path, {...options, signal: AbortSignal.timeout(14000)});
+      if (ui.steerIntents.get(project)?.id !== intent.id) return;
       const matchesIntent = steering?.id === intent.id && steering.project === project && steering.operationId === intent.operationId;
       if (matchesIntent && steering.phase === 'accepted') {
         ui.steerIntents.delete(project);
-        if (draft.value.trim() === intent.prompt) {
-          ui.drafts.delete(draftKey);
-          draft.value = '';
+        const key = intentDraftKey(intent);
+        if (text(ui.drafts.get(key), '').trim() === intent.prompt) {
+          ui.drafts.delete(key);
+          if (key === draftKey && draft.value.trim() === intent.prompt) draft.value = '';
         }
         storeTab();
         run.steerMessage = '実行中の同じターンで追加指示が受理されました。';
@@ -1376,7 +1439,7 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady) {
         run.steerMessage = '元のターンの状態が変わったため、追加指示を送信しませんでした。';
       } else run.steerMessage = '追加指示の受理をまだ確認できません。作業状態を照合できます。';
     } catch (error) {
-      if (submit && [400, 403, 409, 413].includes(error.status)) {
+      if (submit && [400, 403, 409, 413].includes(error.status) && ui.steerIntents.get(project)?.id === intent.id) {
         ui.steerIntents.delete(project);
         storeTab();
       }
@@ -1388,7 +1451,7 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady) {
   }
 
   function sendSteering() {
-    if (steer.hidden || run.busy || run.checking) return;
+    if (steer.hidden || run.busy || run.checking || !isCurrent() || ui.steerIntents.has(project)) return;
     const prompt = draft.value.trim();
     if (!prompt) {
       run.steerMessage = '追加する指示を下書きに入力してください。';
@@ -1396,13 +1459,17 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady) {
       draft.focus();
       return;
     }
-    ui.steerIntents.set(project, {id: crypto.randomUUID(), operationId: run.operation.id, prompt});
+    const request = {id: crypto.randomUUID(), operationId: run.operation.id, prompt};
+    if (handoff) request.draftReceipt = handoff.receipt;
+    ui.steerIntents.set(project, request);
     storeTab();
     void requestSteering(true);
   }
 
   function submitNew(previous) {
-    if (run.busy || run.checking || !hasRoom()) return;
+    if (run.busy || run.checking || !hasRoom() || !isCurrent()) return;
+    const review = handoff?.review();
+    if (handoff && !previous && (!review || (run.operation?.threadId && run.operation?.turnId))) return;
     const prompt = draft.value.trim() ||
       (previous?.phase === 'interrupted' ? 'このスレッドで中断した作業を再開してください。' : '');
     if (!prompt) {
@@ -1412,7 +1479,10 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady) {
       return;
     }
     const intent = {id: crypto.randomUUID(), prompt, ...choices()};
-    if (previous) intent.resume = previous.id;
+    if (previous) {
+      intent.resume = previous.id;
+      if (handoff) intent.draftReceipt = handoff.receipt;
+    } else if (handoff) intent.handover = {receipt: handoff.receipt, review};
     ui.runIntents.set(runKey, intent);
     storeTab();
     void mutate(path, intent);
@@ -1432,7 +1502,7 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady) {
       void lookup();
     }
   });
-  return paint;
+  return {paint, cleanup};
 }
 
 function modelSettings() {
@@ -1477,7 +1547,7 @@ function modelSettings() {
     options.append(stage.field, model.field, effort.field);
     area.body.append(options);
     let capability;
-    const paint = mountCodexRun(area, project, draft, draftKey, () => ({stage: stage.input.value,
+    const {paint} = mountCodexRun(area, project, draft, draftKey, () => ({stage: stage.input.value,
       ...(model.input.value ? {model: model.input.value} : {}), ...(effort.input.value ? {effort: effort.input.value} : {})}), () => capability);
     options.hidden = true;
     void api(apiPath('/api/execution/api/capabilities', {project})).then(value => {

@@ -135,7 +135,9 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
   const native = codex ?? createCodexClient({socket: await checkedSocket(socket)});
   const chats = createChatStore(directory);
   const execution = createExecutionAccess(directory, native);
-  const operations = createOperations(directory, native, execution);
+  const operations = createOperations(directory, native, execution, {
+    prepareHandover: (...args) => apiWork.prepareNativeHandover(...args),
+  });
   const apiEnabled = Boolean(apiDevelopment);
   const apiWork = createApiDevelopment({...(!apiEnabled || apiDevelopment === true ? {} : apiDevelopment),
     directory, store: execution.store, conversations: chats, hasNativeWork: operations.hasNativeWork, hasActiveWork: operations.hasActiveWork,
@@ -352,7 +354,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       }
     }
     if (route === '/api/codex/run') {
-      if (get) return send(response, 200, await operations.read(project, target.searchParams.get('id')));
+      if (get) return send(response, 200, await operations.read(project, target.searchParams.get('id'), target.searchParams.get('handoverReceipt')));
       if (post) return send(response, 202, await operations.start(project, await jsonBody(request, 64000)));
     }
     if (post && route === '/api/codex/interrupt') {

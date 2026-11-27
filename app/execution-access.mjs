@@ -9,7 +9,7 @@ const problem = (status, message) => Object.assign(new Error(message), {status})
 export function createExecutionAccess(directory, native) {
   const store = new ExecutionStore(join(directory, 'execution-policy.json'), {authorityId: 'personal-ai-hq-local'});
 
-  function preflight(project, stage, workspace, route) {
+  function preflight(project, stage, workspace, route, handoverReceipt) {
     const latest = readCurrentProject(directory, project.id);
     if (!latest || held.has(latest.state)) throw problem(409, '案件の既存の停止条件が解除されていません。');
     if (workspace && (!latest.codexWrite || !latest.cwd.includes(workspace))) {
@@ -17,7 +17,11 @@ export function createExecutionAccess(directory, native) {
     }
     const work = store.getWork(project.id);
     if (work.busy) throw problem(409, '実行中または照合待ちのAPI作業があります。');
-    if (work.checkpointOperation?.route === 'api') throw problem(409, 'API作業のチェックポイントの照合が必要です。');
+    const predecessor = work.checkpointOperation;
+    if ((predecessor?.route === 'api' || handoverReceipt) &&
+        (!handoverReceipt || predecessor?.executionId !== handoverReceipt || predecessor.route !== 'api' || predecessor.status !== 'completed')) {
+      throw problem(409, 'API作業のチェックポイントの照合が必要です。');
+    }
     const snapshot = store.getSettings(project.id);
     const {settings} = snapshot;
     if (route && !settings.allowedRoutes.includes(route)) throw problem(409, 'この作業の指定経路は案件設定で許可されていません。');
@@ -49,8 +53,8 @@ export function createExecutionAccess(directory, native) {
         throw error;
       }
     },
-    async authorize(project, {stage, route, model, effort, catalog}) {
-      const {settings, revision} = preflight(project, stage, undefined, route);
+    async authorize(project, {stage, route, model, effort, catalog, handoverReceipt}) {
+      const {settings, revision} = preflight(project, stage, undefined, route, handoverReceipt);
       // Only the verified subscription provider is currently connected to this server.
       const observed = catalog ?? await native.models();
       const defaultModel = observed.data.find(item => item.isDefault);
@@ -69,6 +73,8 @@ export function createExecutionAccess(directory, native) {
       }
       return {model: chosen.model, effort: chosen.reasoningEffort ?? undefined, revision};
     },
-    isCurrent(project, revision, stage, workspace, route) { return preflight(project, stage, workspace, route).revision === revision; },
+    isCurrent(project, revision, stage, workspace, route, handoverReceipt) {
+      return preflight(project, stage, workspace, route, handoverReceipt).revision === revision;
+    },
   };
 }

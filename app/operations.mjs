@@ -8,12 +8,14 @@ const active = new Set(['reserved', 'sending', 'running', 'interrupting', 'uncon
 const terminal = new Set(['completed', 'interrupted', 'failed']);
 const observationWindowMs = 15000;
 const allowedId = /^[a-z0-9_-]{8,80}$/i;
+const receiptId = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
+const reviewHash = /^[a-f0-9]{64}$/;
 const steerClientId = id => `hq:steer:${id}`;
 const timestamp = () => new Date().toISOString();
 const problem = (status, message) => Object.assign(new Error(message), {status});
 const phase = value => terminal.has(value) ? value : value === 'inProgress' ? 'running' : null;
 
-export function createOperations(directory, native, execution) {
+export function createOperations(directory, native, execution, {prepareHandover} = {}) {
   const db = new DatabaseSync(join(directory, 'conversations.sqlite'));
   db.exec(`PRAGMA busy_timeout = 3000;
     CREATE TABLE IF NOT EXISTS codex_operations (
@@ -34,20 +36,30 @@ export function createOperations(directory, native, execution) {
     const columns = db.prepare('PRAGMA table_info(codex_operations)').all().map(column => column.name);
     if (!columns.includes('stage')) db.exec("ALTER TABLE codex_operations ADD COLUMN stage TEXT NOT NULL DEFAULT 'implementation'");
     if (!columns.includes('explicitRoute')) db.exec('ALTER TABLE codex_operations ADD COLUMN explicitRoute TEXT');
+    if (!columns.includes('handoverReceipt')) db.exec('ALTER TABLE codex_operations ADD COLUMN handoverReceipt TEXT');
+    if (!columns.includes('handoverReview')) db.exec('ALTER TABLE codex_operations ADD COLUMN handoverReview TEXT');
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS one_launched_handover ON codex_operations(project,handoverReceipt)
+      WHERE handoverReview IS NOT NULL AND threadId IS NOT NULL`);
     db.exec('COMMIT');
   } catch (error) { db.exec('ROLLBACK'); db.close(); throw error; }
   const byId = db.prepare('SELECT * FROM codex_operations WHERE project=? AND id=?');
   const latest = db.prepare('SELECT * FROM codex_operations WHERE project=? ORDER BY createdAt DESC LIMIT 1');
+  const latestHandover = db.prepare(`SELECT * FROM codex_operations WHERE project=? AND handoverReceipt=?
+    ORDER BY threadId IS NOT NULL DESC, createdAt DESC, rowid DESC LIMIT 1`);
   const latestScoped = db.prepare(`SELECT id, project, workspace, phase, threadId, turnId, createdAt, updatedAt, startedAt
     FROM codex_operations WHERE project=?
     AND workspace IN (SELECT value FROM json_each(?)) ORDER BY createdAt DESC, rowid DESC LIMIT 1`);
-  const activeRun = db.prepare(`SELECT 1 FROM codex_operations WHERE project=?
+  const activeRun = db.prepare(`SELECT 1 FROM codex_operations WHERE project=? AND id IS NOT ?
     AND phase IN ('reserved','sending','running','interrupting','unconfirmed') LIMIT 1`);
+  const knownNativeWork = db.prepare(`SELECT 1 FROM codex_operations WHERE project=? AND threadId IS NOT NULL AND turnId IS NOT NULL
+    AND workspace IN (SELECT value FROM json_each(?)) LIMIT 1`);
+  const launchedHandover = db.prepare(`SELECT 1 FROM codex_operations WHERE project=? AND handoverReceipt=?
+    AND handoverReview IS NOT NULL AND threadId IS NOT NULL LIMIT 1`);
   const byClientId = db.prepare(`SELECT * FROM codex_operations WHERE threadId=? AND id=? AND turnId IS NULL
     AND phase IN ('sending','unconfirmed') LIMIT 1`);
   const byTurn = db.prepare('SELECT * FROM codex_operations WHERE threadId=? AND turnId=? LIMIT 1');
-  const insert = db.prepare(`INSERT INTO codex_operations(project,id,workspace,fingerprint,phase,createdAt,updatedAt,stage,explicitRoute)
-    VALUES (?,?,?,?,'reserved',?,?,?,?)`);
+  const insert = db.prepare(`INSERT INTO codex_operations(project,id,workspace,fingerprint,phase,createdAt,updatedAt,stage,explicitRoute,handoverReceipt,handoverReview)
+    VALUES (?,?,?,?,'reserved',?,?,?,?,?,?)`);
   const setThread = db.prepare(`UPDATE codex_operations SET threadId=?,phase='sending',updatedAt=? WHERE project=? AND id=? AND phase='reserved'`);
   const expireReservation = db.prepare(`UPDATE codex_operations SET phase='failed',updatedAt=?
     WHERE project=? AND id=? AND phase='reserved' AND threadId IS NULL AND updatedAt<=?`);
@@ -73,8 +85,8 @@ export function createOperations(directory, native, execution) {
   }
   function response(row) {
     if (!row) return null;
-    const {fingerprint, workspace, ...view} = row;
-    return view;
+    const {fingerprint, workspace, handoverReview, handoverReceipt, ...view} = row;
+    return handoverReceipt ? {...view, handoverReceipt} : view;
   }
 
   function steeringResponse(row) {
@@ -126,6 +138,14 @@ export function createOperations(directory, native, execution) {
     }
   }
 
+  async function checkHandoverUsage() {
+    const usage = await native.usage?.();
+    if (usage?.ordinaryUsageAllowed !== true || !Array.isArray(usage.windows) || !usage.windows.length ||
+        usage.windows.some(window => !Number.isInteger(window.usedPercent) || window.usedPercent < 0 || window.usedPercent >= 100)) {
+      throw problem(409, '現在のCodex契約内の利用枠を確認できません。');
+    }
+  }
+
   async function runtimeResult(row) {
     if (!row || !active.has(row.phase)) return row;
     const age = Date.now() - Date.parse(row.updatedAt);
@@ -147,23 +167,24 @@ export function createOperations(directory, native, execution) {
   }
 
   return {
-    hasActiveWork(project) { return Boolean(activeRun.get(project.id)); },
+    hasActiveWork(project, exceptId = null) { return Boolean(activeRun.get(project.id, exceptId)); },
     hasNativeWork(project) {
-      const row = latestScoped.get(project.id, JSON.stringify(project.cwd));
-      return Boolean(row?.threadId && row?.turnId);
+      return Boolean(knownNativeWork.get(project.id, JSON.stringify(project.cwd)));
     },
     updateExecution(project, update) {
       db.exec('BEGIN IMMEDIATE');
       try {
-        if (activeRun.get(project.id)) throw problem(409, 'Codexの実行または照合が終わるまで操作を開始できません。');
+        if (activeRun.get(project.id, null)) throw problem(409, 'Codexの実行または照合が終わるまで操作を開始できません。');
         const result = update();
         db.exec('COMMIT');
         return result;
       } catch (error) { db.exec('ROLLBACK'); throw error; }
     },
-    async read(project, id) {
-      const row = id ? byId.get(project.id, id) : latest.get(project.id);
-      if (row && !project.cwd.includes(row.workspace)) return {operation: null};
+    async read(project, id, receipt = null) {
+      if (receipt !== null && !receiptId.test(receipt)) throw problem(400, '引継ぎ元の受付番号を指定してください。');
+      const row = id ? byId.get(project.id, id)
+        : receipt ? latestHandover.get(project.id, receipt) : latest.get(project.id);
+      if (row && (!project.cwd.includes(row.workspace) || (receipt && row.handoverReceipt !== receipt))) return {operation: null};
       return {operation: response(await runtimeResult(row))};
     },
     async readActivity(project) {
@@ -175,13 +196,17 @@ export function createOperations(directory, native, execution) {
         observedAt: row.updatedAt, createdAt: row.createdAt, startedAt: row.startedAt, terminal: isTerminal}};
     },
     async start(project, input) {
+      const handover = input?.handover;
+      const beginsHandover = handover !== undefined;
       if (!input || typeof input.id !== 'string' || !allowedId.test(input.id) ||
           typeof input.prompt !== 'string' || !input.prompt.trim() || input.prompt.length > 16000 ||
           (input.model !== undefined && typeof input.model !== 'string') ||
           (input.effort !== undefined && typeof input.effort !== 'string') ||
           (input.resume !== undefined && typeof input.resume !== 'string') ||
           (input.route !== undefined && !ROUTES.includes(input.route)) ||
-          (input.stage !== undefined && !STAGES.includes(input.stage))) {
+          (input.stage !== undefined && !STAGES.includes(input.stage)) ||
+          (beginsHandover && (!handover || typeof handover.receipt !== 'string' || !receiptId.test(handover.receipt) ||
+            typeof handover.review !== 'string' || !reviewHash.test(handover.review) || input.resume !== undefined || input.route !== 'subscription'))) {
         throw problem(400, '有効な指示を入力してください。');
       }
       const previous = input.resume ? byId.get(project.id, input.resume) : null;
@@ -190,7 +215,9 @@ export function createOperations(directory, native, execution) {
         throw problem(409, 'この作業を同じCodexスレッドで続けられません。');
       }
       const choice = input.stage || input.route ? [input.stage, input.route] : [];
-      const digest = createHash('sha256').update(JSON.stringify([input.prompt, input.model, input.effort, input.resume, ...choice])).digest('hex');
+      const identity = [input.prompt, input.model, input.effort, input.resume, ...choice];
+      if (beginsHandover) identity.push(handover.receipt, handover.review);
+      const digest = createHash('sha256').update(JSON.stringify(identity)).digest('hex');
       const duplicate = () => {
         const row = byId.get(project.id, input.id);
         if (row && (row.fingerprint !== digest || row.workspace !== expected)) throw problem(409, '送信IDが別の指示に使われています。');
@@ -200,12 +227,32 @@ export function createOperations(directory, native, execution) {
       if (row) return {operation: response(row)};
       const stage = input.stage ?? previous?.stage ?? 'implementation';
       const route = input.route ?? previous?.explicitRoute ?? null;
-      execution?.preflight(project, stage, expected, route);
-      if (!await native.subscriptionReady?.()) throw problem(403, 'ChatGPTプランの認証を確認できないため、実行していません。');
-      const selection = execution ? await execution.authorize(project, {stage, route, model: input.model, effort: input.effort})
-        : {model: input.model, effort: input.effort};
-      if (!execution) await configureModel(selection.model, selection.effort);
-      try { insert.run(project.id, input.id, expected, digest, timestamp(), timestamp(), stage, route); }
+      const handoverReceipt = handover?.receipt ?? previous?.handoverReceipt ?? null;
+      const alreadyLaunched = () => beginsHandover && Boolean(launchedHandover.get(project.id, handoverReceipt));
+      let selection;
+      let submittedPrompt = input.prompt;
+      try {
+        if (alreadyLaunched()) throw problem(409, 'この受付は引継ぎ済みです。元のCodexスレッドで続きを実行してください。');
+        if (beginsHandover && (!prepareHandover || !execution)) throw problem(409, '引継ぎの照合を利用できません。');
+        execution?.preflight(project, stage, expected, route, handoverReceipt);
+        if (!await native.subscriptionReady?.()) throw problem(403, 'ChatGPTプランの認証を確認できないため、実行していません。');
+        selection = execution ? await execution.authorize(project, {stage, route, model: input.model, effort: input.effort, handoverReceipt})
+          : {model: input.model, effort: input.effort};
+        if (handoverReceipt) await checkHandoverUsage();
+        if (!execution) await configureModel(selection.model, selection.effort);
+        if (beginsHandover) {
+          const checked = await prepareHandover(project, handover, expected);
+          if (checked.revision !== selection.revision) throw problem(409, '実行設定が変わりました。');
+          submittedPrompt = '次のJSONは同じ案件の確定済み作業記録です。要求正本と成果物を読み、現在の作業先と照合してください。相違があれば停止して報告してください。今回の依頼に沿って次の作業だけを進めてください。\n' +
+            JSON.stringify(checked.context, null, 2) + '\n\n今回の依頼\n' + input.prompt;
+          if (Buffer.byteLength(submittedPrompt, 'utf8') > 96000) throw problem(409, '引継ぎに必要な内容が送信上限を超えています。');
+        }
+      } catch (error) {
+        row = duplicate();
+        if (row) return {operation: response(row)};
+        throw error;
+      }
+      try { insert.run(project.id, input.id, expected, digest, timestamp(), timestamp(), stage, route, handoverReceipt, handover?.review ?? null); }
       catch (error) {
         row = duplicate();
         if (row) return {operation: response(row)};
@@ -213,16 +260,33 @@ export function createOperations(directory, native, execution) {
         throw error;
       }
       row = byId.get(project.id, input.id);
-      const maySubmit = () => !closed && (!execution || execution.isCurrent(project, selection.revision, stage, expected, route));
-      void native.submit({workspace: expected, prompt: input.prompt, knownId: previous?.threadId,
+      const maySubmit = () => !closed && byId.get(project.id, input.id)?.phase === 'reserved' && !alreadyLaunched() &&
+        (!execution || execution.isCurrent(project, selection.revision, stage, expected, route, handoverReceipt));
+      let readyForTurn = !handoverReceipt;
+      let stillCurrent;
+      const beforeTurn = handoverReceipt ? async () => {
+        if (beginsHandover) {
+          const checked = await prepareHandover(project, handover, expected, input.id);
+          if (checked.revision !== selection.revision) throw problem(409, '実行設定が変わりました。');
+          stillCurrent = checked.stillCurrent;
+        }
+        await checkHandoverUsage();
+        readyForTurn = true;
+      } : undefined;
+      void native.submit({workspace: expected, prompt: submittedPrompt, knownId: previous?.threadId,
         model: selection.model, effort: selection.effort, requestId: input.id,
-        beforeThread: maySubmit, onThread: id => maySubmit() && setThread.run(id, timestamp(), project.id, input.id).changes === 1,
+        beforeThread: maySubmit, ...(beforeTurn ? {beforeTurn} : {}),
+        onThread: id => readyForTurn && maySubmit() && (!beginsHandover || stillCurrent?.() === true) &&
+          setThread.run(id, timestamp(), project.id, input.id).changes === 1,
       }).then(result => {
         advance(row, phase(result.turn.status) ?? 'running', result.turn.id, timestamp());
       }).catch(() => {
         if (!closed) {
           const current = byId.get(project.id, input.id);
-          if (current?.phase === 'reserved') advance(current, 'failed');
+          if (current?.phase === 'reserved') {
+            if (handoverReceipt) append.run('送信直前の引継ぎ条件またはCodex接続を確認できませんでした。', timestamp(), project.id, input.id);
+            advance(current, 'failed');
+          }
           else markUnconfirmed.run(timestamp(), project.id, input.id);
         }
       });
@@ -279,10 +343,11 @@ export function createOperations(directory, native, execution) {
         if (current?.phase !== 'running' || current.workspace !== workspace || current.threadId !== target.threadId || current.turnId !== target.turnId) {
           throw problem(409, '元のCodexターンが中断されたか、実行状態が変わりました。');
         }
-        execution?.preflight(project, target.stage, workspace, target.explicitRoute);
+        execution?.preflight(project, target.stage, workspace, target.explicitRoute, target.handoverReceipt);
       };
       maySteer();
       if (!await native.subscriptionReady?.()) throw problem(403, 'ChatGPTプランの認証を確認できないため、実行していません。');
+      if (target.handoverReceipt) await checkHandoverUsage();
       const concurrent = previous();
       if (concurrent) return steeringResponse(concurrent);
       const run = byId.get(project.id, input.operationId);
@@ -294,10 +359,18 @@ export function createOperations(directory, native, execution) {
         return steeringResponse(previous());
       }
       let outcome = 'unconfirmed';
+      let usageChecked = !run.handoverReceipt;
+      const beforeSteer = run.handoverReceipt ? async () => {
+        try { await checkHandoverUsage(); usageChecked = true; }
+        catch (error) { outcome = 'rejected'; throw error; }
+      } : undefined;
       try {
         const sentTurn = await native.steer({workspace, threadId: run.threadId, turnId: run.turnId, requestId: steerClientId(input.id),
-          prompt: input.prompt, beforeSend: () => {
-            try { maySteer(); }
+          prompt: input.prompt, ...(beforeSteer ? {beforeSteer} : {}), beforeSend: () => {
+            try {
+              if (!usageChecked) throw problem(409, '現在のCodex契約内の利用枠を確認できません。');
+              maySteer();
+            }
             catch (error) { outcome = 'rejected'; throw error; }
           }});
         if (sentTurn === run.turnId) outcome = 'accepted';

@@ -4,7 +4,7 @@ import {open} from 'node:fs/promises';
 import {basename, join, resolve, sep} from 'node:path';
 import {readApiAuthority} from './api-authority.mjs';
 import {apiJobRounds, createApiResponseClient, maximumApiJobUsd} from './api-response.mjs';
-import {prepareApiWorkspace, readCommittedEvidence} from './api-workspace.mjs';
+import {checkedEvidenceIsCurrent, prepareApiWorkspace, readCommittedEvidence} from './api-workspace.mjs';
 import {STAGES, moneyMicros} from './execution-policy.mjs';
 import {readCurrentProject} from './portfolio.mjs';
 import {ensurePrivateDirectory} from './private-directory.mjs';
@@ -253,21 +253,21 @@ export function createApiDevelopment({directory, store, conversations, withProje
     catch { throw problem(409, failure); }
   }
 
-  function handoverState(project) {
+  function handoverState(project, exceptOperation) {
     const owned = ownedProject(project.id);
     const work = store.getWork(project.id);
     const {settings, revision} = store.getSettings(project.id);
-    if (work.busy || hasActiveWork(project) || conversations.hasActiveLive(project.id)) throw problem(409, 'PROJECT_BUSY');
+    if (work.busy || hasActiveWork(project, exceptOperation) || conversations.hasActiveLive(project.id)) throw problem(409, 'PROJECT_BUSY');
     if (!settings.allowedRoutes.includes('subscription')) throw problem(409, 'ROUTE_NOT_ALLOWED');
     const stamp = digest({checkout: owned.checkout, goal: owned.current.goal, requirement: owned.current.handoverRequirements,
-      status: owned.current.state, revision, checkpoint: work.checkpoint, settledApiMicros: work.settledApiMicros,
+      status: owned.current.state, revision, settings, checkpoint: work.checkpoint, settledApiMicros: work.settledApiMicros,
       artifactReceipts: work.verifiedApiOperations.map(operation => operation.artifactsHash)});
-    return {owned, work, revision, stamp};
+    return {owned, work, revision, stamp, settings};
   }
 
-  async function previewHandover(project, receipt) {
+  async function inspectHandover(project, receipt, exceptOperation) {
     if (!receiptKey.test(receipt ?? '')) throw problem(404, 'API_TASK_NOT_FOUND');
-    const {owned, work, revision, stamp} = handoverState(project);
+    const {owned, work, revision, stamp, settings} = handoverState(project, exceptOperation);
     const predecessor = work.checkpointOperation;
     if (predecessor?.executionId !== receipt || predecessor.route !== 'api' || !work.checkpoint ||
         work.checkpoint.artifactsHash !== predecessor.artifactsHash) throw problem(409, 'HANDOVER_RECEIPT_STALE');
@@ -303,13 +303,26 @@ export function createApiDevelopment({directory, store, conversations, withProje
     if (finalRequirements.head !== current.head || finalRequirements.files[0].sha256 !== report.requirements.sha256) {
       throw problem(409, 'HANDOVER_REQUIREMENTS_CHANGED');
     }
-    if (handoverState(project).stamp !== stamp) throw problem(409, 'API_CANDIDATE_HANDOVER_REQUIRED');
-    return {verified: true, kind: 'rehearsal', source: 'api', destination: 'subscription', receipt, archiveId, revision,
+    if (handoverState(project, exceptOperation).stamp !== stamp) throw problem(409, 'API_CANDIDATE_HANDOVER_REQUIRED');
+    const review = digest({project: project.id, receipt, stamp, checkoutHead: current.head, requirements: finalRequirements.files[0], artifacts});
+    const proof = {verified: true, kind: 'rehearsal', source: 'api', destination: 'subscription', receipt, review, archiveId, revision,
       checkoutHead: current.head, requirements: finalRequirements.files[0], artifacts, settledApiMicros: work.settledApiMicros};
+    return {proof, checkout: owned.checkout, stamp, context: {project: project.id, goal: owned.current.goal, apiReceipt: receipt, archiveId,
+      originalInstruction: prompt.text, resultSummary: summary?.text ?? '', checkoutHead: proof.checkoutHead,
+      requirements: proof.requirements, artifacts, settingsRevision: revision, apiBudgetUsd: settings.apiBudgetUsd ?? null,
+      settledApiMicros: work.settledApiMicros}};
   }
 
   return {
-    previewHandover,
+    async previewHandover(project, receipt) { return (await inspectHandover(project, receipt)).proof; },
+    async prepareNativeHandover(project, {receipt, review}, workspace, exceptOperation) {
+      const state = await inspectHandover(project, receipt, exceptOperation);
+      if (state.checkout !== workspace || state.proof.review !== review) throw problem(409, 'HANDOVER_RECEIPT_STALE');
+      return {context: state.context, revision: state.proof.revision, stillCurrent: () =>
+        handoverState(project, exceptOperation).stamp === state.stamp && checkedEvidenceIsCurrent({
+          checkout: state.checkout, head: state.proof.checkoutHead, files: [state.proof.requirements, ...state.proof.artifacts],
+        })};
+    },
     activity(project) { return latestApiActivity(store, project.id, id => jobs.get(id)); },
     listArtifacts(projectIds, offset) {
       const operations = store.listVerifiedApiWork(projectIds);

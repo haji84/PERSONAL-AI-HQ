@@ -189,7 +189,7 @@ export function createCodexClient({command = binary(), socket} = {}) {
     canWrite: Boolean(socket),
     onEvent(listener) { listeners.add(listener); return () => listeners.delete(listener); },
     async subscriptionReady() { return Boolean(socket) && await subscriptionReady(await current()); },
-    async submit({workspace, prompt, knownId, model, effort, requestId, beforeThread, onThread}) {
+    async submit({workspace, prompt, knownId, model, effort, requestId, beforeThread, beforeTurn, onThread}) {
       if (!socket) throw unavailable('独立して稼働するCodex接続が必要です。');
       const rpc = await current();
       if (!await subscriptionReady(rpc)) throw unavailable('ChatGPTプランの認証を確認できません。');
@@ -207,6 +207,7 @@ export function createCodexClient({command = binary(), socket} = {}) {
           (knownId && thread.id !== knownId)) {
         throw unavailable('分離作業先をCodexで確認できませんでした。');
       }
+      if (beforeTurn) await beforeTurn();
       const answer = await rpc.call('turn/start', {threadId: thread.id, clientUserMessageId: requestId,
         input: [{type: 'text', text: prompt, text_elements: []}], cwd: workspace, approvalPolicy: 'never',
         sandboxPolicy: {type: 'workspaceWrite', writableRoots: [workspace], networkAccess: false,
@@ -220,11 +221,12 @@ export function createCodexClient({command = binary(), socket} = {}) {
       const {rpc} = await scopedThread([workspace], id);
       await rpc.call('turn/interrupt', {threadId: id, turnId});
     },
-    async steer({workspace, threadId: id, turnId, requestId, prompt, beforeSend}) {
+    async steer({workspace, threadId: id, turnId, requestId, prompt, beforeSteer, beforeSend}) {
       const {rpc, thread} = await scopedThread([workspace], id);
       if (thread.modelProvider !== 'openai' || !await subscriptionReady(rpc)) {
         throw unavailable('ChatGPTプランの実行中ターンを確認できません。');
       }
+      if (beforeSteer) await beforeSteer();
       const result = await rpc.call('turn/steer', {threadId: id, expectedTurnId: turnId, clientUserMessageId: requestId,
         input: [{type: 'text', text: prompt, text_elements: []}]}, beforeSend);
       return result?.turnId;
