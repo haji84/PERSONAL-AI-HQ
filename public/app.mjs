@@ -2891,7 +2891,7 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
     if (!window.confirm('このCodex作業を中止して、受付を終了しますか？作業履歴と作成済みのファイルは保持します。')) return;
     await mutate('/api/codex/cancel', {id});
   });
-  const steer = button('実行中のターンに追加指示', () => sendSteering(), true);
+  const steer = button('実行中に追加指示・優先順位変更', () => sendSteering(), true);
   const checkSteer = button('追加指示の状態を照合', () => requestSteering(false), true);
   const closeSteer = button('この確認を閉じる', () => {
     if (!steeringIntent()) return;
