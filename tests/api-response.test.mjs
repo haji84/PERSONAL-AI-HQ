@@ -7,6 +7,7 @@ const model = {id: 'fixture-model-2026-11-27', contextTokens: 20000, outputToken
 const context = {baseSha: 'fixture-revision', files: [{path: 'src/demo.mjs', text: 'export const n = 1;', writable: true}]};
 const fixture = json => new Response(JSON.stringify(json), {headers: {'content-type': 'application/json'}});
 const proposal = {summary: '定数を修正', changes: [{path: 'src/demo.mjs', text: 'export const n = 2;'}]};
+const receipt = {id: 'resp_fixture', inputTokens: 100, outputTokens: 25};
 const completed = (content, overrides = {}) => ({id: 'resp_fixture', model: model.id, service_tier: 'default', status: 'completed',
   usage: {input_tokens: 100, output_tokens: 25}, output: [{type: 'message', role: 'assistant', content}], ...overrides});
 const testClient = fetchImpl => createApiResponseClient({key: 'fixture-only', organization: 'org-fixture', project: 'proj_fixture', fetchImpl});
@@ -36,6 +37,7 @@ test('ordinary Responses requests have an exact receiver, bounded output and no 
   const result = await client.propose({model, effort: 'low', prompt: '小さい変更', context, beforeSend() { checked = true; }});
   assert.equal(calls, 1);
   assert.deepEqual(result.proposal, proposal);
+  assert.deepEqual(result.receipt, receipt);
   assert.equal(result.accountedUsd, 0.0004);
   assert.equal(maximumApiJobUsd(model), 0.112);
 });
@@ -54,6 +56,7 @@ test('malformed or refused model output preserves conservative usage without off
     assert.equal(result.proposal, null);
     assert.equal(result.accountedUsd, 0.0004);
     assert.equal(result.code, 'API_OUTPUT_UNUSABLE');
+    assert.deepEqual(result.receipt, receipt);
   }
 });
 
@@ -62,7 +65,8 @@ test('uncertain transport or unexpected billed model leaves settlement unknown a
   for (const send of [() => { throw Error('fixture transport loss'); }, () => fixture(completed([], {model: 'unapproved'})),
     () => new Response('quota', {status: 429})]) {
     const client = testClient(async () => { calls++; return send(); });
-    await assert.rejects(client.propose({model, prompt: '変更', context}), {code: 'API_SETTLEMENT_UNKNOWN'});
+    await assert.rejects(client.propose({model, prompt: '変更', context}), error =>
+      error.code === 'API_SETTLEMENT_UNKNOWN' && !Object.hasOwn(error, 'receipt'));
   }
   assert.equal(calls, 3);
 });
@@ -95,7 +99,7 @@ test('advice uses a single private Responses request with a text-only schema', a
   assert.equal(typeof client.advise, 'function');
   assert.equal(apiAdviceMaxLength, 12000);
   assert.deepEqual(await client.advise({model, effort: 'low', prompt, context, signal, beforeSend() { checked = true; }}),
-    {answer, accountedUsd: 0.0004, code: null});
+    {answer, accountedUsd: 0.0004, code: null, receipt});
   assert.equal(calls, 1);
 });
 
@@ -103,10 +107,10 @@ test('advice rejects replacements and malformed or over-limit answers while acco
   const advise = content => testClient(async () => fixture(completed(content))).advise({model, prompt: '相談', context});
   for (const value of [proposal, {answer: '相談結果', changes: []}, {answer: ' \n'}, {answer: 'a'.repeat(12001)}, ['相談結果']]) {
     assert.deepEqual(await advise([{type: 'output_text', text: JSON.stringify(value)}]),
-      {answer: null, accountedUsd: 0.0004, code: 'API_OUTPUT_UNUSABLE'});
+      {answer: null, accountedUsd: 0.0004, code: 'API_OUTPUT_UNUSABLE', receipt});
   }
   assert.deepEqual(await advise([{type: 'refusal', refusal: 'fixture'}]),
-    {answer: null, accountedUsd: 0.0004, code: 'API_OUTPUT_UNUSABLE'});
+    {answer: null, accountedUsd: 0.0004, code: 'API_OUTPUT_UNUSABLE', receipt});
   assert.equal((await advise([{type: 'output_text', text: JSON.stringify({answer: 'a'.repeat(12000)})}])).answer.length, 12000);
 });
 
@@ -120,7 +124,23 @@ test('advice preserves dispatch denial, billing mismatch and token guards', asyn
   const advise = overrides => testClient(async () => fixture(completed(content, overrides))).advise({model, prompt: '相談', context});
   await assert.rejects(advise({service_tier: 'priority'}), {code: 'API_SETTLEMENT_UNKNOWN'});
   assert.deepEqual(await advise({usage: {input_tokens: 100, output_tokens: 2001}}),
-    {answer: null, accountedUsd: 0.016208, code: 'API_OUTPUT_UNUSABLE'});
+    {answer: null, accountedUsd: 0.016208, code: 'API_OUTPUT_UNUSABLE', receipt: {...receipt, outputTokens: 2001}});
+});
+
+test('known terminal receipts retain exact actual counts and only a recognized response ID', async () => {
+  const resultFor = (id, status) => testClient(async () => fixture(completed([], {id, status, output: [],
+    usage: {input_tokens: 8, output_tokens: 0, total_tokens: 99, input_tokens_details: {cached_tokens: 6}},
+    metadata: {undeclared: 'private-response-metadata'},
+  }))).advise({model, prompt: '相談', context});
+  const exact = 'resp_A0z' + 'B'.repeat(120);
+  for (const status of ['failed', 'incomplete']) {
+    assert.deepEqual(await resultFor(exact, status), {answer: null, accountedUsd: 0.000016,
+      code: 'API_OUTPUT_UNUSABLE', receipt: {id: exact, inputTokens: 8, outputTokens: 0}});
+  }
+  for (const id of [undefined, null, 123, {}, 'message_1', 'resp_', 'Resp_fixture', 'resp_A/B', 'resp_a b',
+    'resp_fixture\n', ' resp_fixture', 'resp_あ', exact + 'Z']) {
+    assert.deepEqual((await resultFor(id, 'failed')).receipt, {id: null, inputTokens: 8, outputTokens: 0});
+  }
 });
 
 test('unexpected action output leaves the price and advice unconfirmed', async () => {
@@ -132,7 +152,7 @@ test('unexpected action output leaves the price and advice unconfirmed', async (
     return fixture(completed([], {output}));
   }).advise({model, prompt: '相談', context});
   await assert.rejects(advise([{type: 'web_search_call', status: 'completed'}, message]), {code: 'API_SETTLEMENT_UNKNOWN'});
-  assert.deepEqual(await advise([{type: 'reasoning', summary: []}, message]), {answer, accountedUsd: 0.0004, code: null});
+  assert.deepEqual(await advise([{type: 'reasoning', summary: []}, message]), {answer, accountedUsd: 0.0004, code: null, receipt});
   assert.equal(calls, 2);
 });
 

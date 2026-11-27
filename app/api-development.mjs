@@ -141,6 +141,7 @@ export function createApiDevelopment({directory, store, conversations, withProje
     return {operation: {id: work.taskId, project, route: 'api', stage: work.task?.stage, model: work.model, phase,
       createdAt: work.createdAt, startedAt: work.dispatchedAt ?? null, updatedAt: observedAt(work),
       ...(work.nativeOrigin ? {nativeOrigin: work.nativeOrigin} : {}),
+      ...(work.providerReceipts?.length ? {providerReceipts: work.providerReceipts} : {}),
       result: output?.reason ?? work.reason ?? (phase === 'unconfirmed' ? 'API_SETTLEMENT_UNKNOWN' : null),
       ...(work.status === 'completed' && output?.kind === 'advice' ? {advice: output.summary} : {}),
       verification: output?.verification ?? null, artifactCount: changes.length,
@@ -235,7 +236,9 @@ export function createApiDevelopment({directory, store, conversations, withProje
             dispatched = true;
             awaitingReceipt = true;
           }});
-        spentMicros += moneyMicros(answer.accountedUsd, 'ceil');
+        const accountedMicros = moneyMicros(answer.accountedUsd, 'ceil');
+        store.recordApiReceipt({projectId, taskId, executionId, round, receipt: answer.receipt, accountedMicros});
+        spentMicros += accountedMicros;
         awaitingReceipt = false;
         signal.throwIfAborted();
         if (!(advice ? answer.answer : answer.proposal) || spentMicros > operation.reservedMicros) {
@@ -462,19 +465,22 @@ export function createApiDevelopment({directory, store, conversations, withProje
     },
     conversationView(project, result, offset) {
       const {conversation} = result;
-      if (conversation.source !== 'api-development' || terminalPhases.has(conversation.outcome)) return result;
+      if (conversation.source !== 'api-development') return result;
       const observed = outcome => ({...result, conversation: {...conversation, outcome}});
       try {
         const work = store.findExecution(project.id, conversation.id.slice('api/'.length));
-        if (work?.route !== 'api') return observed('unconfirmed');
+        if (work?.route !== 'api') return terminalPhases.has(conversation.outcome) ? result : observed('unconfirmed');
+        const withReceipts = view => work.providerReceipts?.length && view ?
+          {...view, conversation: {...view.conversation, providerReceipts: work.providerReceipts}} : view;
+        if (terminalPhases.has(conversation.outcome)) return withReceipts(result);
         const saved = publicPhase[work.status];
         if (terminalPhases.has(saved) || (saved === 'unconfirmed' && conversation.outcome !== 'unconfirmed')) {
           archiveOutcome(project.id, work);
-          return conversations.read(project.id, conversation.id, offset);
+          return withReceipts(conversations.read(project.id, conversation.id, offset));
         }
         const phase = currentPhase(work, jobs.get(work.executionId));
-        return observed(phase === 'running' ? 'in_progress' : phase);
-      } catch { return observed('unconfirmed'); }
+        return withReceipts(observed(phase === 'running' ? 'in_progress' : phase));
+      } catch { return terminalPhases.has(conversation.outcome) ? result : observed('unconfirmed'); }
     },
     capabilities(project) {
       try {

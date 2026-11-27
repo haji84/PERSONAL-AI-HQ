@@ -25,6 +25,11 @@ const validNativeOrigin = origin => origin !== null && typeof origin === 'object
   typeof origin.threadId === 'string' && /^[A-Za-z0-9_-]{8,80}$/.test(origin.threadId) &&
   typeof origin.operationId === 'string' && /^[A-Za-z0-9_-]{8,80}$/.test(origin.operationId) &&
   typeof origin.review === 'string' && hashPattern.test(origin.review);
+const validProviderReceipt = receipt => receipt !== null && typeof receipt === 'object' && Object.keys(receipt).length === 5 &&
+  (receipt.id === null || (typeof receipt.id === 'string' && receipt.id.startsWith('resp_') &&
+    receipt.id.length >= 6 && receipt.id.length <= 128 && !/[^A-Za-z0-9]/.test(receipt.id.slice(5)))) &&
+  [receipt.inputTokens, receipt.outputTokens, receipt.accountedMicros].every(count => Number.isSafeInteger(count) && count >= 0) &&
+  typeof receipt.observedAt === 'string' && Number.isFinite(Date.parse(receipt.observedAt));
 const settingFields = Object.keys(normalizeSettings());
 const emptyProject = () => ({ revision: 0, settings: normalizeSettings(), history: [], operations: {}, spentMicros: 0, lastRoute: null, lastExecution: null, checkpoint: null });
 
@@ -93,6 +98,8 @@ export class ExecutionStore {
       if (!operation || !['api', 'subscription'].includes(operation.route) || (!active.has(operation.status) && !terminals.has(operation.status)) || !Number.isSafeInteger(operation.reservedMicros) || operation.reservedMicros < 0 || !Number.isSafeInteger(operation.costMicros) || operation.costMicros < 0) error('STATE_INVALID');
       if (typeof operation.model !== 'string' || !operation.model || typeof operation.executorId !== 'string' || !operation.executorId || typeof operation.executionId !== 'string' || !hashPattern.test(operation.fingerprint ?? '') || !hashPattern.test(operation.instructionDigest ?? '') || !Number.isSafeInteger(operation.settingsRevision) || operation.settingsRevision < 0) error('STATE_INVALID');
       if (operation.nativeOrigin !== undefined && (operation.route !== 'api' || !validNativeOrigin(operation.nativeOrigin))) error('STATE_INVALID');
+      if (operation.providerReceipts !== undefined && (operation.route !== 'api' || !Array.isArray(operation.providerReceipts) ||
+          operation.providerReceipts.length > 2 || !operation.providerReceipts.every(validProviderReceipt))) error('STATE_INVALID');
       if (operation.route === 'api') { try { id(operation.organizationId); } catch { error('STATE_INVALID'); } }
     }
     return project;
@@ -259,6 +266,22 @@ export class ExecutionStore {
       operation.status = 'running';
       operation.dispatchedAt = new Date(context.now ?? Date.now()).toISOString();
       return { allowed: true, dispatchable: true, operation };
+    });
+  }
+
+  recordApiReceipt({projectId, taskId, executionId, round, receipt, accountedMicros}) {
+    const value = {id: receipt?.id, inputTokens: receipt?.inputTokens, outputTokens: receipt?.outputTokens,
+      accountedMicros, observedAt: new Date().toISOString()};
+    if (!validProviderReceipt(value) || !Number.isInteger(round) || round < 0 || round > 1) error('INVALID_API_RECEIPT');
+    this.#change(data => {
+      const project = this.#project(data, projectId);
+      const operation = project.operations[id(taskId)];
+      if (!operation || operation.executionId !== executionId || operation.route !== 'api') error('EXECUTION_ID_MISMATCH');
+      if (operation.status !== 'running') error('EXECUTION_HELD');
+      operation.providerReceipts ??= [];
+      if (operation.providerReceipts.length !== round ||
+          (value.id !== null && operation.providerReceipts.some(prior => prior.id === value.id))) error('API_RECEIPT_CONFLICT');
+      operation.providerReceipts.push(value);
     });
   }
 

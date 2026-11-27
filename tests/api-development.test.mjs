@@ -113,7 +113,7 @@ test('owner API-only work repairs actual source in an isolated Mac and returns a
     assert.equal(input.candidate.files[0].path, 'source.mjs');
     if (requests === 2) assert.match(input.previousVerification, /1 failed/);
     const answer = requests === 1 ? 3 : 2;
-    return Response.json({model: modelId, service_tier: 'default', status: 'completed', usage: {input_tokens: 100, output_tokens: 25},
+    return Response.json({id: 'resp_test' + requests, model: modelId, service_tier: 'default', status: 'completed', usage: {input_tokens: 100, output_tokens: 25},
       output: [{type: 'message', role: 'assistant', content: [{type: 'output_text', text: JSON.stringify({
         summary: '定数を修正', changes: [{path: 'source.mjs', text: `export const answer = ${answer};\n`}],
       })}]}]});
@@ -132,6 +132,8 @@ test('owner API-only work repairs actual source in an isolated Mac and returns a
   assert.equal(operation.route, 'api');
   assert.equal(operation.verification.passed, true);
   assert.equal(operation.artifactCount, 1);
+  assert.deepEqual(operation.providerReceipts.map(({id, inputTokens, outputTokens, accountedMicros}) =>
+    [id, inputTokens, outputTokens, accountedMicros]), [['resp_test1', 100, 25, 400], ['resp_test2', 100, 25, 400]]);
   const query = {id: instruction.id, index: '0'};
   assert.equal((await call('/api/execution/api/artifact', {query, project: 'other-fixture'})).status, 404);
   assert.equal(await (await call('/api/execution/api/artifact', {query})).text(), 'export const answer = 2;\n');
@@ -144,6 +146,7 @@ test('owner API-only work repairs actual source in an isolated Mac and returns a
   const {conversation} = await (await call('/api/chat', {query: {id: timelineId}})).json();
   assert.equal(conversation.outcome, 'completed');
   assert.equal(conversation.model, modelId);
+  assert.deepEqual(conversation.providerReceipts, operation.providerReceipts);
   assert.deepEqual(conversation.messages.map(({role, text}) => [role, text]), [
     ['user', instruction.prompt], ['assistant', '定数を修正'],
   ]);
@@ -650,6 +653,33 @@ test('revocation during the provider response records known usage and withholds 
   assert.equal(store.getWork(id).busy, false);
   assert.equal((await call('/api/execution/api/artifact', {query: {id: instruction.id, index: '0'}})).status, 404);
   assert.equal(requests, 1);
+});
+
+test('the first received API receipt survives loss of the second response and a gateway restart', {skip: process.platform !== 'darwin'}, async t => {
+  let requests = 0;
+  const {call, open, store} = await fixture(t, async () => {
+    if (++requests === 2) throw new Error('connection lost after dispatch');
+    const response = await providerAnswer(3).json();
+    return Response.json({...response, id: 'resp_receiptfirst'});
+  });
+  assert.equal((await call('/api/execution/settings', {data: {revision: 0, settings: {mode: 'api-only', apiBudgetUsd: 1}}})).status, 200);
+  assert.equal((await call('/api/execution/api', {data: instruction})).status, 202);
+  const operation = await waitFor(call, 'unconfirmed');
+  assert.equal(requests, 2);
+  assert.equal(operation.providerReceipts.length, 1);
+  const receipt = operation.providerReceipts[0];
+  assert.deepEqual([receipt.id, receipt.inputTokens, receipt.outputTokens, receipt.accountedMicros], ['resp_receiptfirst', 100, 25, 400]);
+  assert.ok(Number.isFinite(Date.parse(receipt.observedAt)));
+  const work = store.getWork(id, instruction.id).operation;
+  assert.equal(work.status, 'uncertain');
+  assert.equal(work.costMicros, 0);
+  assert.ok(work.reservedMicros > receipt.accountedMicros);
+  assert.ok(store.getWork(id).busy);
+  await open(false);
+  const {conversation} = await (await call('/api/chat', {query: {id: 'api/' + work.executionId}})).json();
+  assert.equal(conversation.outcome, 'unconfirmed');
+  assert.deepEqual(conversation.providerReceipts, [receipt]);
+  assert.equal(requests, 2);
 });
 
 test('lost API settlement holds the project across repeated requests', {skip: process.platform !== 'darwin'}, async t => {

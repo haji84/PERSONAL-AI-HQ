@@ -808,6 +808,27 @@ function messageBubble(item) {
   }
   return box;
 }
+function apiReceiptSummary(receipts) {
+  if (!receipts.length) return '';
+  const input = receipts.reduce((total, item) => total + BigInt(item.inputTokens), 0n);
+  const output = receipts.reduce((total, item) => total + BigInt(item.outputTokens), 0n);
+  return `API応答 ${receipts.length}件 · 入力 ${input.toLocaleString('ja-JP')} · 出力 ${output.toLocaleString('ja-JP')} トークン`;
+}
+function showApiReceipts(destination, receipts) {
+  if (!receipts.length) return;
+  const details = node('details', 'scope-info');
+  const responses = node('ul', 'marked-list');
+  for (const item of receipts) {
+    const identifier = node('code', '', text(item.id, '応答ID未取得'));
+    const row = node('li');
+    const details = [time(item.observedAt)];
+    if (receipts.length > 1) details.push(`入力 ${item.inputTokens.toLocaleString('ja-JP')} · 出力 ${item.outputTokens.toLocaleString('ja-JP')}`);
+    row.append(identifier, node('span', 'small muted', ' · ' + details.join(' · ')));
+    responses.append(row);
+  }
+  details.append(node('summary', '', apiReceiptSummary(receipts)), responses);
+  destination.append(details);
+}
 function messagesInto(parent, items, onTop) {
   const payload = asArray(items).filter(item => ['user', 'assistant', 'agent'].includes(item?.role));
   const nodes = payload.map(messageBubble);
@@ -1182,6 +1203,7 @@ function chat() {
       if (apiArchive) {
         const status = conversation.outcome === 'in_progress' ? '実行中' : activityLabels[conversation.outcome] ?? '状態未確認';
         destination.append(node('p', 'small muted', [status, text(conversation.model, '')].filter(Boolean).join(' · ')));
+        showApiReceipts(destination, asArray(conversation.providerReceipts));
       }
       const messages = node('div', 'messages messages-embedded');
       destination.append(messages);
@@ -1539,6 +1561,7 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
       '受付 ' + time(run.operation.createdAt),
       run.operation.startedAt ? '開始 ' + time(run.operation.startedAt) : '',
       run.operation.updatedAt ? '更新 ' + time(run.operation.updatedAt) : '',
+      apiMode ? apiReceiptSummary(asArray(relevantOperation.providerReceipts)) : '',
     ].filter(Boolean) : [];
     details.textContent = timestamps.join(' · ');
     details.hidden = !timestamps.length;
