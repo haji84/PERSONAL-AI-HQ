@@ -6,6 +6,7 @@ import { moneyMicros, normalizeSettings, resolveExecution, verifyHandover } from
 
 const active = new Set(['reserved', 'running', 'uncertain', 'awaiting_settlement']);
 const terminals = new Set(['completed', 'failed', 'interrupted', 'cancelled']);
+const hasApiArtifact = item => item.route === 'api' && item.status === 'completed' && item.artifactsHash;
 const hashPattern = /^[a-f0-9]{64}$/;
 const error = code => { throw new Error(code); };
 const clone = value => structuredClone(value);
@@ -126,7 +127,7 @@ export class ExecutionStore {
       : Object.hasOwn(project.operations, id(taskId)) ? project.operations[taskId] : null;
     const checkpointOperation = project.checkpoint
       ? operations.find(item => item.checkpointVersion === project.checkpoint.version) ?? null : null;
-    const verifiedApiOperations = taskId === undefined ? operations.filter(item => item.route === 'api' && item.status === 'completed' && item.artifactsHash)
+    const verifiedApiOperations = taskId === undefined ? operations.filter(hasApiArtifact)
       .sort((a, b) => a.checkpointVersion - b.checkpointVersion) : [];
     return clone({operation, checkpoint: project.checkpoint, checkpointOperation, verifiedApiOperations,
       busy: operations.some(item => active.has(item.status))});
@@ -136,6 +137,14 @@ export class ExecutionStore {
     id(executionId);
     const project = this.#project(this.#read(), projectId);
     return clone(Object.values(project.operations).find(item => item.executionId === executionId) ?? null);
+  }
+
+  listVerifiedApiWork(projectIds) {
+    const state = this.#read();
+    return projectIds.flatMap(project => Object.values(this.#project(state, project).operations).filter(hasApiArtifact)
+      .map(operation => ({project, operation})))
+      .sort((a, b) => b.operation.completedAt.localeCompare(a.operation.completedAt) ||
+        a.operation.executionId.localeCompare(b.operation.executionId));
   }
 
   updateSettings(projectId, expectedRevision, input) {

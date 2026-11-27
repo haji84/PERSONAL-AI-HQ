@@ -146,6 +146,15 @@ test('owner API-only work repairs actual source in an isolated Mac and returns a
   assert.equal(activity.model, modelId);
   await open(false);
   assert.equal((await call('/api/execution/api', {data: instruction})).status, 409);
+  assert.equal((await call('/api/artifacts/work', {auth: false})).status, 401);
+  assert.deepEqual((await (await call('/api/artifacts/work', {project: 'other-fixture'})).json()).artifacts, []);
+  const published = (await (await call('/api/artifacts/work')).json()).artifacts;
+  assert.equal(published.length, 1);
+  assert.equal(published[0].title, 'source.mjs');
+  assert.equal(published[0].sha256, operation.changes[0].sha256);
+  const fileQuery = Object.fromEntries(new URLSearchParams(published[0].href.split('?')[1]));
+  assert.equal((await call('/api/artifacts/work/file', {query: {...fileQuery, project: 'other-fixture'}})).status, 404);
+  assert.equal(await (await call('/api/artifacts/work/file', {query: fileQuery})).text(), 'export const answer = 2;\n');
   const restarted = await (await call('/api/chat', {query: {id: timelineId}})).json();
   assert.deepEqual(restarted.conversation, conversation);
   assert.deepEqual((await (await call('/api/execution/activity')).json()).activity, activity);

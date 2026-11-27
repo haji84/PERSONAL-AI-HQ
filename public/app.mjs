@@ -1680,7 +1680,10 @@ function codex() {
   showThread();
 }
 function artifacts() {
-  const all = asArray(ui.portfolio?.artifacts);
+  const registered = asArray(ui.portfolio?.artifacts);
+  const workArtifacts = new Map();
+  let generation = 0;
+  let page = 0;
   const section = panel('確認済みの成果物');
   const scope = node('label', 'picker artifact-filter');
   const only = node('select');
@@ -1696,11 +1699,14 @@ function artifacts() {
   section.header.append(scope);
   const list = node('ul', 'rows');
   const empty = node('p', 'empty');
+  const workStatus = node('p', 'muted small');
+  workStatus.hidden = true;
   const searchWrap = node('div', 'search-wrap');
   function filter(query) {
-    const visible = all.filter(item => (only.value !== 'project' || item.project === ui.project) &&
+    const visible = [...registered, ...workArtifacts.values()].filter(item => (only.value !== 'project' || item.project === ui.project) &&
       matches(query, item.title, item.description, item.observedAt, time(item.observedAt),
-        projectList().find(candidate => candidate.id === item.project)?.name));
+        projectList().find(candidate => candidate.id === item.project)?.name))
+      .sort((a, b) => (Date.parse(b.observedAt) || 0) - (Date.parse(a.observedAt) || 0));
     list.replaceChildren();
     for (const artifact of visible) {
       const item = node('div', 'artifact-row');
@@ -1718,17 +1724,44 @@ function artifacts() {
     empty.hidden = visible.length > 0;
     empty.textContent = query ? '一致する成果物がありません。' : '表示できる確認済みの成果物はありません。';
   }
+  const more = button('以前の検証済み成果物を表示', () => loadWork());
+  more.hidden = true;
+  async function loadWork() {
+    const generationAtStart = generation;
+    const current = () => section.root.isConnected && generationAtStart === generation;
+    const offset = page;
+    more.disabled = true;
+    try {
+      const result = await api(apiPath('/api/artifacts/work', {project: only.value === 'project' ? ui.project : undefined, offset}));
+      if (!current()) return;
+      for (const file of asArray(result.artifacts)) workArtifacts.set(file.href, file);
+      page = Number.isSafeInteger(result.nextOffset) && result.nextOffset > offset ? result.nextOffset : null;
+      more.hidden = page === null;
+      workStatus.hidden = true;
+      filter(search.value);
+    } catch {
+      if (!current()) return;
+      workStatus.textContent = '通常APIの成果物を読み取れませんでした。';
+      workStatus.hidden = false;
+    } finally { if (current()) more.disabled = false; }
+  }
   const search = queryInput('artifact-search', '成果物を検索', '成果物を検索', filter);
   only.addEventListener('change', () => {
     ui.searches.set('artifact-filter', only.value);
     storeTab();
+    generation++;
+    page = 0;
+    more.hidden = true;
+    workArtifacts.clear();
     filter(search.value);
+    void loadWork();
   });
   searchWrap.append(search);
   section.body.remove();
-  section.root.append(searchWrap, empty, list);
+  section.root.append(searchWrap, empty, list, workStatus, more);
   dom.content.append(section.root);
   filter(search.value);
+  void loadWork();
 }
 function emptyProject() {
   dom.content.append(node('p', 'empty panel', '上のプロジェクト欄から対象を選んでください。'));

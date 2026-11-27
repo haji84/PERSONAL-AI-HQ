@@ -222,6 +222,20 @@ export function createApiDevelopment({directory, store, conversations, withProje
 
   return {
     activity(project) { return latestApiActivity(store, project.id, id => jobs.get(id)); },
+    listArtifacts(projectIds, offset) {
+      const operations = store.listVerifiedApiWork(projectIds);
+      const page = operations.slice(offset, offset + 16);
+      const files = page.flatMap(({project, operation}) => {
+        const report = resultReport(operation);
+        if (report?.projectId !== project || report.executionId !== operation.executionId || report.verification?.passed !== true ||
+            !Array.isArray(report.changes)) return [];
+        return report.changes.map((file, index) => ({project, kind: 'file', title: file.path, description: '通常APIで検証済み',
+          observedAt: operation.completedAt, sha256: file.sha256,
+          href: '/api/artifacts/work/file?' + new URLSearchParams({project, id: operation.taskId, index})}));
+      });
+      const following = offset + page.length;
+      return {artifacts: files, nextOffset: following < operations.length ? following : null};
+    },
     conversationView(project, result, offset) {
       const {conversation} = result;
       if (conversation.source !== 'api-development' || terminalPhases.has(conversation.outcome)) return result;
@@ -296,7 +310,8 @@ export function createApiDevelopment({directory, store, conversations, withProje
       const {operation} = store.getWork(project.id, taskId);
       const result = operation?.status === 'completed' ? resultReport(operation) : null;
       const file = result?.changes?.[index];
-      if (!file || !/^candidate-[1-9]\d*$/.test(result.candidate)) throw problem(404, 'API_ARTIFACT_NOT_FOUND');
+      if (!file || result.projectId !== project.id || result.executionId !== operation.executionId || !result.verification?.passed ||
+          !/^candidate-[1-9]\d*$/.test(result.candidate)) throw problem(404, 'API_ARTIFACT_NOT_FOUND');
       const root = join(artifacts, operation.executionId, result.candidate);
       const destination = resolve(root, file.path);
       let handle;

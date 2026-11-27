@@ -288,6 +288,15 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
     const portfolio = await readPortfolio(directory);
     if (get && route === '/api/portfolio') return send(response, 200, portfolio.view);
     if (get && route === '/api/artifacts/file') return download(response, portfolio.artifacts.get(target.searchParams.get('id')));
+    if (get && route === '/api/artifacts/work') {
+      const offset = Number(target.searchParams.get('offset') ?? 0);
+      const scope = target.searchParams.get('project');
+      if (!Number.isSafeInteger(offset) || offset < 0) throw error(400, '成果物一覧の位置が正しくありません。');
+      if ((scope !== null && !portfolio.projects.has(scope)) || target.searchParams.getAll('project').length > 1) {
+        throw error(404, '案件を見つけられませんでした。');
+      }
+      return send(response, 200, apiWork.listArtifacts(scope === null ? [...portfolio.projects.keys()] : [scope], offset));
+    }
 
     const project = portfolio.projects.get(target.searchParams.get('project'));
     if (!project) throw error(404, '案件を見つけられませんでした。');
@@ -308,6 +317,17 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
         }));
       }
     }
+    if (get && ['/api/artifacts/work/file', '/api/execution/api/artifact'].includes(route)) {
+      if (target.searchParams.getAll('project').length !== 1) throw error(404, '案件を見つけられませんでした。');
+      const value = target.searchParams.get('index');
+      if (!value || !/^\d{1,2}$/.test(value)) throw error(404, apiMessages.API_ARTIFACT_NOT_FOUND);
+      const {bytes, name} = await apiWork.artifact(project, target.searchParams.get('id'), Number(value));
+      const encoded = encodeURIComponent(name).replace(/[!'()*]/g, char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
+      response.writeHead(200, {'Content-Type': 'application/octet-stream', 'Content-Length': bytes.length,
+        'Content-Disposition': `attachment; filename*=UTF-8''${encoded}`});
+      response.end(bytes);
+      return;
+    }
     if (route.startsWith('/api/execution/api')) {
       if (!apiEnabled) throw error(409, apiMessages.API_AUTHORIZATION_REQUIRED);
       if (target.searchParams.getAll('project').length !== 1) throw error(404, '案件を見つけられませんでした。');
@@ -317,16 +337,6 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       if (post && route === '/api/execution/api/interrupt') {
         const input = await jsonBody(request, 4096);
         return send(response, 202, apiWork.interrupt(project, input?.id));
-      }
-      if (get && route === '/api/execution/api/artifact') {
-        const value = target.searchParams.get('index');
-        if (!value || !/^\d{1,2}$/.test(value)) throw error(404, apiMessages.API_ARTIFACT_NOT_FOUND);
-        const {bytes, name} = await apiWork.artifact(project, target.searchParams.get('id'), Number(value));
-        const encoded = encodeURIComponent(name).replace(/[!'()*]/g, char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
-        response.writeHead(200, {'Content-Type': 'application/octet-stream', 'Content-Length': bytes.length,
-          'Content-Disposition': `attachment; filename*=UTF-8''${encoded}`});
-        response.end(bytes);
-        return;
       }
     }
     if (route === '/api/codex/run') {
