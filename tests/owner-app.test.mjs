@@ -88,6 +88,50 @@ test('owner credentials are one-use and private API calls never expose the works
   assert.equal(reads(), 1);
 });
 
+test('Codex turn evidence requires an exact authenticated project and rechecks scope after native reading', async t => {
+  const {directory, start} = await runtimeFixture(t);
+  const portfolioPath = join(directory, 'portfolio.json');
+  await writeFile(portfolioPath, JSON.stringify(seed), {mode: 0o600});
+  let admit;
+  let release;
+  const reading = new Promise(resolve => { admit = resolve; });
+  const released = new Promise(resolve => { release = resolve; });
+  t.after(release);
+  const calls = [];
+  const app = await start({codex: {async readTurnEvidence(scope, id, turn, options) {
+    calls.push({scope, id, turn, options});
+    if (turn === 'held') { admit(); await released; }
+    return {threadId: id, turnId: turn, entries: [], nextCursor: null};
+  }}});
+  const url = app.url + '/api/codex/evidence';
+  const query = '?project=example&id=thread&turn=turn';
+  assert.equal((await fetch(url + query)).status, 401);
+  const cookie = await login(app);
+  const get = params => fetch(url + params, {headers: {cookie}});
+  assert.equal((await get('?project=unknown&id=thread&turn=turn')).status, 404);
+  assert.equal((await get(query + '&project=unknown')).status, 404);
+  for (const bad of ['&id=other', '&turn=other', '&item=x&cursor=y', '&cursor=%0A', '&item=']) {
+    assert.equal((await get(query + bad)).status, 400);
+  }
+  assert.equal(calls.length, 0);
+  const page = await get(query + '&cursor=native%2Bcursor');
+  assert.equal(page.headers.get('cache-control'), 'no-store');
+  assert.deepEqual(await page.json(), {threadId: 'thread', turnId: 'turn', entries: [], nextCursor: null});
+  assert.deepEqual(calls[0], {scope: [seed.projects[0].cwd], id: 'thread', turn: 'turn',
+    options: {cursor: 'native+cursor', item: null}});
+  const held = get('?project=example&id=thread&turn=held');
+  await reading;
+  try {
+    await writeFile(portfolioPath, JSON.stringify({...seed,
+      projects: [{...seed.projects[0], cwd: resolve(tmpdir(), 'new-workspace')}]}));
+  } finally {
+    release();
+  }
+  const rejected = await held;
+  assert.equal(rejected.status, 404);
+  assert.equal((await rejected.json()).entries, undefined);
+});
+
 test('Codex loopback configuration refuses missing credentials, remote URLs and mixed transports', async t => {
   const {directory, start} = await runtimeFixture(t);
   const realDirectory = await realpath(directory);

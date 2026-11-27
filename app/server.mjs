@@ -10,7 +10,7 @@ import {fileURLToPath, pathToFileURL} from 'node:url';
 import {pipeline} from 'node:stream/promises';
 import {readCurrentProject, readPortfolio} from './portfolio.mjs';
 import {createChatStore} from './chat-store.mjs';
-import {createCodexClient, emptyNativeActivity, isCodexLoopbackUrl} from './codex.mjs';
+import {createCodexClient, emptyNativeActivity, isCodexLoopbackUrl, validEvidenceCursor, validEvidenceTarget} from './codex.mjs';
 import {createOperations} from './operations.mjs';
 import {createExecutionAccess} from './execution-access.mjs';
 import {createPlanAuth, PLAN_AUTH_CALLBACK_PATH} from './chatgpt-plan-auth.mjs';
@@ -329,7 +329,8 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
     if (target.origin !== origin) throw error(403, 'このホストからはアクセスできません。');
     const route = target.pathname;
     const cookie = cookieKey(request.headers.cookie, remote ? tailnetCookieName : undefined);
-    const authenticated = remote ? access.authenticated(cookie) : Date.now() < expires && sameKey(session, cookie);
+    const signedIn = () => remote ? access.authenticated(cookie) : Date.now() < expires && sameKey(session, cookie);
+    const authenticated = signedIn();
     const get = request.method === 'GET';
     const post = request.method === 'POST';
     if (remote && (route === PLAN_AUTH_CALLBACK_PATH || route === '/api/chat/plan' ||
@@ -544,6 +545,29 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       const {desktopThreadId, ...view} = await native.readThread(project.cwd, id, target.searchParams.get('cursor'));
       const managed = operations.managesThread(project, id);
       return send(response, 200, {...view, managed, ...(!remote && !managed && desktopThreadId === id ? {desktopThreadId} : {})});
+    }
+    if (get && route === '/api/codex/evidence') {
+      const params = target.searchParams;
+      if (!project.cwd.length || params.getAll('project').length !== 1) {
+        throw error(404, 'この案件のCodex接続情報がありません。');
+      }
+      const id = params.get('id');
+      const turn = params.get('turn');
+      const cursor = params.get('cursor');
+      const item = params.get('item');
+      if (!validEvidenceTarget(id) || !validEvidenceTarget(turn) || params.getAll('id').length !== 1 ||
+          params.getAll('turn').length !== 1 || params.getAll('cursor').length > 1 || params.getAll('item').length > 1 ||
+          (cursor !== null && (!validEvidenceCursor(cursor) || item !== null)) || (item !== null && !validEvidenceTarget(item))) {
+        throw error(400, 'スレッド、作業、取得位置の指定を確認してください。');
+      }
+      if (!native.readTurnEvidence) throw error(503, 'このCodex接続から作業記録を取得できません。');
+      const result = await native.readTurnEvidence(project.cwd, id, turn, {cursor, item});
+      const current = readCurrentProject(directory, project.id);
+      if (!current || current.cwd.length !== project.cwd.length || current.cwd.some(cwd => !project.cwd.includes(cwd))) {
+        throw error(404, 'この案件のCodex接続情報がありません。');
+      }
+      if (!signedIn()) throw error(401, 'サインインが必要です。');
+      return send(response, 200, result);
     }
     throw error(404, '見つかりませんでした。');
   }

@@ -73,7 +73,7 @@ const nativeActivityLabels = {
   running: '稼働中', approval: '承認待ち', input: '入力待ち', 'approval-and-input': '承認・入力待ち',
 };
 const nativeOutcomeLabels = {completed: '完了', failed: '失敗', interrupted: '中断'};
-const nativeActivityId = /^[a-z0-9_-]{1,160}$/i;
+const codexRecordId = /^[a-z0-9_-]{1,160}$/i;
 const nativeWatchLimit = 3;
 const nativeWatchAge = 60000;
 const chatSourceLabels = {'chatgpt-export': 'ChatGPTの書き出し', 'chatgpt-live': 'ChatGPTプラン',
@@ -320,7 +320,7 @@ function recordNativeActivity(project, result, watched) {
   if (!['observed', 'unconfigured', 'unavailable'].includes(result?.status) ||
       (result.status === 'observed' && (!Number.isFinite(Date.parse(result.observedAt)) ||
         !Array.isArray(result.live) || result.live.some(row => typeof row?.id !== 'string' ||
-          !nativeActivityId.test(row.id) || typeof row.title !== 'string' || !Object.hasOwn(nativeActivityLabels, row.phase))))) {
+          !codexRecordId.test(row.id) || typeof row.title !== 'string' || !Object.hasOwn(nativeActivityLabels, row.phase))))) {
     result = {status: 'unavailable'};
   }
   if (result.status === 'unconfigured') {
@@ -345,7 +345,7 @@ function recordNativeActivity(project, result, watched) {
     nativeNotices.set(key, expires);
   }
   for (const row of result.live) {
-    if (typeof row.turnId !== 'string' || !nativeActivityId.test(row.turnId)) continue;
+    if (typeof row.turnId !== 'string' || !codexRecordId.test(row.turnId)) continue;
     const key = row.id + ':' + row.turnId;
     if (!nativeNotices.has(key) && (watched.has(key) || watched.size < nativeWatchLimit)) watched.set(key, expires);
   }
@@ -2327,6 +2327,169 @@ function modelSettings(target, back) {
     apiRun?.cleanup();
   }};
 }
+const evidenceStatus = {inProgress: '実行中', completed: '完了', interrupted: '中断', failed: '失敗', declined: '却下'};
+const evidenceKind = {add: '追加', update: '変更', delete: '削除'};
+
+function codexTurnEvidence(project, threadId, isCurrent) {
+  const section = node('details', 'scope-info');
+  const selector = labeledSelect('確認するターン', {});
+  const status = node('p', 'small muted');
+  status.setAttribute('role', 'status');
+  const records = node('ol', 'marked-list');
+  const refresh = button('実行記録を更新', () => { reset(); void load(); });
+  const more = button('続きの実行記録を表示', () => load(cursor));
+  const actions = node('div', 'run-actions');
+  actions.append(refresh, more);
+  more.hidden = true;
+  section.append(node('summary', '', 'コマンド結果・変更ファイル'), selector.field, status, records, actions);
+  section.hidden = true;
+  const displayed = new Set();
+  const previousCursors = new Set();
+  const mounted = () => section.isConnected && isCurrent();
+  const endpoint = '/api/codex/evidence';
+  let generation = 0, request, cursor, attempted = false;
+
+  function reset() {
+    generation++;
+    request?.abort();
+    request = null;
+    attempted = false;
+    cursor = undefined;
+    displayed.clear();
+    previousCursors.clear();
+    records.replaceChildren();
+    more.hidden = true;
+  }
+  function renderCommandOutput(output, entry, turn, visit) {
+    const messages = {empty: '出力なし', unavailable: '出力未取得', hidden: '出力は非表示です。'};
+    if (entry.outputState === 'visible' && typeof entry.output === 'string') {
+      const pre = node('pre', 'run-output', entry.output);
+      pre.setAttribute('aria-label', 'コマンドの出力');
+      pre.tabIndex = 0;
+      output.replaceChildren(pre);
+      if (entry.truncated) output.append(node('p', 'small muted', 'この記録の一部を表示しています。'));
+    } else if (entry.outputState === 'deferred') {
+      const message = node('p', 'small muted');
+      message.setAttribute('role', 'status');
+      const read = button('保存済みの出力を取得', async () => {
+        if (read.disabled || !mounted() || visit !== generation || !output.isConnected) return;
+        const wasFocused = document.activeElement === read;
+        read.disabled = true;
+        message.textContent = '出力を取得中…';
+        try {
+          const page = await api(apiPath(endpoint, {project, id: threadId, turn, item: entry.id}),
+            {signal: AbortSignal.timeout(9000)});
+          if (!mounted() || visit !== generation || !output.isConnected) return;
+          if (page?.threadId !== threadId || page.turnId !== turn || page.entry?.id !== entry.id || page.entry.type !== 'command') {
+            throw new Error('対象の出力を照合できませんでした。');
+          }
+          if (page.entry.outputState === 'deferred') {
+            message.textContent = '現在の接続から保存済みの出力を取得できません。';
+            return;
+          }
+          const returnFocus = wasFocused && [read, document.body].includes(document.activeElement);
+          renderCommandOutput(output, page.entry, turn, visit);
+          const heading = output.firstElementChild;
+          if (returnFocus && heading) {
+            if (!heading.hasAttribute('tabindex')) heading.tabIndex = -1;
+            heading.focus({preventScroll: true});
+          }
+        } catch (error) {
+          if (mounted() && visit === generation) message.textContent = error.message;
+        } finally { read.disabled = false; }
+      });
+      output.replaceChildren(read, message);
+    } else {
+      output.replaceChildren(node('p', 'small muted', messages[entry.outputState] ?? '出力未取得'));
+    }
+  }
+  function renderEntry(entry, turn, visit) {
+    const row = node('li', 'stack');
+    const details = [evidenceStatus[entry.status] ?? '状態未確認'];
+    if (entry.type === 'command') {
+      if (Number.isInteger(entry.exitCode)) details.push('終了コード ' + entry.exitCode);
+      if (Number.isSafeInteger(entry.durationMs)) details.push(entry.durationMs.toLocaleString('ja-JP') + ' ms');
+      if (entry.cwd && entry.cwd !== '.') details.push('作業先 ' + entry.cwd);
+      row.append(node('p', 'strong', 'コマンド · ' + details.join(' · ')));
+      if (entry.command) {
+        const command = node('pre', 'run-output', entry.command);
+        command.setAttribute('aria-label', '実行したコマンド');
+        command.tabIndex = 0;
+        row.append(command);
+      }
+      const output = node('div', 'stack');
+      renderCommandOutput(output, entry, turn, visit);
+      row.append(output);
+      if (entry.truncated && entry.outputState !== 'visible') row.append(node('p', 'small muted', 'この記録の一部を表示しています。'));
+    } else {
+      row.append(node('p', 'strong', 'ファイル変更 · ' + details.join(' · ')));
+      const paths = node('ul', 'marked-list');
+      for (const change of asArray(entry.changes)) {
+        if (typeof change?.path !== 'string' || !Object.hasOwn(evidenceKind, change.kind)) continue;
+        paths.append(node('li', 'small', change.from ? '移動 ' + change.from + ' → ' + change.path :
+          evidenceKind[change.kind] + ' ' + change.path));
+      }
+      if (paths.children.length) row.append(paths);
+      if (entry.truncated) row.append(node('p', 'small muted', '表示できる変更の一部を掲載しています。'));
+    }
+    return row;
+  }
+  async function load(next) {
+    const turn = selector.input.value;
+    if (!section.open || !mounted() || !turn || request) return;
+    const visit = generation;
+    const current = new AbortController();
+    request = current;
+    attempted = true;
+    refresh.disabled = more.disabled = true;
+    status.textContent = '実行記録を取得中…';
+    try {
+      const page = await api(apiPath(endpoint, {project, id: threadId, turn, cursor: next}),
+        {signal: AbortSignal.any([current.signal, AbortSignal.timeout(9000)])});
+      if (!mounted() || visit !== generation) return;
+      if (page?.threadId !== threadId || page.turnId !== turn || !Array.isArray(page.entries)) {
+        throw new Error('対象ターンの実行記録を照合できませんでした。');
+      }
+      for (const entry of page.entries) {
+        if (typeof entry?.id !== 'string' || displayed.has(entry.id) || !['command', 'files'].includes(entry.type)) continue;
+        displayed.add(entry.id);
+        records.append(renderEntry(entry, turn, visit));
+      }
+      if (next) previousCursors.add(next);
+      cursor = typeof page.nextCursor === 'string' && page.nextCursor && !previousCursors.has(page.nextCursor) ? page.nextCursor : undefined;
+      more.hidden = !cursor;
+      status.textContent = displayed.size ? '' : 'このページに表示できる実行記録はありません。';
+    } catch (error) {
+      if (mounted() && visit === generation && !current.signal.aborted) status.textContent = error.message;
+    } finally {
+      if (request === current) {
+        request = null;
+        refresh.disabled = more.disabled = false;
+      }
+    }
+  }
+  selector.input.addEventListener('change', () => { reset(); void load(); });
+  section.addEventListener('toggle', () => { if (section.open && !attempted) void load(); });
+  return {section, useTurns(turns) {
+    const previous = selector.input.value;
+    selector.input.replaceChildren(...[...asArray(turns)].reverse().filter(turn =>
+      typeof turn?.id === 'string' && codexRecordId.test(turn.id)).map(turn => {
+      const user = asArray(turn.messages).find(message => message?.role === 'user');
+      const title = text(user?.text, '').replace(/\s+/g, ' ').slice(0, 65);
+      const parts = [turn.startedAt ? time(turn.startedAt) : '', title, evidenceStatus[turn.status] ?? '状態未確認'].filter(Boolean);
+      const option = node('option', '', parts.join(' · '));
+      option.value = turn.id;
+      return option;
+    }));
+    if ([...selector.input.options].some(option => option.value === previous)) selector.input.value = previous;
+    section.hidden = !selector.input.value;
+    if (previous !== selector.input.value) {
+      reset();
+      if (section.open) void load();
+    }
+  }};
+}
+
 function codex() {
   const project = ui.project;
   if (!project) return emptyProject();
@@ -2390,6 +2553,9 @@ function codex() {
         actions.append(open);
       }
       if (actions.children.length) destination.append(actions);
+      const evidence = codexTurnEvidence(project, id, isCurrent);
+      destination.append(evidence.section);
+      evidence.useTurns(value?.turns);
       const messages = node('div', 'messages messages-embedded');
       destination.append(messages);
       function appendTurns(turns, prepend = false) {
@@ -2412,6 +2578,7 @@ function codex() {
           const added = asArray(page?.turns);
           appendTurns(added, true);
           value.turns = [...added, ...asArray(value.turns)];
+          evidence.useTurns(value.turns);
           value.nextCursor = page?.nextCursor;
           cursor = page?.nextCursor;
           more.hidden = typeof cursor !== 'string' || !cursor;

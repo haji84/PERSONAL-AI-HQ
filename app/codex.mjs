@@ -4,6 +4,7 @@ import {Agent} from 'node:http';
 import {createConnection} from 'node:net';
 import {setTimeout as delay} from 'node:timers/promises';
 import WebSocket from 'ws';
+import {turnEvidenceItem} from './codex-evidence.mjs';
 
 const unavailable = message => Object.assign(new Error(message), {status: 503});
 const missing = message => Object.assign(new Error(message), {status: 404});
@@ -18,6 +19,7 @@ const handoverItemId = /^[a-z0-9_.:-]{1,160}$/i;
 const steeringClientId = /^hq:steer:[a-z0-9_-]{8,80}$/i;
 const turnItemPageLimit = 12;
 const turnItemPageCount = 4;
+const evidenceCursorLimit = 4096;
 const handoverMessageLimit = 24000;
 // JSON escaping can double a 16 KiB document. Leave room for its filename and explanation.
 const handoverReferenceLimit = 34 * 1024;
@@ -33,6 +35,34 @@ const clean = (value, limit = 500) => typeof value === 'string' ? value.slice(0,
 const items = value => Array.isArray(value) ? value : [];
 const cursorText = value => typeof value === 'string' && value.length <= 8192 ? value : null;
 const iso = value => Number.isFinite(value) && value >= 0 && value < 253402300800 ? new Date(value * 1000).toISOString() : null;
+
+export const validEvidenceCursor = value => typeof value === 'string' && value.length > 0 &&
+  value.length <= evidenceCursorLimit && !/[\x00-\x1f\x7f]/u.test(value);
+export const validEvidenceTarget = value => typeof value === 'string' && handoverItemId.test(value);
+
+const exactEvidenceEntry = (entry, turn) => entry?.turnId === turn && validEvidenceTarget(entry.item?.id);
+
+function evidencePage(result, workspace, turnId, cursor) {
+  if (!Array.isArray(result?.data) || result.data.length > turnItemPageLimit ||
+      result.data.some(row => !exactEvidenceEntry(row, turnId)) ||
+      new Set(result.data.map(row => row.item.id)).size !== result.data.length ||
+      (result.nextCursor != null && (!validEvidenceCursor(result.nextCursor) || result.nextCursor === cursor))) {
+    throw unavailable('このCodex作業の記録を照合できませんでした。');
+  }
+  return {entries: result.data.map(row => turnEvidenceItem(row, workspace)).filter(Boolean), nextCursor: result.nextCursor ?? null};
+}
+
+function evidenceDetail(result, workspace, turnId, item) {
+  const row = items(result?.data)[0];
+  if (!Array.isArray(result?.data) || result.data.length !== 1 || !exactEvidenceEntry(row, turnId) ||
+      row.item.id !== item || row.item.type !== 'commandExecution' || row.item.status !== 'completed') {
+    throw missing('この作業に該当するコマンド出力がありません。');
+  }
+  const entry = turnEvidenceItem(row, workspace);
+  if (!entry) throw missing('この作業に表示できるコマンド出力がありません。');
+  if (entry.outputState === 'deferred') throw unavailable('Codexから出力の本文を取得できませんでした。');
+  return {entry};
+}
 
 export function emptyNativeActivity(status) {
   return {status, observedAt: null, truncated: false, unconfirmed: 0, live: [], transitions: []};
@@ -363,6 +393,8 @@ export function createCodexClient({command, socket, loopback} = {}) {
   let transport;
   let initialized;
   const listeners = new Set();
+  const evidenceConnections = new Set();
+  const clientInfo = {name: 'personal_ai_hq', title: 'Personal AI HQ', version: '0.1.0'};
 
   async function current() {
     if (!initialized) {
@@ -370,19 +402,46 @@ export function createCodexClient({command, socket, loopback} = {}) {
         if (transport === next) { transport = undefined; initialized = undefined; }
       }, (method, params) => { for (const listener of listeners) listener(method, params); });
       transport = next;
-      initialized = next.call('initialize', {clientInfo: {name: 'personal_ai_hq', title: 'Personal AI HQ', version: '0.1.0'}})
+      initialized = next.call('initialize', {clientInfo})
         .then(() => { next.send({method: 'initialized'}); return next; })
         .catch(error => { next.close(); throw error; });
     }
     return initialized;
   }
 
-  async function scopedThread(scope, id) {
+  async function scopedThread(scope, id, existing, signal) {
     if (typeof id !== 'string' || !threadId.test(id)) throw missing('スレッドを見つけられませんでした。');
-    const rpc = await current();
-    const {thread} = await rpc.call('thread/read', {threadId: id, includeTurns: false});
+    const rpc = existing ?? await current();
+    const {thread} = await rpc.call('thread/read', {threadId: id, includeTurns: false}, undefined, signal);
     if (!thread || thread.id !== id || !scope.includes(thread.cwd)) throw missing('この案件のスレッドではありません。');
     return {rpc, thread};
+  }
+
+  async function readEvidence(scope, id, turnId, cursor, item) {
+    if (evidenceConnections.size >= 3) throw unavailable('Codexの作業記録取得が使用中です。');
+    const rpc = openTransport(stdioCommand, socket, endpoint, () => {}, () => {});
+    evidenceConnections.add(rpc);
+    const signal = AbortSignal.timeout(12000);
+    try {
+      await rpc.call('initialize', {clientInfo, capabilities: {experimentalApi: true, requestAttestation: false}}, undefined, signal);
+      signal.throwIfAborted();
+      rpc.send({method: 'initialized'});
+      const {thread} = await scopedThread(scope, id, rpc, signal);
+      const view = item === null
+        ? evidencePage(await rpc.call('thread/items/list', {threadId: id, turnId, cursor, limit: turnItemPageLimit,
+          sortDirection: 'asc', deferOutput: {commandExecution: true}}, undefined, signal), thread.cwd, turnId, cursor)
+        : evidenceDetail(await rpc.call('thread/items/read', {threadId: id, turnId, itemIds: [item]}, undefined, signal),
+          thread.cwd, turnId, item);
+      await scopedThread([thread.cwd], id, rpc, signal);
+      return {threadId: id, turnId, ...view};
+    } catch (error) {
+      if (error?.status === 404) throw error;
+      throw unavailable(item === null ? 'このCodex接続から作業記録を取得できません。' :
+        'このCodex接続から保存済みの出力を取得できません。');
+    } finally {
+      evidenceConnections.delete(rpc);
+      rpc.close();
+    }
   }
 
   async function subscriptionReady(rpc) {
@@ -561,11 +620,21 @@ export function createCodexClient({command, socket, loopback} = {}) {
     async readThread(scope, id, cursor) {
       const {rpc, thread} = await scopedThread(scope, id);
       const result = await recentTurns(rpc, id, cursor);
-      const turns = items(result.data).map(turn => ({id: turn.id, status: clean(turn.status, 32) || 'unknown',
-        messages: plainMessages(turn.items), itemCount: items(turn.items).length})).reverse();
+      const turns = items(result.data).map(turn => {
+        const startedAt = iso(turn.startedAt);
+        const completedAt = iso(turn.completedAt);
+        return {id: turn.id, status: clean(turn.status, 32) || 'unknown',
+          messages: plainMessages(turn.items), itemCount: items(turn.items).length,
+          ...(startedAt ? {startedAt} : {}), ...(completedAt ? {completedAt} : {})};
+      }).reverse();
       return {thread: threadView(thread), turns, nextCursor: cursorText(result.nextCursor),
         ...(thread.ephemeral === false && thread.id.length === 36 && desktopThreadId.test(thread.id)
           ? {desktopThreadId: thread.id} : {})};
+    },
+    async readTurnEvidence(scope, id, turnId, {cursor = null, item = null} = {}) {
+      if (!validEvidenceTarget(turnId) || (item !== null && (!validEvidenceTarget(item) || cursor !== null)) ||
+          (cursor !== null && !validEvidenceCursor(cursor))) throw missing('作業記録を見つけられませんでした。');
+      return readEvidence(scope, id, turnId, cursor, item);
     },
     async readHandoverTurn(workspace, id, turnId, clientId) {
       if (typeof workspace !== 'string' || !workspace || typeof turnId !== 'string' || !threadId.test(turnId) ||
@@ -629,6 +698,9 @@ export function createCodexClient({command, socket, loopback} = {}) {
           description: clean(option.description, 160)})), defaultReasoningEffort: clean(row.defaultReasoningEffort, 24),
       })), accountType: clean(account?.account?.type, 32) || null};
     },
-    close() { transport?.close(); },
+    close() {
+      transport?.close();
+      for (const rpc of evidenceConnections) rpc.close();
+    },
   };
 }

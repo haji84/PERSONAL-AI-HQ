@@ -31,7 +31,7 @@ function call(target, path, {method = 'GET', headers = {}, body} = {}) {
   });
 }
 
-async function fixture(t, options = {}) {
+async function fixture(t, options = {}, {includeCodexScope = false} = {}) {
   const directory = await mkdtemp(join(await realpath(tmpdir()), 'hq-tailnet-test-'));
   const expectedOrigin = options.tailnet?.origin ?? origin;
   const expectedHost = new URL(expectedOrigin).host;
@@ -42,7 +42,7 @@ async function fixture(t, options = {}) {
   });
   await ensurePrivateDirectory(directory);
   await writeFile(join(directory, 'portfolio.json'), JSON.stringify({
-    projects: [{id: 'sample', name: 'Tailnet fixture', state: 'ready'}],
+    projects: [{id: 'sample', name: 'Tailnet fixture', state: 'ready', ...(includeCodexScope ? {cwd: directory} : {})}],
   }), {mode: 0o600});
   app = await startOwnerApp({directory, port: 0, codex: {}, ...options});
   const signIn = await readFile(app.signInFile, 'utf8');
@@ -245,4 +245,28 @@ test('remote owner access cannot invoke the local-only ChatGPT Plan flow', async
     assert.ok([403, 404].includes((await env.remote(path, options)).status), path);
   }
   assert.deepEqual(invocations, []);
+});
+
+test('a revoked remote session receives no in-flight Codex evidence', async t => {
+  const nativeStarted = Promise.withResolvers();
+  const releaseNative = Promise.withResolvers();
+  const marker = 'private fixture evidence';
+  const env = await fixture(t, {tailnet, codex: {
+    async readTurnEvidence(scope, id, turn) {
+      assert.equal(scope.length, 1);
+      nativeStarted.resolve();
+      await releaseNative.promise;
+      return {threadId: id, turnId: turn, entries: [{type: 'command', output: marker}], nextCursor: null};
+    },
+  }}, {includeCodexScope: true});
+  const remoteCookie = await redeem(env, await pair(env));
+  const read = env.remote('/api/codex/evidence?project=sample&id=thread&turn=turn', {headers: {Cookie: remoteCookie}});
+  try {
+    await nativeStarted.promise;
+    const revoked = await env.local('/api/access/revoke', post({Origin: env.app.url, Cookie: env.localCookie}));
+    assert.equal(revoked.status, 200);
+  } finally { releaseNative.resolve(); }
+  const result = await read;
+  assert.equal(result.status, 401);
+  assert.ok(!result.text.includes(marker));
 });

@@ -46,10 +46,12 @@ async function fixture(t, {accountType = 'chatgpt', redirect, thread = fixtureTh
       return;
     }
     websocket.handleUpgrade(request, socket, head, connection => {
+      let experimental = false;
       connection.on('message', bytes => {
         const {id, method, params} = JSON.parse(bytes);
         calls.push([method, params]);
         if (id === undefined) return;
+        if (method === 'initialize') experimental = params.capabilities?.experimentalApi === true;
         const results = {
           initialize: {}, 'account/read': {requiresOpenaiAuth: true, account: accountType && {type: accountType}},
           'thread/list': {data: [fixtureThread, {id: 'outside', cwd: foreignWorkspace}]},
@@ -59,7 +61,7 @@ async function fixture(t, {accountType = 'chatgpt', redirect, thread = fixtureTh
           'thread/items/list': {data: [{turnId: params?.turnId, item: {type: 'userMessage', clientId: firstUser}}]},
           'turn/steer': {turnId: fixtureTurn.id}, 'turn/interrupt': {},
         };
-        const result = rpcResults[method] ? rpcResults[method](params) : results[method];
+        const result = rpcResults[method] ? rpcResults[method](params, {experimental}) : results[method];
         if (result === 'hold') return;
         connection.send(JSON.stringify({id, ...(result ? {result} : {error: {code: -32601}})}));
       });
@@ -173,6 +175,133 @@ test('native activity aborts a held list before starting turn reads and leaves t
 
 const request = {workspace, prompt: 'Run the fixture.', requestId: 'fixture-request', model: 'fixture-model', effort: 'low', onThread: () => true};
 
+test('turn evidence returns bounded exact command and workspace file metadata', async t => {
+  const turnId = 'evidence-turn';
+  const entry = (id, fields) => ({turnId, item: {id, status: 'completed', ...fields}});
+  const run = {type: 'commandExecution', cwd: workspace, command: 'npm test', exitCode: 0, durationMs: 34};
+  const {client, calls, connections} = await fixture(t, {rpcResults: {
+    'thread/items/list': ({cursor}, {experimental}) => {
+      if (!experimental) return null;
+      if (cursor) return {data: [{...entry('foreign', run), turnId: 'different-turn'}], nextCursor: null};
+      return {data: [
+        entry('inline', {...run, aggregatedOutput: '\x1b[31mPASS\x1b[0m'}),
+        entry('sensitive', {...run, command: 'printenv', aggregatedOutput: 'private-value'}),
+        entry('token-output', {...run, aggregatedOutput: 'OPENAI_API_KEY=private-value'}),
+        {...entry('deferred', run), outputDeferred: true},
+        entry('tool', {type: 'mcpToolCall', arguments: 'private tool payload'}),
+        entry('moderated', {...run, aggregatedOutput: 'private moderated output', moderation: {moderated: true}}),
+        entry('bounded', {...run, aggregatedOutput: 'a'.repeat(7000)}),
+        entry('outside-cwd', {...run, cwd: workspace + '-sibling', aggregatedOutput: 'foreign data'}),
+        entry('outside-read', {...run, command: 'cat input.txt', aggregatedOutput: 'outside content',
+          commandActions: [{type: 'read', path: foreignWorkspace + '\\input.txt'}]}),
+        entry('changes', {type: 'fileChange', changes: [
+          {path: workspace + '\\old.txt', kind: {type: 'update', move_path: workspace + '\\new.txt'}, diff: 'private diff'},
+          {path: workspace + '-sibling\\private.txt', kind: {type: 'add'}},
+          {path: '..\\private.txt', kind: {type: 'delete'}},
+        ]}),
+        entry('outside-changes', {type: 'fileChange', changes: [{path: '..\\outside.txt', kind: {type: 'delete'}}]}),
+      ], nextCursor: 'native-cursor'};
+    },
+    'thread/items/read': ({itemIds: [id]}, {experimental}) => experimental ? {data: [id === 'deferred' ?
+      entry(id, {...run, aggregatedOutput: 'later output'}) : entry('different-id', run)]} : null,
+  }});
+  const native = client();
+  assert.equal((await native.readThread([workspace], fixtureThread.id)).thread.id, fixtureThread.id);
+  await assert.rejects(native.readTurnEvidence([foreignWorkspace], fixtureThread.id, turnId, {}), {status: 404});
+  assert.ok(!calls.some(([method]) => method.startsWith('thread/items')));
+  const page = await native.readTurnEvidence([workspace], fixtureThread.id, turnId, {});
+  assert.equal(page.threadId, fixtureThread.id);
+  assert.equal(page.turnId, turnId);
+  assert.equal(page.nextCursor, 'native-cursor');
+  assert.deepEqual(page.entries.map(item => [item.id, item.outputState]), [
+    ['inline', 'visible'], ['sensitive', 'hidden'], ['token-output', 'hidden'], ['deferred', 'deferred'],
+    ['bounded', 'visible'], ['outside-cwd', 'hidden'], ['outside-read', 'hidden'], ['changes', undefined],
+  ]);
+  assert.deepEqual(page.entries[0], {id: 'inline', type: 'command', status: 'completed', cwd: '.', command: 'npm test',
+    exitCode: 0, durationMs: 34, outputState: 'visible', output: 'PASS'});
+  assert.equal(page.entries[1].exitCode, 0);
+  assert.equal(page.entries[1].command, undefined);
+  assert.equal(page.entries.find(item => item.id === 'bounded').output.length, 6000);
+  assert.equal(page.entries.find(item => item.id === 'bounded').truncated, true);
+  assert.deepEqual(page.entries.at(-1).changes, [{path: 'new.txt', from: 'old.txt', kind: 'update'}]);
+  assert.ok(!JSON.stringify(page).match(/private|foreign data|outside content|Fixture/i));
+  assert.equal((await native.readTurnEvidence([workspace], fixtureThread.id, turnId, {item: 'deferred'})).entry.output, 'later output');
+  assert.equal(connections.length, 4);
+  await Promise.all(connections.slice(1).map(connection => connection.closed));
+  assert.equal((await native.readThread([workspace], fixtureThread.id)).thread.id, fixtureThread.id);
+  assert.equal(connections.length, 4);
+  const negotiated = {experimentalApi: true, requestAttestation: false};
+  assert.deepEqual(calls.filter(([method]) => method === 'initialize').map(([, params]) => params.capabilities),
+    [undefined, negotiated, negotiated, negotiated]);
+  assert.ok(calls.some(([method, params]) => method === 'thread/items/read' && params.turnId === turnId &&
+    params.threadId === fixtureThread.id && params.itemIds.length === 1 && params.itemIds[0] === 'deferred'));
+  await assert.rejects(native.readTurnEvidence([workspace], fixtureThread.id, turnId, {item: 'wrong-id'}), {status: 404});
+  await assert.rejects(native.readTurnEvidence([workspace], fixtureThread.id, turnId, {cursor: 'native-cursor'}), {status: 503});
+});
+
+test('even an authorized native cwd move during the evidence read invalidates that result', async t => {
+  for (const item of [undefined, 'changed-item']) {
+    let reads = 0;
+    const entry = {turnId: 'changed-turn', item: {id: 'changed-item', status: 'completed', type: 'commandExecution',
+      cwd: workspace, command: 'npm test', aggregatedOutput: 'initial workspace output'}};
+    const {client, calls} = await fixture(t, {rpcResults: {
+      'thread/read': () => ({thread: {...fixtureThread, cwd: reads++ ? foreignWorkspace : workspace}}),
+      'thread/items/list': (_params, {experimental}) => experimental ? {data: [entry], nextCursor: null} : null,
+      'thread/items/read': (_params, {experimental}) => experimental ? {data: [entry]} : null,
+    }});
+    await assert.rejects(client().readTurnEvidence([workspace, foreignWorkspace], fixtureThread.id, 'changed-turn', {item}), {status: 404});
+    assert.equal(calls.filter(([method]) => method === 'thread/read').length, 2);
+  }
+});
+
+test('unknown command actions hide outside literals in both the evidence page and exact output', async t => {
+  const projectRoot = '/private/project root';
+  const turnId = 'literal-path-turn';
+  const command = (id, text, deferred = false, cwd = projectRoot) => ({turnId, outputDeferred: deferred,
+    item: {id, type: 'commandExecution', status: 'completed', command: text, cwd, exitCode: 0,
+      commandActions: [{type: 'unknown', command: text}], aggregatedOutput: 'fixture-' + id}});
+  const safe = [
+    command('local', "/bin/zsh -lc 'node --test proof.test.mjs'"),
+    command('inside-quoted', 'cat "/private/project root/test report.txt"'),
+    command('deferred-local', "/bin/zsh -lc 'node --test nested/proof.test.mjs'", true),
+  ];
+  const outside = [
+    command('outside-posix', 'cat "/private/outside report.txt"'),
+    command('outside-drive', 'cat "D:\\Outside report.txt"'),
+    command('outside-unc', 'cat "\\\\host\\share\\Outside report.txt"'),
+    command('outside-parent', "/bin/zsh -lc 'cat ../outside.txt'"),
+    command('outside-nested', 'cat reports/../../outside.txt'),
+    command('outside-home', 'cat ~/outside.txt'),
+    command('outside-env', 'cat "$HOME/outside.txt"'),
+    command('outside-windows-env', 'type "%USERPROFILE%\\Outside report.txt"'),
+    command('fake-shell-prefix', '/private/bin/zsh -lc "node --test proof.test.mjs"'),
+  ];
+  const rows = [...safe, ...outside];
+  const {client} = await fixture(t, {thread: {...fixtureThread, cwd: projectRoot}, rpcResults: {
+    'thread/items/list': () => ({data: rows, nextCursor: null}),
+    'thread/items/read': ({itemIds: [id]}) => {
+      const row = rows.find(row => row.item.id === id);
+      return {data: [{...row, outputDeferred: false}]};
+    },
+  }});
+  const native = client();
+  const options = {scope: [projectRoot], id: fixtureThread.id, turnId};
+  const {entries} = await native.readTurnEvidence(options.scope, options.id, options.turnId);
+  assert.deepEqual(entries.slice(0, 3).map(row => row.outputState), ['visible', 'visible', 'deferred']);
+  assert.ok(entries[1].command.includes('test report.txt'));
+  for (const row of entries.slice(3)) {
+    assert.equal(row.outputState, 'hidden', row.id);
+    assert.equal(row.command, undefined);
+    assert.equal(row.output, undefined);
+    assert.equal(row.exitCode, 0);
+  }
+  const direct = await native.readTurnEvidence(options.scope, options.id, options.turnId, {item: 'outside-parent'});
+  assert.equal(direct.entry.outputState, 'hidden');
+  assert.equal(direct.entry.output, undefined);
+  const deferred = await native.readTurnEvidence(options.scope, options.id, options.turnId, {item: 'deferred-local'});
+  assert.equal(deferred.entry.output, 'fixture-deferred-local');
+});
+
 test('loopback rejects any noncanonical destination, unsafe token, and mixed transport synchronously', () => {
   const url = 'ws://127.0.0.1:8123';
   for (const invalidUrl of ['ws://localhost:8123', 'ws://127.1:8123', 'ws://[::1]:8123', 'ws://0.0.0.0:8123',
@@ -266,6 +395,18 @@ test('a verified desktop handoff identifies only a persisted native thread', asy
   assert.equal((await persisted.client().readThread([workspace], fixtureThread.id)).desktopThreadId, fixtureThread.id);
   assert.equal((await ephemeral.client().readThread([workspace], fixtureThread.id)).desktopThreadId, undefined);
   await assert.rejects(persisted.client().readThread([foreignWorkspace], fixtureThread.id), {status: 404});
+});
+
+test('the exact history turn exposes native recorded timestamps only when present', async t => {
+  const dated = await fixture(t, {turn: {...priorTurn, startedAt: 1760000000, completedAt: 1760000001}});
+  const blank = await fixture(t, {turn: {...priorTurn, startedAt: null}});
+  const [read] = (await dated.client().readThread([workspace], fixtureThread.id)).turns;
+  const [old] = (await blank.client().readThread([workspace], fixtureThread.id)).turns;
+  assert.equal(read.id, priorTurn.id);
+  assert.equal(read.startedAt, '2025-10-09T08:53:20.000Z');
+  assert.equal(read.completedAt, '2025-10-09T08:53:21.000Z');
+  assert.equal(Object.hasOwn(old, 'startedAt'), false);
+  assert.equal(Object.hasOwn(old, 'completedAt'), false);
 });
 
 test('Codex adding this client to a different active turn does not confer ownership of that turn', async t => {
