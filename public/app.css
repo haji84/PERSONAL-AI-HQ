@@ -168,6 +168,8 @@ fieldset { min-width: 0; padding: 0; margin: 0; border: 0; }
 .message.user { justify-self: end; background: var(--active); }
 .message p, textarea { white-space: pre-wrap; overflow-wrap: anywhere; }
 .message p { margin-top: 3px; }
+.speech-control { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.speech-audio { width: min(100%, 310px); }
 .thread-meta { padding: 0 19px 13px; }
 .model-pickers { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
 .draft { width: 100%; min-height: 102px; padding: 10px 11px; resize: vertical; }

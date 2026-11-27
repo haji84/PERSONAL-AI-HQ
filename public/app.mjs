@@ -73,6 +73,7 @@ let pendingScroll;
 let activityTimer;
 let activityPollRunning = false;
 let activitySession;
+let activeSpeech;
 
 function storePreferences() {
   writeStorage(localStorage, prefsKey, {
@@ -228,6 +229,7 @@ function gate(title, description, canRetry) {
   dom['gate-retry'].hidden = !canRetry;
 }
 function endSession() {
+  stopSpeech();
   for (const stop of runViewCleanups) stop();
   clearTimeout(activityTimer);
   activities.clear();
@@ -690,6 +692,105 @@ function evictChats(project) {
     if (id === project && kind.startsWith('chat-')) resources.delete(key);
   }
 }
+function stopSpeech() {
+  const current = activeSpeech;
+  if (!current) return;
+  activeSpeech = null;
+  current.controller.abort();
+  current.audio.pause();
+  current.audio.removeAttribute('src');
+  current.audio.hidden = true;
+  if (current.url) URL.revokeObjectURL(current.url);
+  current.toggle.textContent = '読み上げ';
+  current.status.textContent = '';
+}
+function speechChunks(text) {
+  const speakable = text.replaceAll('[[', '[ [').replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/gu, ' ');
+  const chunks = [];
+  let current = '';
+  for (const character of speakable) {
+    if (current.length + character.length > 2000) {
+      if (current.trim()) chunks.push(current);
+      current = '';
+    }
+    current += character;
+  }
+  if (current.trim()) chunks.push(current);
+  return chunks;
+}
+function speechControls(project, text) {
+  const control = node('div', 'speech-control');
+  const status = node('span', 'small muted');
+  status.setAttribute('role', 'status');
+  const audio = node('audio', 'speech-audio');
+  audio.controls = true;
+  audio.preload = 'metadata';
+  audio.hidden = true;
+  audio.setAttribute('aria-label', '回答の音声');
+  const toggle = button('読み上げ', () => {
+    if (activeSpeech?.audio === audio) {
+      stopSpeech();
+      return;
+    }
+    const replacing = Boolean(activeSpeech);
+    stopSpeech();
+    const playback = {audio, status, toggle, controller: new AbortController(), chunks: speechChunks(text), next: 0, url: '', replacing};
+    activeSpeech = playback;
+    toggle.textContent = '読み上げを停止';
+    void nextSpeech(playback);
+  });
+  function isCurrent(playback) {
+    return activeSpeech === playback && control.isConnected && ui.project === project && ui.view === 'chat';
+  }
+  async function nextSpeech(playback) {
+    if (!isCurrent(playback)) return;
+    const content = playback.chunks[playback.next++];
+    if (content === undefined) { stopSpeech(); return; }
+    status.textContent = '音声を準備しています。';
+    audio.hidden = true;
+    try {
+      const request = () => fetch(apiPath('/api/chat/speech', {project}), {method: 'POST', cache: 'no-store', credentials: 'same-origin',
+        headers: {'Content-Type': 'application/json'}, body: JSON.stringify({text: content}), signal: playback.controller.signal});
+      let response = await request();
+      if (response.status === 409 && playback.replacing && isCurrent(playback)) {
+        playback.replacing = false;
+        await response.body?.cancel();
+        await new Promise(resolve => setTimeout(resolve, 200));
+        if (!isCurrent(playback)) return;
+        response = await request();
+      }
+      playback.replacing = false;
+      if (!isCurrent(playback)) return;
+      if (response.status === 401) { endSession(); return; }
+      if (!response.ok) {
+        const reason = await response.json().catch(() => null);
+        throw new Error(typeof reason?.error === 'string' ? reason.error : '読み上げの音声を取得できませんでした。');
+      }
+      const wave = await response.blob();
+      if (!isCurrent(playback)) return;
+      if (wave.type !== 'audio/wav' || !wave.size) throw new Error('音声形式を確認できませんでした。');
+      if (playback.url) URL.revokeObjectURL(playback.url);
+      playback.url = URL.createObjectURL(wave);
+      audio.src = playback.url;
+      audio.hidden = false;
+      status.textContent = '';
+      try { await audio.play(); }
+      catch { if (isCurrent(playback)) status.textContent = '音声の再生を押してください。'; }
+    } catch (error) {
+      if (!isCurrent(playback)) return;
+      stopSpeech();
+      status.textContent = error.message;
+    }
+  }
+  audio.addEventListener('ended', () => { if (activeSpeech?.audio === audio) void nextSpeech(activeSpeech); });
+  audio.addEventListener('error', () => {
+    if (activeSpeech?.audio !== audio) return;
+    stopSpeech();
+    status.textContent = '音声を再生できませんでした。';
+  });
+  control.append(toggle, status, audio);
+  return control;
+}
 function messageBubble(item) {
   const user = item.role === 'user';
   const box = node('div', 'message' + (user ? ' user' : ''));
@@ -701,6 +802,9 @@ function messageBubble(item) {
     original.tabIndex = 0;
     reference.append(node('summary', '', item.reference.name), original);
     box.append(reference);
+  }
+  if (!user && ui.view === 'chat' && ui.capabilities.localSpeech === true && typeof item.text === 'string' && item.text.trim()) {
+    box.append(speechControls(ui.project, item.text));
   }
   return box;
 }
@@ -1049,6 +1153,7 @@ function chat() {
     cleanupAdvice = advice.cleanup;
   }
   function showChatDetails() {
+    stopSpeech();
     cleanupHandoff?.();
     cleanupHandoff = undefined;
     const id = ui.chatIds.get(project);
@@ -2119,6 +2224,7 @@ function emptyProject() {
 const screens = {dashboard, chat, codex, artifacts};
 function render(restore = true) {
   if (dom.shell.hidden) return;
+  stopSpeech();
   for (const stop of runViewCleanups) stop();
   mounted++;
   const intended = ui.scroll.get(routeKey());

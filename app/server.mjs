@@ -17,6 +17,7 @@ import {createPlanAuth, PLAN_AUTH_CALLBACK_PATH} from './chatgpt-plan-auth.mjs';
 import {createChatGPTResponses} from './chatgpt-responses.mjs';
 import {ensurePrivateDirectory} from './private-directory.mjs';
 import {createApiDevelopment} from './api-development.mjs';
+import {localSpeechAvailable, localSpeechMaxChars, synthesizeLocalSpeech} from './local-speech.mjs';
 
 const root = fileURLToPath(new URL('../public/', import.meta.url));
 const assets = new Map([['/', ['index.html', 'text/html']], ['/app.mjs', ['app.mjs', 'text/javascript']],
@@ -24,7 +25,7 @@ const assets = new Map([['/', ['index.html', 'text/html']], ['/app.mjs', ['app.m
 const defaultRuntime = process.platform === 'win32'
   ? join(process.env.LOCALAPPDATA ?? join(homedir(), 'AppData', 'Local'), 'PersonalAIHQ', 'integration')
   : join(homedir(), 'Library', 'Application Support', 'Personal AI HQ', 'integration');
-const browserPolicy = "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
+const browserPolicy = "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; media-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 const sessionAge = 8 * 60 * 60;
 const error = (status, message) => Object.assign(new Error(message), {status});
 const apiMessages = {
@@ -133,7 +134,7 @@ async function checkedSocket(socket) {
   return target;
 }
 
-export async function startOwnerApp({directory = defaultRuntime, port = 4328, socket, codex, plan, apiDevelopment = false} = {}) {
+export async function startOwnerApp({directory = defaultRuntime, port = 4328, socket, codex, plan, apiDevelopment = false, speech} = {}) {
   directory = resolve(directory);
   await ensurePrivateDirectory(directory);
   const native = codex ?? createCodexClient({socket: await checkedSocket(socket)});
@@ -154,7 +155,9 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
     const auth = createPlanAuth({directory});
     plan = {auth, responses: createChatGPTResponses({auth})};
   }
+  const speechService = speech ?? {available: localSpeechAvailable, synthesize: (text, options) => synthesizeLocalSpeech(directory, text, options)};
   const liveRequests = new Set();
+  let speechTask;
   let key = randomBytes(32).toString('hex');
   let session = '';
   let expires = 0;
@@ -232,6 +235,34 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
     }
   }
 
+  async function speak(input, response) {
+    if (typeof input?.text !== 'string' || !input.text.trim() || input.text.length > localSpeechMaxChars || Object.keys(input).length !== 1) {
+      throw error(400, '読み上げる文字を確認してください。');
+    }
+    if (!await speechService.available()) throw error(503, 'この端末の日本語読み上げを利用できません。');
+    const previous = speechTask;
+    if (previous?.controller.signal.aborted) await previous.pending.catch(() => {});
+    if (response.destroyed || closing) return;
+    if (speechTask && (speechTask !== previous || !speechTask.controller.signal.aborted)) {
+      throw error(409, '先に開始した読み上げを準備しています。');
+    }
+    const controller = new AbortController();
+    const cancel = () => controller.abort();
+    response.once('close', cancel);
+    const pending = Promise.resolve().then(() => speechService.synthesize(input.text, {signal: controller.signal}));
+    const task = {controller, pending};
+    speechTask = task;
+    try {
+      const audio = await pending;
+      if (response.destroyed || controller.signal.aborted) return;
+      response.writeHead(200, {'Content-Type': 'audio/wav', 'Content-Length': audio.byteLength});
+      response.end(audio);
+    } finally {
+      response.off('close', cancel);
+      if (speechTask === task) speechTask = null;
+    }
+  }
+
   async function respond(request, response) {
     response.setHeader('Cache-Control', 'no-store');
     response.setHeader('X-Content-Type-Options', 'nosniff');
@@ -265,7 +296,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
         await Promise.resolve(native.subscriptionReady?.()).catch(() => false) === true;
       return send(response, 200, {authenticated, capabilities: {chatImport: true, codexWrite: enabled,
         executionSettings: authenticated, executionActivity: authenticated, chatgptPlan: authenticated && Boolean(plan),
-        apiDevelopment: authenticated && apiEnabled}});
+        apiDevelopment: authenticated && apiEnabled, localSpeech: authenticated && await speechService.available()}});
     }
     if (post && route === '/api/session') {
       if (!['null', url].includes(request.headers.origin)) throw error(403, 'ログイン元を確認できません。');
@@ -386,6 +417,10 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       if (get) return send(response, 200, {turn: chats.readLive(project.id, target.searchParams.get('id'))});
       if (post) return liveChat(project, await jsonBody(request, 64000), response);
     }
+    if (post && route === '/api/chat/speech') {
+      if (target.searchParams.getAll('project').length !== 1) throw error(404, '案件を指定してください。');
+      return speak(await jsonBody(request, 16384), response);
+    }
     if (post && route === '/api/chat/import') {
       const result = chats.import(project.id, await jsonBody(request, 16 * 1024 ** 2));
       if (!result) throw error(400, 'ChatGPTの書き出しから conversations.json を選んでください。');
@@ -404,6 +439,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
 
   const server = http.createServer({requestTimeout: 30000, headersTimeout: 10000, maxHeaderSize: 8192}, (request, response) => {
     respond(request, response).catch(problem => {
+      if (response.destroyed) return;
       if (response.headersSent) { response.destroy(); return; }
       const status = typeof problem?.status === 'number' ? problem.status : 500;
       send(response, status, {error: status === 500 ? '状態を読み取れませんでした。' : apiMessages[problem.code] ?? problem.message,
@@ -413,6 +449,8 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
   async function close() {
     closing ??= (async () => {
       for (const controller of liveRequests) controller.abort();
+      speechTask?.controller.abort();
+      await speechTask?.pending.catch(() => {});
       await apiWork.close();
       await new Promise(done => server.close(done));
       operations.close();

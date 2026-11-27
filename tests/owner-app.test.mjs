@@ -88,6 +88,102 @@ test('owner credentials are one-use and private API calls never expose the works
   assert.equal(reads(), 1);
 });
 
+test('local speech runs only after an authenticated explicit request and returns uncached audio', {timeout: 15000}, async t => {
+  const {directory, start} = await runtimeFixture(t);
+  await writeFile(join(directory, 'portfolio.json'), JSON.stringify(seed), {mode: 0o600});
+  const requested = [];
+  let release;
+  let reached;
+  const starting = new Promise(resolve => { reached = resolve; });
+  const wav = Buffer.from('524946462400000057415645666d74201000000001000100803e0000007d0000020010006461746100000000', 'hex');
+  const app = await start({codex: {}, speech: {available: async () => true, async synthesize(text, {signal}) {
+    requested.push(text);
+    reached();
+    await new Promise(resolve => { release = resolve; });
+    assert.equal(signal.aborted, false);
+    return wav;
+  }}});
+  const path = '/api/chat/speech?project=example';
+  const request = (text, {cookie, origin = app.url, suffix = ''} = {}) => fetch(app.url + path + suffix, {
+    method: 'POST', headers: {Origin: origin, 'Content-Type': 'application/json', ...(cookie ? {cookie} : {})},
+    body: JSON.stringify({text}),
+  });
+  assert.equal((await request('認証なし')).status, 401);
+  const cookie = await login(app);
+  const {capabilities} = await (await fetch(app.url + '/api/session', {headers: {cookie}})).json();
+  assert.equal(capabilities.localSpeech, true);
+  assert.equal((await fetch(app.url + path, {headers: {cookie}})).status, 404);
+  assert.equal((await request('別のサイト', {cookie, origin: 'https://example.invalid'})).status, 403);
+  assert.equal((await request('対象が曖昧', {cookie, suffix: '&project=example'})).status, 404);
+  assert.equal((await request(' ', {cookie})).status, 400);
+  assert.equal((await request('音'.repeat(2001), {cookie})).status, 400);
+  assert.equal(requested.length, 0);
+  const phrase = '保存した回答を読み上げます。';
+  const speaking = request(phrase, {cookie});
+  await starting;
+  try {
+    assert.equal((await request('重複読み上げ', {cookie})).status, 409);
+  } finally { release(); }
+  const response = await speaking;
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('content-type'), 'audio/wav');
+  assert.equal(response.headers.get('cache-control'), 'no-store');
+  assert.deepEqual(Buffer.from(await response.arrayBuffer()), wav);
+  assert.deepEqual(requested, [phrase]);
+});
+
+test('a new speech request waits for an aborted request to release its workspace', {timeout: 15000}, async t => {
+  const {directory, start} = await runtimeFixture(t);
+  await writeFile(join(directory, 'portfolio.json'), JSON.stringify(seed), {mode: 0o600});
+  let began;
+  let closed;
+  let checked;
+  let release;
+  let checks = 0;
+  const oldStarted = new Promise(resolve => { began = resolve; });
+  const oldAborted = new Promise(resolve => { closed = resolve; });
+  const nextChecked = new Promise(resolve => { checked = resolve; });
+  const cleanup = new Promise(resolve => { release = resolve; });
+  const heard = [];
+  const app = await start({codex: {}, speech: {
+    async available() { if (++checks === 2) checked(); return true; },
+    async synthesize(text, {signal}) {
+      heard.push(text);
+      if (heard.length === 1) {
+        signal.addEventListener('abort', closed, {once: true});
+        began();
+        await cleanup;
+        signal.throwIfAborted();
+      }
+      return Buffer.from('fixture audio');
+    },
+  }});
+  const cookie = await login(app);
+  const url = app.url + '/api/chat/speech?project=example';
+  const request = (text, signal) => fetch(url, {method: 'POST', headers: {cookie, Origin: app.url, 'Content-Type': 'application/json'},
+    body: JSON.stringify({text}), signal});
+  const controller = new AbortController();
+  const canceled = assert.rejects(request('最初の回答', controller.signal), {name: 'AbortError'});
+  try {
+    await oldStarted;
+    controller.abort();
+    await oldAborted;
+    const later = request('次の回答');
+    await nextChecked;
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(heard, ['最初の回答']);
+    release();
+    const result = await later;
+    assert.equal(result.status, 200);
+    assert.equal(await result.text(), 'fixture audio');
+  } finally {
+    controller.abort();
+    release();
+    await canceled;
+  }
+  assert.deepEqual(heard, ['最初の回答', '次の回答']);
+});
+
 test('execution activity is owner-scoped and returns only status metadata', async t => {
   const {app, directory, reads} = await fixture(t);
   const observedAt = '2026-01-01T00:00:00.000Z';
