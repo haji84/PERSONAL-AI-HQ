@@ -2,7 +2,7 @@
 // browser input, an AI assertion, or this function alone cannot authorize dispatch.
 export const ROUTES = Object.freeze(['api', 'subscription']);
 export const MODES = Object.freeze(['api-only', 'subscription-only', 'auto', 'hybrid']);
-const STAGES = ['consultation', 'design', 'implementation', 'test', 'verification', 'review', 'delivery'];
+export const STAGES = Object.freeze(['consultation', 'design', 'implementation', 'test', 'verification', 'review', 'delivery']);
 const FIELDS = ['mode', 'allowedRoutes', 'preference', 'allowFallback', 'model', 'reasoningEffort', 'apiBudgetUsd', 'stageRoutes'];
 const own = (value, key) => Object.hasOwn(value, key);
 const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);

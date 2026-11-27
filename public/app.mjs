@@ -4,6 +4,8 @@ const pages = {
   codex: 'Codex',
   artifacts: '成果物',
 };
+const workStageLabels = {consultation: '相談', design: '設計', implementation: '実装', test: 'テスト',
+  verification: '実機検証', review: 'レビュー', delivery: '納品'};
 const stateLabels = {
   active: '稼働中', running: '稼働中', inprogress: '稼働中', 'in-progress': '稼働中',
   implementing: '開発中', development: '開発中', developing: '開発中', investigating: '調査中', researching: '調査中', designing: '設計中',
@@ -97,6 +99,18 @@ function button(text, handler, secondary = true) {
   element.addEventListener('click', handler);
   return element;
 }
+function labeledSelect(label, options) {
+  const field = node('label', 'picker');
+  const input = node('select');
+  input.setAttribute('aria-label', label);
+  for (const [value, name] of Object.entries(options)) {
+    const option = node('option', '', name);
+    option.value = value;
+    input.append(option);
+  }
+  field.append(node('span', '', label), input);
+  return {field, input};
+}
 function safeUrl(value, local = false) {
   if (typeof value !== 'string' || value.length > 4096) return null;
   try {
@@ -188,6 +202,7 @@ function changeView() {
   if (next === ui.view) return;
   rememberScroll();
   ui.view = next;
+  if (next === 'dashboard') resources.delete(memoryKey('usage'));
   render();
 }
 function setTheme() {
@@ -305,7 +320,9 @@ async function api(path, options = {}) {
   catch { throw new Error('通信できませんでした。接続してから更新してください。'); }
   if (response.status === 401) endSession();
   if (!response.ok) {
-    const error = new Error(httpMessages[response.status] ?? '読み込みに失敗しました。');
+    const problem = await response.json().catch(() => null);
+    const message = typeof problem?.error === 'string' && problem.error.length <= 240 ? problem.error : '';
+    const error = new Error(message || httpMessages[response.status] || '読み込みに失敗しました。');
     error.status = response.status;
     throw error;
   }
@@ -411,20 +428,8 @@ function executionSettings(project) {
       let current = initial;
       const values = {'subscription-only': 'サブスク専用', 'api-only': 'API専用', auto: '自動選択', hybrid: '工程ごとに指定'};
       const routes = {subscription: 'サブスク', api: 'API'};
-      function select(label, options) {
-        const field = node('label', 'picker');
-        const input = node('select');
-        input.setAttribute('aria-label', label);
-        for (const [value, label] of Object.entries(options)) {
-          const option = node('option', '', label);
-          option.value = value;
-          input.append(option);
-        }
-        field.append(node('span', '', label), input);
-        return {field, input};
-      }
-      const mode = select('実行モード', values);
-      const preference = select('自動選択の優先順', {'subscription-first': 'サブスク優先', 'api-first': 'API優先', balanced: '実測をもとに選択'});
+      const mode = labeledSelect('実行モード', values);
+      const preference = labeledSelect('自動選択の優先順', {'subscription-first': 'サブスク優先', 'api-first': 'API優先', balanced: '実測をもとに選択'});
       const fallback = node('label', 'picker');
       const consent = node('input');
       consent.type = 'checkbox';
@@ -436,9 +441,8 @@ function executionSettings(project) {
       amount.step = '0.01';
       budget.append(node('span', '', 'API作業上限（USD）'), amount);
       const stages = node('div', 'stack');
-      const choices = Object.entries({consultation: '相談', design: '設計', implementation: '実装', test: 'テスト',
-        verification: '実機検証', review: 'レビュー', delivery: '納品'}).map(([stage, label]) => {
-        const entry = select(label, {'': '未指定', ...routes});
+      const choices = Object.entries(workStageLabels).map(([stage, label]) => {
+        const entry = labeledSelect(label, {'': '未指定', ...routes});
         stages.append(entry.field);
         return [stage, entry.input];
       });
@@ -527,6 +531,40 @@ function projectDetail() {
   if (ui.capabilities.executionSettings === true) detail.body.append(executionSettings(project.id));
   return detail.root;
 }
+function usagePanel() {
+  const area = panel('利用枠');
+  const subscription = node('div', 'stack');
+  area.body.append(node('h3', '', 'Codexの契約内利用枠'), subscription);
+  fetchView(memoryKey('usage'), '/api/usage', subscription, (result, output) => {
+    const observed = result?.subscription;
+    const windows = asArray(observed?.windows);
+    if (!windows.length) {
+      output.append(node('p', 'small muted', 'この端末のCodexから利用枠を取得できません。'));
+      return;
+    }
+    const facts = node('dl', 'properties');
+    for (const entry of windows) {
+      const duration = entry.durationMinutes;
+      const label = Number.isFinite(duration) && duration > 0
+        ? duration % 1440 === 0 ? `${duration / 1440}日枠` : duration % 60 === 0 ? `${duration / 60}時間枠` : `${duration}分枠`
+        : entry.label === 'primary' ? '主な利用枠' : '追加の利用枠';
+      if (Number.isFinite(entry.usedPercent)) metric(facts, label + 'の使用率', entry.usedPercent, true);
+      if (entry.resetsAt) metric(facts, label + 'のリセット', time(entry.resetsAt));
+    }
+    if (observed.ordinaryUsageAllowed === false) output.append(node('p', 'small muted', 'Codexの通常利用は制限中です。'));
+    output.append(facts, node('p', 'small muted', '観測 ' + time(observed.observedAt)));
+  }, () => ui.view === 'dashboard');
+  area.body.append(node('h3', '', '組織共通の別枠API特典'));
+  const api = ui.portfolio?.apiCreditObservation;
+  if (api) {
+    const facts = node('dl', 'properties');
+    const usd = new Intl.NumberFormat('ja-JP', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+    metric(facts, '公式画面で確認した残高', `${usd.format(api.balanceUsd)} USD`);
+    metric(facts, '付与分の期限', api.expiresOn);
+    area.body.append(facts, node('p', 'small muted', `${time(api.observedFrom)}〜${time(api.observedUntil)}の確認値`));
+  } else area.body.append(node('p', 'small muted', '公式画面での残高・期限の確認記録がありません。'));
+  return area.root;
+}
 function dashboard() {
   const groups = [
     ['全プロジェクト', () => true],
@@ -566,7 +604,7 @@ function dashboard() {
   projects.root.append(searchWrap, message, list);
   filterProjects(search.value);
   left.append(projects.root);
-  right.append(projectDetail());
+  right.append(projectDetail(), usagePanel());
 
   const devices = panel('実行端末');
   const rows = node('ul', 'rows');
@@ -1205,8 +1243,8 @@ function mountCodexRun(area, project, draft, draftKey, choices) {
       const path = apiPath('/api/codex/steer', {project, id: submit ? undefined : intent.id});
       const options = submit ? {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(intent)} : {};
       const {steering} = await api(path, {...options, signal: AbortSignal.timeout(14000)});
-      if (steering?.id === intent.id && steering.project === project && steering.operationId === intent.operationId &&
-          steering.phase === 'accepted') {
+      const matchesIntent = steering?.id === intent.id && steering.project === project && steering.operationId === intent.operationId;
+      if (matchesIntent && steering.phase === 'accepted') {
         ui.steerIntents.delete(project);
         if (draft.value.trim() === intent.prompt) {
           ui.drafts.delete(draftKey);
@@ -1214,6 +1252,10 @@ function mountCodexRun(area, project, draft, draftKey, choices) {
         }
         storeTab();
         run.steerMessage = '実行中の同じターンで追加指示が受理されました。';
+      } else if (matchesIntent && steering.phase === 'rejected') {
+        ui.steerIntents.delete(project);
+        storeTab();
+        run.steerMessage = '元のターンの状態が変わったため、追加指示を送信しませんでした。';
       } else run.steerMessage = '追加指示の受理をまだ確認できません。作業状態を照合できます。';
     } catch (error) {
       if (submit && [400, 403, 409, 413].includes(error.status)) {
@@ -1292,7 +1334,17 @@ function modelSettings() {
   const form = node('fieldset', 'model-pickers');
   area.body.append(form, node('h3', '', '下書き'), draftLabel);
   let runChoices = {};
-  if (canWrite) mountCodexRun(area, project, draft, draftKey, () => runChoices);
+  if (canWrite) {
+    const details = node('details', 'scope-info');
+    const fields = node('div', 'stack');
+    const route = labeledSelect('作業別の利用経路', {'': '案件設定を使う', subscription: 'サブスク', api: 'API'});
+    const stage = labeledSelect('作業の工程', {'': '標準設定を使う', ...workStageLabels});
+    fields.append(route.field, stage.field);
+    details.append(node('summary', '', 'この作業の経路を指定'), fields);
+    if (ui.capabilities.executionSettings === true) area.body.append(details);
+    mountCodexRun(area, project, draft, draftKey, () => ({...runChoices,
+      ...(route.input.value ? {route: route.input.value} : {}), ...(stage.input.value ? {stage: stage.input.value} : {})}));
+  }
   else {
     area.body.append(node('p', 'small muted draft-hint', '現在の接続では履歴を閲覧できます。下書きはこのタブに保存されます。'));
   }

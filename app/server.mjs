@@ -240,6 +240,10 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
     if (!authenticated) throw error(401, 'サインインが必要です。');
     if (!get && (!post || request.headers.origin !== url)) throw error(403, 'この画面から操作してください。');
     if (get && route === '/api/codex/models') return send(response, 200, await native.models());
+    if (get && route === '/api/usage') {
+      const subscription = await Promise.resolve(native.usage?.()).catch(() => null);
+      return send(response, 200, {subscription: subscription ?? null});
+    }
     if (get && route === '/api/chat/plan' && plan) return send(response, 200, await plan.auth.status());
     if (post && route === '/api/chat/plan/authorize' && plan) {
       try { return send(response, 200, {authorizationUrl: await plan.auth.begin(url, session)}); }

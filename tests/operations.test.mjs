@@ -109,7 +109,9 @@ test('steering is tied to the current turn and a retry never sends the instructi
     return {turn: {id: 'current-turn', status: 'inProgress'}};
   }, async steer(input) {
     additions++;
-    assert.deepEqual(input, {workspace, threadId: 'current-thread', turnId: 'current-turn',
+    const {beforeSend, ...details} = input;
+    beforeSend?.();
+    assert.deepEqual(details, {workspace, threadId: 'current-thread', turnId: 'current-turn',
       requestId: 'hq:steer:request-steer', prompt: 'An addition'});
     return 'current-turn';
   }});
@@ -125,6 +127,32 @@ test('steering is tied to the current turn and a retry never sends the instructi
   assert.deepEqual(await operations.readSteering(project, extra.id), first);
   await assert.rejects(operations.steer(project, {...extra, prompt: 'Changed'}), {status: 409});
   assert.equal(additions, 1);
+});
+
+test('an interrupt wins before a queued steer can send to the native turn', async t => {
+  const {project, open} = await fixture(t);
+  const waiting = Promise.withResolvers();
+  const proceed = Promise.withResolvers();
+  let dispatched = 0;
+  const operations = open({async submit(input) {
+    assert.equal(input.onThread('fixture-thread'), true);
+    return {turn: {id: 'fixture-turn', status: 'inProgress'}};
+  }, async steer(input) {
+    waiting.resolve();
+    await proceed.promise;
+    input.beforeSend?.();
+    dispatched++;
+    return 'fixture-turn';
+  }, async interrupt() {}});
+  const original = {id: 'request-to-stop', prompt: 'A fixture'};
+  await operations.start(project, original);
+  assert.equal((await operations.read(project, original.id)).operation.phase, 'running');
+  const steering = operations.steer(project, {id: 'queued-steering', operationId: original.id, prompt: 'A change'});
+  await waiting.promise;
+  assert.equal((await operations.interrupt(project, original.id)).operation.phase, 'interrupting');
+  proceed.resolve();
+  assert.equal((await steering).steering.phase, 'rejected');
+  assert.equal(dispatched, 0);
 });
 
 test('stale running activity is unconfirmed until exact native observation', async t => {

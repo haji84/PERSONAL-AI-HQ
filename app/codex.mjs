@@ -97,9 +97,10 @@ function openTransport(command, socket, onClose, onEvent) {
 
   return {
     send,
-    async call(method, params) {
+    async call(method, params, beforeSend) {
       await ready;
       if (closed || waiting.size >= 24) return Promise.reject(unavailable('Codexの接続が使用中です。'));
+      beforeSend?.();
       return new Promise((resolve, reject) => {
         const id = ++lastId;
         const timer = setTimeout(() => {
@@ -128,6 +129,24 @@ function plainMessages(content) {
     return item?.type === 'agentMessage' && typeof item.text === 'string'
       ? [{role: 'assistant', text: clean(item.text, 24000)}] : [];
   });
+}
+
+function usageView(result) {
+  const historical = result?.rateLimits;
+  const bucket = result?.rateLimitsByLimitId?.codex ??
+    (historical?.limitId == null || historical.limitId === 'codex' ? historical : null);
+  const windows = ['primary', 'secondary'].flatMap(label => {
+    const window = bucket?.[label];
+    if (!Number.isInteger(window?.usedPercent) || window.usedPercent < 0 || window.usedPercent > 100) return [];
+    const minutes = window.windowDurationMins;
+    return [{label, usedPercent: window.usedPercent,
+      durationMinutes: Number.isSafeInteger(minutes) && minutes > 0 ? minutes : null,
+      resetsAt: Number.isSafeInteger(window.resetsAt) ? iso(window.resetsAt) : null}];
+  });
+  const permission = result?.ordinaryUsageAllowed;
+  const ordinaryUsageAllowed = typeof permission === 'boolean' ? permission : null;
+  return {observedAt: windows.length || ordinaryUsageAllowed !== null ? new Date().toISOString() : null,
+    windows, ordinaryUsageAllowed};
 }
 
 export function createCodexClient({command = binary(), socket} = {}) {
@@ -175,22 +194,25 @@ export function createCodexClient({command = binary(), socket} = {}) {
       const rpc = await current();
       if (!await subscriptionReady(rpc)) throw unavailable('ChatGPTプランの認証を確認できません。');
       if (knownId) await scopedThread([workspace], knownId);
-      if (beforeThread && !beforeThread()) throw unavailable('送信権限を確認できませんでした。');
+      const beginThread = () => {
+        if (beforeThread && !beforeThread()) throw unavailable('送信権限を確認できませんでした。');
+      };
       const params = {cwd: workspace, modelProvider: 'openai', sandbox: 'workspace-write', approvalPolicy: 'never',
         ...(model ? {model} : {})};
       const result = knownId
-        ? await rpc.call('thread/resume', {...params, threadId: knownId, excludeTurns: true})
-        : await rpc.call('thread/start', params);
+        ? await rpc.call('thread/resume', {...params, threadId: knownId, excludeTurns: true}, beginThread)
+        : await rpc.call('thread/start', params, beginThread);
       const thread = result?.thread;
       if (!thread?.id || !threadId.test(thread.id) || thread.cwd !== workspace || thread.modelProvider !== 'openai' ||
           (knownId && thread.id !== knownId)) {
         throw unavailable('分離作業先をCodexで確認できませんでした。');
       }
-      if (onThread(thread.id) !== true) throw unavailable('送信権限を確認できませんでした。');
       const answer = await rpc.call('turn/start', {threadId: thread.id, clientUserMessageId: requestId,
         input: [{type: 'text', text: prompt, text_elements: []}], cwd: workspace, approvalPolicy: 'never',
         sandboxPolicy: {type: 'workspaceWrite', writableRoots: [workspace], networkAccess: false,
-          excludeTmpdirEnvVar: true, excludeSlashTmp: true}, ...(model ? {model} : {}), ...(effort ? {effort} : {})});
+          excludeTmpdirEnvVar: true, excludeSlashTmp: true}, ...(model ? {model} : {}), ...(effort ? {effort} : {})}, () => {
+        if (onThread(thread.id) !== true) throw unavailable('送信権限を確認できませんでした。');
+      });
       if (!answer?.turn?.id) throw unavailable('Codexの受理IDを確認できませんでした。');
       return {threadId: thread.id, turn: answer.turn};
     },
@@ -203,9 +225,8 @@ export function createCodexClient({command = binary(), socket} = {}) {
       if (thread.modelProvider !== 'openai' || !await subscriptionReady(rpc)) {
         throw unavailable('ChatGPTプランの実行中ターンを確認できません。');
       }
-      beforeSend?.();
       const result = await rpc.call('turn/steer', {threadId: id, expectedTurnId: turnId, clientUserMessageId: requestId,
-        input: [{type: 'text', text: prompt, text_elements: []}]});
+        input: [{type: 'text', text: prompt, text_elements: []}]}, beforeSend);
       return result?.turnId;
     },
     async listThreads(scope, cursor) {
@@ -245,6 +266,13 @@ export function createCodexClient({command = binary(), socket} = {}) {
         if (!cursor) break;
       }
       return false;
+    },
+    async usage() {
+      try {
+        const rpc = await current();
+        if (!await subscriptionReady(rpc)) return usageView(null);
+        return usageView(await rpc.call('account/rateLimits/read', {excludeResetCreditDetails: true}));
+      } catch { return usageView(null); }
     },
     async models() {
       const rpc = await current();

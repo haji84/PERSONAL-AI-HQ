@@ -10,6 +10,8 @@ import {ensurePrivateDirectory} from '../app/private-directory.mjs';
 const seed = {
   observedAt: '2026-11-27T06:25:00.000Z',
   projects: [{id: 'example', name: '検証用プロジェクト', state: 'unknown', goal: '帰属範囲の確認', cwd: resolve(tmpdir(), 'fixture-scope')}],
+  apiCreditObservation: {observedFrom: '2026-11-27T06:20:00.000Z', observedUntil: '2026-11-27T06:25:00.000Z',
+    expiresOn: '2026-12-19', balanceUsd: 10, internalReference: 'private-fixture'},
   artifacts: [],
 };
 
@@ -64,6 +66,9 @@ test('owner credentials are one-use and private API calls never expose the works
   const portfolio = await response.json();
   assert.equal(portfolio.projects[0].name, '検証用プロジェクト');
   assert.equal(portfolio.projects[0].cwd, undefined);
+  assert.equal(portfolio.apiCreditObservation.balanceUsd, 10);
+  assert.equal(portfolio.apiCreditObservation.internalReference, undefined);
+  assert.equal((await fetch(`${app.url}/api/usage`)).status, 401);
   assert.equal((await fetch(`${app.url}/api/codex/threads?project=other`, {headers: {cookie}})).status, 404);
   assert.equal((await fetch(`${app.url}/api/codex/threads?project=example`, {headers: {cookie}})).status, 200);
   assert.equal(reads(), 1);
@@ -159,9 +164,13 @@ test('project execution settings block native dispatch in API-only mode and stay
   assert.equal(apiOnly.status, 200);
   const task = {id: 'task-policy-check', prompt: 'A fixture'};
   assert.equal((await call('/api/codex/run', task)).status, 409);
+  assert.equal((await call('/api/codex/run', {...task, route: 'subscription'})).status, 409);
   assert.equal(submits, 0);
-  assert.equal((await call(settings, {revision: 1, settings: {mode: 'subscription-only'}})).status, 200);
-  assert.equal((await call('/api/codex/run', task)).status, 202);
+  assert.equal((await call(settings, {revision: 1, settings: {mode: 'hybrid', stageRoutes: {design: 'api'}}})).status, 200);
+  assert.equal((await call('/api/codex/run', {...task, stage: 'design'})).status, 409);
+  const override = await call('/api/codex/run', {...task, stage: 'design', route: 'subscription'});
+  assert.equal(override.status, 202);
+  assert.equal((await override.json()).operation.stage, 'design');
   assert.equal(submits, 1);
   assert.equal((await call(settings, {revision: 2, settings: {mode: 'api-only'}})).status, 409);
   project.state = 'paused';

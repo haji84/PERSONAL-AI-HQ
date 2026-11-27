@@ -2,6 +2,7 @@ import {createHash} from 'node:crypto';
 import {lstat, readFile, realpath} from 'node:fs/promises';
 import {join} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
+import {ROUTES, STAGES} from './execution-policy.mjs';
 
 const active = new Set(['reserved', 'sending', 'running', 'interrupting', 'unconfirmed']);
 const terminal = new Set(['completed', 'interrupted', 'failed']);
@@ -19,6 +20,7 @@ export function createOperations(directory, native, execution) {
       id TEXT NOT NULL, project TEXT NOT NULL, workspace TEXT NOT NULL, fingerprint TEXT NOT NULL,
       phase TEXT NOT NULL, threadId TEXT, turnId TEXT, createdAt TEXT NOT NULL,
       updatedAt TEXT NOT NULL, startedAt TEXT, output TEXT NOT NULL DEFAULT '',
+      stage TEXT NOT NULL DEFAULT 'implementation', explicitRoute TEXT,
       PRIMARY KEY(project,id)
     );
     CREATE UNIQUE INDEX IF NOT EXISTS one_active_operation ON codex_operations(project)
@@ -27,6 +29,13 @@ export function createOperations(directory, native, execution) {
       project TEXT NOT NULL, id TEXT NOT NULL, operationId TEXT NOT NULL, turnId TEXT NOT NULL,
       fingerprint TEXT NOT NULL, phase TEXT NOT NULL, updatedAt TEXT NOT NULL, PRIMARY KEY(project,id)
     );`);
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const columns = db.prepare('PRAGMA table_info(codex_operations)').all().map(column => column.name);
+    if (!columns.includes('stage')) db.exec("ALTER TABLE codex_operations ADD COLUMN stage TEXT NOT NULL DEFAULT 'implementation'");
+    if (!columns.includes('explicitRoute')) db.exec('ALTER TABLE codex_operations ADD COLUMN explicitRoute TEXT');
+    db.exec('COMMIT');
+  } catch (error) { db.exec('ROLLBACK'); db.close(); throw error; }
   const byId = db.prepare('SELECT * FROM codex_operations WHERE project=? AND id=?');
   const latest = db.prepare('SELECT * FROM codex_operations WHERE project=? ORDER BY createdAt DESC LIMIT 1');
   const latestScoped = db.prepare(`SELECT id, project, workspace, phase, threadId, turnId, createdAt, updatedAt, startedAt
@@ -37,8 +46,8 @@ export function createOperations(directory, native, execution) {
   const byClientId = db.prepare(`SELECT * FROM codex_operations WHERE threadId=? AND id=? AND turnId IS NULL
     AND phase IN ('sending','unconfirmed') LIMIT 1`);
   const byTurn = db.prepare('SELECT * FROM codex_operations WHERE threadId=? AND turnId=? LIMIT 1');
-  const insert = db.prepare(`INSERT INTO codex_operations(project,id,workspace,fingerprint,phase,createdAt,updatedAt)
-    VALUES (?,?,?,?,'reserved',?,?)`);
+  const insert = db.prepare(`INSERT INTO codex_operations(project,id,workspace,fingerprint,phase,createdAt,updatedAt,stage,explicitRoute)
+    VALUES (?,?,?,?,'reserved',?,?,?,?)`);
   const setThread = db.prepare(`UPDATE codex_operations SET threadId=?,phase='sending',updatedAt=? WHERE project=? AND id=? AND phase='reserved'`);
   const expireReservation = db.prepare(`UPDATE codex_operations SET phase='failed',updatedAt=?
     WHERE project=? AND id=? AND phase='reserved' AND threadId IS NULL AND updatedAt<=?`);
@@ -165,7 +174,9 @@ export function createOperations(directory, native, execution) {
           typeof input.prompt !== 'string' || !input.prompt.trim() || input.prompt.length > 16000 ||
           (input.model !== undefined && typeof input.model !== 'string') ||
           (input.effort !== undefined && typeof input.effort !== 'string') ||
-          (input.resume !== undefined && typeof input.resume !== 'string')) {
+          (input.resume !== undefined && typeof input.resume !== 'string') ||
+          (input.route !== undefined && !ROUTES.includes(input.route)) ||
+          (input.stage !== undefined && !STAGES.includes(input.stage))) {
         throw problem(400, '有効な指示を入力してください。');
       }
       const previous = input.resume ? byId.get(project.id, input.resume) : null;
@@ -173,7 +184,8 @@ export function createOperations(directory, native, execution) {
       if (input.resume && (!previous?.threadId || !previous.turnId || !terminal.has(previous.phase) || previous.workspace !== expected)) {
         throw problem(409, 'この作業を同じCodexスレッドで続けられません。');
       }
-      const digest = createHash('sha256').update(JSON.stringify([input.prompt, input.model, input.effort, input.resume])).digest('hex');
+      const choice = input.stage || input.route ? [input.stage, input.route] : [];
+      const digest = createHash('sha256').update(JSON.stringify([input.prompt, input.model, input.effort, input.resume, ...choice])).digest('hex');
       const duplicate = () => {
         const row = byId.get(project.id, input.id);
         if (row && (row.fingerprint !== digest || row.workspace !== expected)) throw problem(409, '送信IDが別の指示に使われています。');
@@ -181,12 +193,14 @@ export function createOperations(directory, native, execution) {
       };
       let row = duplicate();
       if (row) return {operation: response(row)};
-      execution?.preflight(project, 'implementation');
+      const stage = input.stage ?? previous?.stage ?? 'implementation';
+      const route = input.route ?? previous?.explicitRoute ?? null;
+      execution?.preflight(project, stage, expected, route);
       if (!await native.subscriptionReady?.()) throw problem(403, 'ChatGPTプランの認証を確認できないため、実行していません。');
-      const selection = execution ? await execution.authorize(project, {stage: 'implementation', model: input.model, effort: input.effort})
+      const selection = execution ? await execution.authorize(project, {stage, route, model: input.model, effort: input.effort})
         : {model: input.model, effort: input.effort};
       if (!execution) await configureModel(selection.model, selection.effort);
-      try { insert.run(project.id, input.id, expected, digest, timestamp(), timestamp()); }
+      try { insert.run(project.id, input.id, expected, digest, timestamp(), timestamp(), stage, route); }
       catch (error) {
         row = duplicate();
         if (row) return {operation: response(row)};
@@ -194,7 +208,7 @@ export function createOperations(directory, native, execution) {
         throw error;
       }
       row = byId.get(project.id, input.id);
-      const maySubmit = () => !closed && (!execution || execution.isCurrent(project, selection.revision, 'implementation', expected));
+      const maySubmit = () => !closed && (!execution || execution.isCurrent(project, selection.revision, stage, expected, route));
       void native.submit({workspace: expected, prompt: input.prompt, knownId: previous?.threadId,
         model: selection.model, effort: selection.effort, requestId: input.id,
         beforeThread: maySubmit, onThread: id => maySubmit() && setThread.run(id, timestamp(), project.id, input.id).changes === 1,
@@ -228,7 +242,7 @@ export function createOperations(directory, native, execution) {
       const steering = steeringById.get(project.id, id);
       const run = steering && byId.get(project.id, steering.operationId);
       if (!run || !project.cwd.includes(run.workspace)) return steeringResponse(null);
-      if (steering.phase === 'accepted' || Date.now() - Date.parse(steering.updatedAt) < 15000) return steeringResponse(steering);
+      if (['accepted', 'rejected'].includes(steering.phase) || Date.now() - Date.parse(steering.updatedAt) < 15000) return steeringResponse(steering);
       try {
         const exact = await native.hasTurnMessage(run.workspace, run.threadId, steering.turnId, steerClientId(id));
         if (!closed && exact) resolveSteering.run('accepted', timestamp(), project.id, id);
@@ -251,7 +265,18 @@ export function createOperations(directory, native, execution) {
       };
       const existing = previous();
       if (existing) return steeringResponse(existing);
-      execution?.preflight(project, 'implementation', workspace);
+      const target = byId.get(project.id, input.operationId);
+      if (!target?.threadId || !target.turnId || target.phase !== 'running' || target.workspace !== workspace) {
+        throw problem(409, '追加指示の対象のターンは実行中と確認できません。');
+      }
+      const maySteer = () => {
+        const current = !closed && byId.get(project.id, input.operationId);
+        if (current?.phase !== 'running' || current.workspace !== workspace || current.threadId !== target.threadId || current.turnId !== target.turnId) {
+          throw problem(409, '元のCodexターンが中断されたか、実行状態が変わりました。');
+        }
+        execution?.preflight(project, target.stage, workspace, target.explicitRoute);
+      };
+      maySteer();
       if (!await native.subscriptionReady?.()) throw problem(403, 'ChatGPTプランの認証を確認できないため、実行していません。');
       const concurrent = previous();
       if (concurrent) return steeringResponse(concurrent);
@@ -259,17 +284,21 @@ export function createOperations(directory, native, execution) {
       if (!run?.threadId || !run.turnId || run.phase !== 'running' || run.workspace !== workspace) {
         throw problem(409, '追加指示の対象のターンは実行中と確認できません。');
       }
-      execution?.preflight(project, 'implementation', workspace);
+      maySteer();
       if (!reserveSteering.run(project.id, input.id, run.id, run.turnId, digest, timestamp()).changes) {
         return steeringResponse(previous());
       }
-      let accepted = false;
+      let outcome = 'unconfirmed';
       try {
-        accepted = (await native.steer({workspace, threadId: run.threadId, turnId: run.turnId, requestId: steerClientId(input.id),
-          prompt: input.prompt, ...(execution ? {beforeSend: () => execution.preflight(project, 'implementation', workspace)} : {})})) === run.turnId;
+        const sentTurn = await native.steer({workspace, threadId: run.threadId, turnId: run.turnId, requestId: steerClientId(input.id),
+          prompt: input.prompt, beforeSend: () => {
+            try { maySteer(); }
+            catch (error) { outcome = 'rejected'; throw error; }
+          }});
+        if (sentTurn === run.turnId) outcome = 'accepted';
       } catch {}
       if (closed) return steeringResponse(null);
-      resolveSteering.run(accepted ? 'accepted' : 'unconfirmed', timestamp(), project.id, input.id);
+      resolveSteering.run(outcome, timestamp(), project.id, input.id);
       return steeringResponse(steeringById.get(project.id, input.id));
     },
     close() { closed = true; unsubscribe?.(); db.close(); },

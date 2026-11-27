@@ -28,6 +28,16 @@ function evidence(rows) {
   });
 }
 
+function apiCreditObservation(value) {
+  const observedFrom = date(value?.observedFrom);
+  const observedUntil = date(value?.observedUntil);
+  const balanceUsd = count(value?.balanceUsd);
+  if (!observedFrom || !observedUntil || Date.parse(observedUntil) < Date.parse(observedFrom) || balanceUsd === null ||
+      typeof value.expiresOn !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value.expiresOn) ||
+      !Number.isFinite(Date.parse(value.expiresOn))) return null;
+  return {balanceUsd, observedFrom, observedUntil, expiresOn: value.expiresOn};
+}
+
 function normalizeProject(row, observedAt) {
   const {id} = row;
   const name = text(row.name, 100);
@@ -106,7 +116,7 @@ export async function readPortfolio(directory) {
   return {
     projects: byId,
     artifacts: new Map(artifacts.map(row => [row.id, row])),
-    view: {observedAt, limits: scope, devices,
+    view: {observedAt, limits: scope, devices, apiCreditObservation: apiCreditObservation(raw.apiCreditObservation),
       projects: projects.map(({cwd, ...project}) => project),
       artifacts: artifacts.map(({file, ...artifact}) => artifact)},
   };

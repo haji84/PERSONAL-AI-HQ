@@ -9,16 +9,18 @@ const problem = (status, message) => Object.assign(new Error(message), {status})
 export function createExecutionAccess(directory, native) {
   const store = new ExecutionStore(join(directory, 'execution-policy.json'), {authorityId: 'personal-ai-hq-local'});
 
-  function preflight(project, stage, workspace) {
+  function preflight(project, stage, workspace, route) {
     const latest = readCurrentProject(directory, project.id);
     if (!latest || held.has(latest.state)) throw problem(409, '案件の既存の停止条件が解除されていません。');
-    if (stage === 'implementation' && (!latest.codexWrite || workspace && !latest.cwd.includes(workspace))) {
+    if (workspace && (!latest.codexWrite || !latest.cwd.includes(workspace))) {
       throw problem(409, 'この案件の実行先の設定が変わりました。');
     }
     const snapshot = store.getSettings(project.id);
     const {settings} = snapshot;
-    if (settings.mode === 'api-only' || settings.mode === 'hybrid' && settings.stageRoutes[stage] === 'api' ||
-        settings.mode === 'auto' && settings.preference === 'api-first' && !settings.allowFallback) {
+    if (route && !settings.allowedRoutes.includes(route)) throw problem(409, 'この作業の指定経路は案件設定で許可されていません。');
+    const apiFirst = settings.mode === 'api-only' || settings.mode === 'hybrid' && settings.stageRoutes[stage] === 'api' ||
+      settings.mode === 'auto' && settings.preference === 'api-first' && !settings.allowFallback;
+    if (route === 'api' || (!route && apiFirst)) {
       throw problem(409, 'この作業に指定されたAPI実行経路は利用できません。');
     }
     return snapshot;
@@ -44,12 +46,12 @@ export function createExecutionAccess(directory, native) {
         throw error;
       }
     },
-    async authorize(project, {stage, model, effort, catalog}) {
-      const {settings, revision} = preflight(project, stage);
+    async authorize(project, {stage, route, model, effort, catalog}) {
+      const {settings, revision} = preflight(project, stage, undefined, route);
       // Only the verified subscription provider is currently connected to this server.
       const observed = catalog ?? await native.models();
       const defaultModel = observed.data.find(item => item.isDefault);
-      const chosen = resolveExecution({settings, task: {stage, ...(model ? {model} : {}),
+      const chosen = resolveExecution({settings, task: {stage, ...(route ? {route} : {}), ...(model ? {model} : {}),
         ...(effort ? {reasoningEffort: effort} : {})}, safety: {authorized: true, status: 'ready', allowedRoutes: ['subscription']},
       capabilities: {api: {available: false}, subscription: {available: observed.accountType === 'chatgpt',
         authMode: observed.accountType, defaultModel: defaultModel?.id,
@@ -64,6 +66,6 @@ export function createExecutionAccess(directory, native) {
       }
       return {model: chosen.model, effort: chosen.reasoningEffort ?? undefined, revision};
     },
-    isCurrent(project, revision, stage, workspace) { return preflight(project, stage, workspace).revision === revision; },
+    isCurrent(project, revision, stage, workspace, route) { return preflight(project, stage, workspace, route).revision === revision; },
   };
 }

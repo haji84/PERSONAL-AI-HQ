@@ -70,9 +70,11 @@ try {
   assert.equal((await call('/api/session')).capabilities.codexWrite, true);
   const id = randomUUID();
   const instructions = 'This is a controlled Personal AI HQ integration check. In this workspace only, create proof.txt with exactly the single line HQ_NATIVE_WRITE_OK followed by a newline, then wait for 12 seconds using the shell sleep command before the final response. If a separate instruction arrives during this turn, also perform that instruction in this workspace. Do not contact the network or delegate. Reply HQ_NATIVE_RESPONSE_OK and stop.';
-  const data = {id, prompt: instructions};
+  const data = {id, prompt: instructions, stage: 'test', route: 'subscription'};
   const [first, duplicate] = await Promise.all([call(operationPath, data), call(operationPath, data)]);
   assert.equal(first.operation.id, duplicate.operation.id);
+  assert.equal(first.operation.stage, 'test');
+  assert.equal(first.operation.explicitRoute, 'subscription');
   const running = await observe(id, ['running'], 45000);
   const steeringId = randomUUID();
   const newInstruction = {id: steeringId, operationId: id,
@@ -100,6 +102,7 @@ try {
   assert.equal(written.toString(), 'HQ_NATIVE_WRITE_OK\n');
   assert.equal(await readFile(join(workspace, 'steered.txt'), 'utf8'), 'HQ_NATIVE_STEER_OK\n');
   console.log(JSON.stringify({stage: 'write', completed: complete.phase, duplicateSameId: true,
+    scopedWorkStageAndRouteApplied: true,
     gatewayRestart: true, continuedThroughRestart: true, nativeHistoryClientIdMatched: true,
     sameTurnSteerAccepted: true, duplicateSteerSuppressed: true, steeredArtifactVerified: true,
     verifiedOutputSha256: createHash('sha256').update(written).digest('hex')}));
