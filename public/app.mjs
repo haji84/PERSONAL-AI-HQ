@@ -1243,11 +1243,17 @@ function projectForecastPanel(project) {
   details.append(facts);
   const source=forecast.source && link(forecast.source.label,forecast.source.url);
   if (source) details.append(source);
+  else if (forecast.source?.revision) {
+    details.append(node('p','small muted',forecast.source.label+' · '+forecast.source.revision.slice(0,12)));
+  }
   const expanded=node('details','scope-info forecast-details');
   expanded.append(node('summary','','残工程・見積もりの根拠'));
   const timings=node('dl','properties');
   const original=baseline.original??baseline.retrospective;
-  if (original?.minutes) metric(timings,baseline.kind==='retrospective'?'開始後の事後推定':'開始時の見積もり',estimateLabel(original.minutes));
+  const originalLabel=baseline.kind==='retrospective'?'開始後の事後推定':'開始時の見積もり';
+  if (original?.minutes && original.target!=='requirements-readback') metric(timings,originalLabel,estimateLabel(original.minutes));
+  const intake=baseline.intake??(original?.target==='requirements-readback'?original:null);
+  if (intake?.minutes) metric(timings,'登録時の要件確認の見積もり',estimateLabel(intake.minutes));
   if (original?.basis) metric(timings,'見積もりの根拠',original.basis);
   if (baseline.revisionReason) metric(timings,'見積もりの変更理由',baseline.revisionReason);
   if (schedule.criticalPathMinutes) metric(timings,'依存工程の最長経路',estimateLabel(schedule.criticalPathMinutes));
