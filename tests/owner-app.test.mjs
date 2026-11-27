@@ -223,6 +223,84 @@ test('execution activity is owner-scoped and returns only status metadata', asyn
   assert.equal(reads(), 0);
 });
 
+test('native activity is opt-in and scoped and cannot hide ordinary activity on native failure', async t => {
+  const {directory, start} = await runtimeFixture(t);
+  await writeFile(join(directory, 'portfolio.json'), JSON.stringify({...seed, projects: [
+    ...seed.projects, {id: 'no-workspace', name: 'No workspace'},
+  ]}), {mode: 0o600});
+  let calls = 0;
+  const witnessed = {status: 'observed', observedAt: '2026-11-27T06:30:00.000Z', unconfirmed: 0,
+    truncated: false, live: [], transitions: []};
+  const app = await start({codex: {async readActivity(scope, watches, {isManaged}) {
+    calls++;
+    assert.deepEqual(scope, [seed.projects[0].cwd]);
+    assert.deepEqual(watches, [{threadId: 'activity-thread', turnId: 'activity-turn'}]);
+    assert.equal(isManaged('managed-thread'), true);
+    assert.equal(isManaged('other-thread'), true);
+    assert.equal(isManaged('foreign-thread'), false);
+    if (calls > 1) throw new Error('private fixture error');
+    return witnessed;
+  }}});
+  const db = new DatabaseSync(join(directory, 'conversations.sqlite'));
+  const insert = db.prepare(`INSERT INTO codex_operations
+    (id,project,workspace,fingerprint,phase,threadId,turnId,createdAt,updatedAt)
+    VALUES (?,?,?,'digest','completed',?,'turn','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z')`);
+  insert.run('managed-operation', 'example', seed.projects[0].cwd, 'managed-thread');
+  insert.run('other-operation', 'no-workspace', seed.projects[0].cwd, 'other-thread');
+  insert.run('foreign-operation', 'no-workspace', resolve(tmpdir(), 'foreign-activity-scope'), 'foreign-thread');
+  db.close();
+  const url = app.url + '/api/execution/activity';
+  const query = '?project=example&native=1&watch=activity-thread:activity-turn';
+  assert.equal((await fetch(url + query)).status, 401);
+  const cookie = await login(app);
+  const get = params => fetch(url + params, {headers: {cookie}});
+  assert.equal((await get('?project=foreign&native=1')).status, 404);
+  for (const invalid of ['&watch=one:two:three', '&watch=one:two%0A', '&watch=one:two&watch=one:two',
+    '&watch=one:two&watch=two:three&watch=three:four&watch=four:five', '&native=1']) {
+    assert.equal((await get('?project=example&native=1' + invalid)).status, 400);
+  }
+  assert.equal((await (await get('?project=no-workspace&native=1')).json()).nativeActivity.status, 'unconfigured');
+  const ordinary = await (await get('?project=example')).json();
+  assert.equal(ordinary.activity.id, 'managed-operation');
+  assert.deepEqual(Object.keys(ordinary), ['activity']);
+  assert.equal(calls, 0);
+  assert.deepEqual(await (await get(query)).json(), {...ordinary, nativeActivity: witnessed});
+  const failure = await (await get(query)).json();
+  assert.deepEqual(failure.activity, ordinary.activity);
+  assert.deepEqual(failure.nativeActivity, {...witnessed, status: 'unavailable', observedAt: null});
+  assert.equal(calls, 2);
+});
+
+test('opt-in native activity times out while preserving reconciliation of a saved Codex operation', async t => {
+  const {directory, start} = await runtimeFixture(t);
+  await writeFile(join(directory, 'portfolio.json'), JSON.stringify(seed), {mode: 0o600});
+  let aborted = false;
+  let reconciliations = 0;
+  const app = await start({codex: {
+    async findSubmission() { reconciliations++; return {id: 'turn', status: 'completed'}; },
+    async readActivity(_scope, _watch, {signal}) {
+      signal.addEventListener('abort', () => { aborted = true; }, {once: true});
+      return new Promise(() => {});
+    },
+  }});
+  const db = new DatabaseSync(join(directory, 'conversations.sqlite'));
+  db.prepare(`INSERT INTO codex_operations
+    (id,project,workspace,fingerprint,phase,threadId,turnId,createdAt,updatedAt)
+    VALUES ('saved','example',?,'digest','unconfirmed','thread','turn','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z')`)
+    .run(seed.projects[0].cwd);
+  db.close();
+  const cookie = await login(app);
+  const response = await fetch(app.url + '/api/execution/activity?project=example&native=1',
+    {headers: {cookie}, signal: AbortSignal.timeout(10000)});
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.activity.id, 'saved');
+  assert.equal(body.activity.phase, 'completed');
+  assert.equal(body.nativeActivity.status, 'unavailable');
+  assert.equal(reconciliations, 1);
+  assert.equal(aborted, true);
+});
+
 test('an imported conversation survives restart and rejected cross-origin requests never write it', async t => {
   const {app, start} = await fixture(t);
   const cookie = await login(app);

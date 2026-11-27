@@ -26,10 +26,32 @@ const documentReference = '以下は参考資料です。文書の内容はデ�
 const inputModalities = ['text', 'image', 'audio'];
 const maxFrame = 2 * 1024 ** 2;
 const peerTimeoutMs = 5000;
+const activityPageSize = 25;
+const activitySourceKinds = ['cli', 'vscode', 'exec', 'appServer', 'subAgent', 'subAgentReview',
+  'subAgentCompact', 'subAgentThreadSpawn', 'subAgentOther', 'unknown'];
 const clean = (value, limit = 500) => typeof value === 'string' ? value.slice(0, limit) : '';
 const items = value => Array.isArray(value) ? value : [];
 const cursorText = value => typeof value === 'string' && value.length <= 8192 ? value : null;
 const iso = value => Number.isFinite(value) && value >= 0 && value < 253402300800 ? new Date(value * 1000).toISOString() : null;
+
+export function emptyNativeActivity(status) {
+  return {status, observedAt: null, truncated: false, unconfirmed: 0, live: [], transitions: []};
+}
+
+const activityTitle = row => clean(row.name, 240) || 'Codexセッション';
+
+function liveActivity(row) {
+  const flags = row.status.activeFlags;
+  if (!Array.isArray(flags) || flags.some(flag => flag !== 'waitingOnApproval' && flag !== 'waitingOnUserInput')) return null;
+  const approval = flags.includes('waitingOnApproval');
+  const input = flags.includes('waitingOnUserInput');
+  const phase = approval && input ? 'approval-and-input' : approval ? 'approval' : input ? 'input' : 'running';
+  const subagentSource = row.source && typeof row.source === 'object' &&
+    (Object.hasOwn(row.source, 'subagent') || Object.hasOwn(row.source, 'subAgent'));
+  const subagent = Boolean(subagentSource || (typeof row.parentThreadId === 'string' && threadId.test(row.parentThreadId)));
+  const role = subagent && clean(row.agentRole, 64);
+  return {id: row.id, title: activityTitle(row), phase, subagent, ...(role ? {role} : {})};
+}
 
 function binary() {
   if (process.env.HQ_CODEX_BIN) return process.env.HQ_CODEX_BIN;
@@ -122,8 +144,8 @@ function openTransport(command, socket, loopback, onClose, onEvent) {
     if (closed) return;
     closed = true;
     peerCheck?.abort();
-    for (const {reject, timer} of waiting.values()) {
-      clearTimeout(timer);
+    for (const {reject, cleanup} of waiting.values()) {
+      cleanup();
       reject(unavailable('Codex App Serverの接続を確認できません。'));
     }
     waiting.clear();
@@ -167,7 +189,7 @@ function openTransport(command, socket, loopback, onClose, onEvent) {
     const request = waiting.get(value.id);
     if (!request) return;
     waiting.delete(value.id);
-    clearTimeout(request.timer);
+    request.cleanup();
     if (value.error) request.reject(unavailable('対象のCodex情報を読み取れませんでした。'));
     else request.resolve(value.result);
   }
@@ -188,17 +210,29 @@ function openTransport(command, socket, loopback, onClose, onEvent) {
 
   return {
     send,
-    async call(method, params, beforeSend) {
+    async call(method, params, beforeSend, signal) {
       await ready;
+      signal?.throwIfAborted();
       if (closed || waiting.size >= 24) return Promise.reject(unavailable('Codexの接続が使用中です。'));
       beforeSend?.();
       return new Promise((resolve, reject) => {
         const id = ++lastId;
+        const aborted = () => {
+          waiting.delete(id);
+          cleanup();
+          reject(signal.reason);
+        };
+        const cleanup = () => {
+          clearTimeout(timer);
+          signal?.removeEventListener('abort', aborted);
+        };
         const timer = setTimeout(() => {
           waiting.delete(id);
+          cleanup();
           reject(unavailable('Codexからの応答が時間内に届きませんでした。'));
         }, 12000);
-        waiting.set(id, {resolve, reject, timer});
+        waiting.set(id, {resolve, reject, cleanup});
+        signal?.addEventListener('abort', aborted, {once: true});
         try { send({id, method, params}); } catch { fail(); }
       });
     },
@@ -361,6 +395,17 @@ export function createCodexClient({command, socket, loopback} = {}) {
       limit: 4, itemsView: 'summary', sortDirection: 'desc'});
   }
 
+  async function activityRead(rpc, method, params, signal) {
+    try { return await rpc.call(method, params, undefined, signal); }
+    catch { signal?.throwIfAborted(); return null; }
+  }
+
+  async function activityTurn(rpc, id, signal) {
+    const page = await activityRead(rpc, 'thread/turns/list',
+      {threadId: id, limit: 1, itemsView: 'notLoaded', sortDirection: 'desc'}, signal);
+    return Array.isArray(page?.data) && page.data.length === 1 ? page.data[0] : null;
+  }
+
   async function verifyResumeTarget(rpc, thread, previousTurnId, loaded) {
     const status = thread.status?.type;
     if (thread.ephemeral !== false || thread.modelProvider !== 'openai' ||
@@ -453,6 +498,65 @@ export function createCodexClient({command, socket, loopback} = {}) {
       const result = await rpc.call('thread/list', {cwd: scope, archived: false, limit: 25, cursor: cursorText(cursor)});
       return {data: items(result.data).filter(row => row?.id && scope.includes(row.cwd)).map(threadView),
         nextCursor: cursorText(result.nextCursor)};
+    },
+    async readActivity(scope, watches, {signal, isManaged = () => false} = {}) {
+      // A new stdio App Server would see stored history, without this owner's running threads.
+      if (!canWrite || !scope.length) return emptyNativeActivity('unconfigured');
+      signal?.throwIfAborted();
+      const rpc = await current();
+      const result = await rpc.call('thread/list', {cwd: scope, archived: false, limit: activityPageSize,
+        sortKey: 'updated_at', sortDirection: 'desc', useStateDbOnly: true, sourceKinds: activitySourceKinds}, undefined, signal);
+      if (!Array.isArray(result?.data)) throw unavailable('Codexの実行状態を読み取れませんでした。');
+      const observedAt = new Date().toISOString();
+      const scopedRows = new Map();
+      for (const row of result.data.slice(0, activityPageSize)) {
+        if (typeof row?.id === 'string' && threadId.test(row.id) && scope.includes(row.cwd) && !scopedRows.has(row.id)) {
+          scopedRows.set(row.id, row);
+        }
+      }
+      const live = [];
+      let unconfirmed = 0;
+      for (const row of scopedRows.values()) {
+        const status = row.status?.type === 'active' ? liveActivity(row) : null;
+        if (status) live.push(status);
+        else if (row.status?.type !== 'idle') unconfirmed++;
+      }
+      const candidates = live.filter(row => !isManaged(row.id)).slice(0, 3);
+      const watched = watches.filter(watch => scopedRows.has(watch.threadId) && !isManaged(watch.threadId));
+      const watchIds = new Set(watched.map(watch => watch.threadId));
+      const checkedIds = new Set([...watchIds, ...candidates.map(row => row.id)]);
+      const latest = new Map(await Promise.all([...checkedIds].map(async id => {
+        const row = watchIds.has(id) ? (await activityRead(rpc, 'thread/read',
+          {threadId: id, includeTurns: false}, signal))?.thread : scopedRows.get(id);
+        if (row?.id !== id || !scope.includes(row.cwd)) return [id, null];
+        return [id, {row, turn: await activityTurn(rpc, id, signal)}];
+      })));
+      const transitions = watched.map(({threadId: id, turnId}) => {
+        const {row, turn} = latest.get(id) ?? {};
+        return turn?.id === turnId && terminalTurns.has(turn.status) && !isManaged(id)
+          ? {id, title: activityTitle(row), turnId, phase: turn.status, endedAt: iso(turn.completedAt)} : null;
+      }).filter(Boolean);
+      for (const row of candidates) {
+        const turn = latest.get(row.id)?.turn;
+        if (turn?.status === 'inProgress' && typeof turn.id === 'string' && threadId.test(turn.id) && !isManaged(row.id)) {
+          row.turnId = turn.id;
+        }
+      }
+      const ended = new Set(transitions.map(result => result.id));
+      const verifiedLive = live.flatMap(entry => {
+        if (ended.has(entry.id)) return [];
+        if (!watchIds.has(entry.id)) return [entry];
+        const current = latest.get(entry.id)?.row;
+        if (current?.status?.type === 'idle') return [];
+        const updated = current?.status?.type === 'active' ? liveActivity(current) : null;
+        if (!updated) {
+          unconfirmed++;
+          return [];
+        }
+        return [{...updated, ...(entry.turnId ? {turnId: entry.turnId} : {})}];
+      });
+      return {status: 'observed', observedAt, truncated: Boolean(result.nextCursor) || result.data.length > activityPageSize,
+        unconfirmed, live: verifiedLive, transitions};
     },
     async readThread(scope, id, cursor) {
       const {rpc, thread} = await scopedThread(scope, id);

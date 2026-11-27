@@ -63,10 +63,19 @@ const runStates = new Map();
 const runViewCleanups = new Set();
 const chatStreams = new Map();
 const activities = new Map();
+const nativeActivities = new Map();
+const nativeNotices = new Map();
 const activityLabels = {
   reserved: '受付済み', sending: 'Codexへの送信を確認中', running: '実行中', interrupting: '中断を要求中', cancelling: '中止を照合中',
   unconfirmed: '状態未確認', completed: 'ターン完了', interrupted: '中断済み', cancelled: '中止済み', failed: '実行失敗',
 };
+const nativeActivityLabels = {
+  running: '稼働中', approval: '承認待ち', input: '入力待ち', 'approval-and-input': '承認・入力待ち',
+};
+const nativeOutcomeLabels = {completed: '完了', failed: '失敗', interrupted: '中断'};
+const nativeActivityId = /^[a-z0-9_-]{1,160}$/i;
+const nativeWatchLimit = 3;
+const nativeWatchAge = 60000;
 const chatSourceLabels = {'chatgpt-export': 'ChatGPTの書き出し', 'chatgpt-live': 'ChatGPTプラン',
   'api-development': '通常APIの開発', 'codex-history': 'Codex'};
 let requestSequence = 0;
@@ -240,6 +249,8 @@ function endSession() {
   for (const stop of runViewCleanups) stop();
   clearTimeout(activityTimer);
   activities.clear();
+  nativeActivities.clear();
+  nativeNotices.clear();
   activitySession = undefined;
   resources.clear();
   ui.attachmentDrafts.clear();
@@ -251,12 +262,102 @@ function endSession() {
   } else gate('サインイン', 'この端末のサインイン用ファイルを開いてください。', true);
 }
 function activityPanel() {
-  const section = node('section', 'stack');
-  section.id = 'project-activity';
-  section.hidden = true;
-  return section;
+  const group = node('div', 'stack');
+  const local = node('section', 'stack');
+  local.id = 'project-activity';
+  local.hidden = true;
+  const native = node('section', 'stack');
+  native.id = 'native-codex-activity';
+  native.hidden = true;
+  native.append(node('h3', '', '接続先Codexの稼働'), node('p', 'small muted'), node('ul', 'rows'));
+  group.append(local, native);
+  return group;
+}
+function paintNativeActivity() {
+  const section = document.getElementById('native-codex-activity');
+  if (!section) return;
+  const project = ui.project;
+  const snapshot = nativeActivities.get(project);
+  section.hidden = !snapshot;
+  if (!snapshot) return;
+  const info = section.querySelector('p');
+  const list = section.querySelector('ul');
+  const current = snapshot.status === 'observed' && performance.now() - snapshot.receivedAt <= 30000;
+  const rows = current ? snapshot.live : [];
+  const scopes = current ? [
+    rows.length ? '接続先で稼働中のスレッドを' + rows.length + '件確認' : '稼働中と確認できたスレッドは0件',
+    snapshot.unconfirmed ? snapshot.unconfirmed + '件は状態未確認' : '',
+    snapshot.truncated ? '直近の一覧の一部' : '',
+  ].filter(Boolean) : [snapshot.status === 'unconfigured' ? '稼働を確認できるCodex接続が未設定です。' : '現在の稼働状態を確認できません。'];
+  if (snapshot.observedAt) scopes.push((current ? '確認 ' : '前回確認 ') + time(snapshot.observedAt));
+  if (snapshot.lastOutcome) {
+    const {title, phase, endedAt} = snapshot.lastOutcome;
+    scopes.push(title + ' ' + nativeOutcomeLabels[phase] + (endedAt ? ' ' + time(endedAt) : ''));
+  }
+  const summary = scopes.join(' · ');
+  if (info.textContent !== summary) info.textContent = summary;
+  const signature = JSON.stringify(rows.map(row => [row.id, row.title, row.phase, row.subagent, row.role]));
+  if (list.dataset.snapshot === signature) return;
+  const focused = list.contains(document.activeElement) ? document.activeElement.dataset.nativeThread : null;
+  list.dataset.snapshot = signature;
+  list.hidden = rows.length === 0;
+  list.replaceChildren(...rows.map(row => {
+    const role = row.subagent ? text(row.role, 'サブエージェント') : '';
+    const select = rowButton(row.title, role, false, () => {
+      if (ui.project !== project) return;
+      ui.threadIds.set(project, row.id);
+      storeTab();
+      location.hash = 'codex';
+    }, chip(row.phase === 'approval-and-input' ? 'approval' : row.phase, nativeActivityLabels[row.phase]));
+    select.removeAttribute('aria-pressed');
+    select.dataset.nativeThread = row.id;
+    if (row.id === focused) queueMicrotask(() => select.isConnected && select.focus({preventScroll: true}));
+    return listItem(select);
+  }));
+}
+function recordNativeActivity(project, result, watched) {
+  const previous = nativeActivities.get(project);
+  if (!['observed', 'unconfigured', 'unavailable'].includes(result?.status) ||
+      (result.status === 'observed' && (!Number.isFinite(Date.parse(result.observedAt)) ||
+        !Array.isArray(result.live) || result.live.some(row => typeof row?.id !== 'string' ||
+          !nativeActivityId.test(row.id) || typeof row.title !== 'string' || !Object.hasOwn(nativeActivityLabels, row.phase))))) {
+    result = {status: 'unavailable'};
+  }
+  if (result.status === 'unconfigured') {
+    nativeActivities.set(project, {status: result.status});
+    return;
+  }
+  if (result.status !== 'observed') {
+    nativeActivities.set(project, {...previous, status: result.status, watched});
+    return;
+  }
+  const receivedAt = performance.now();
+  for (const [key, expires] of nativeNotices) if (expires <= receivedAt) nativeNotices.delete(key);
+  const expires = receivedAt + nativeWatchAge;
+  let lastOutcome = previous?.lastOutcome;
+  const completed = [];
+  for (const outcome of asArray(result.transitions)) {
+    const key = outcome?.id + ':' + outcome?.turnId;
+    if (!watched.has(key) || !Object.hasOwn(nativeOutcomeLabels, outcome.phase) || typeof outcome.title !== 'string') continue;
+    watched.delete(key);
+    lastOutcome = outcome;
+    if (!nativeNotices.has(key)) completed.push(outcome);
+    nativeNotices.set(key, expires);
+  }
+  for (const row of result.live) {
+    if (typeof row.turnId !== 'string' || !nativeActivityId.test(row.turnId)) continue;
+    const key = row.id + ':' + row.turnId;
+    if (!nativeNotices.has(key) && (watched.has(key) || watched.size < nativeWatchLimit)) watched.set(key, expires);
+  }
+  nativeActivities.set(project, {...result, receivedAt, watched, lastOutcome});
+  const name = projectList().find(item => item.id === project)?.name;
+  if (name && completed.length) {
+    const outcomes = completed.map(item => item.title + 'が' + nativeOutcomeLabels[item.phase] + 'しました').join(' / ');
+    setNotice(name + ' · Codex ' + outcomes, completed.some(item => item.phase === 'failed'));
+  }
 }
 function paintActivity() {
+  paintNativeActivity();
   const section = document.getElementById('project-activity');
   if (!section) return;
   const activity = activities.get(ui.project);
@@ -284,24 +385,39 @@ async function pollActivity() {
   const session = activitySession ??= Symbol();
   const currentProject = ui.project;
   const selected = new Set([currentProject]);
-  for (const [id, value] of activities) {
-    if (value && !value.terminal && selected.size < 3 && projectList().some(project => project.id === id)) selected.add(id);
+  const now = performance.now();
+  for (const project of projectList()) {
+    const local = activities.get(project.id);
+    const watched = nativeActivities.get(project.id)?.watched;
+    if (selected.size < 3 && ((local && !local.terminal) || [...(watched?.values() ?? [])].some(expires => expires > now))) {
+      selected.add(project.id);
+    }
   }
   try {
     await Promise.allSettled([...selected].map(async project => {
       const previous = activities.get(project);
+      const watched = new Map([...(nativeActivities.get(project)?.watched ?? [])].filter(([, expires]) => expires > now));
+      const observeNative = watched.size > 0 || (project === currentProject && ui.view === 'dashboard');
       let activity;
+      let observedNative;
       try {
-        ({activity} = await api(apiPath('/api/execution/activity', {project}), {signal: AbortSignal.timeout(6500)}));
+        const path = apiPath('/api/execution/activity', {project, native: observeNative ? 1 : undefined});
+        const params = new URLSearchParams();
+        for (const key of watched.keys()) params.append('watch', key);
+        ({activity, nativeActivity: observedNative} = await api(params.size ? path + '&' + params : path, {signal: AbortSignal.timeout(6500)}));
       } catch {
-        if (activitySession === session && previous && !previous.terminal && previous.phase !== 'cancelling') {
-          activities.set(project, {...previous, phase: 'unconfirmed'});
+        if (activitySession === session) {
+          if (previous && !previous.terminal && previous.phase !== 'cancelling') {
+            activities.set(project, {...previous, phase: 'unconfirmed'});
+          }
+          if (observeNative) recordNativeActivity(project, null, watched);
         }
         return;
       }
       if (activitySession !== session || (activity !== null && (typeof activity?.id !== 'string' ||
           typeof activity.terminal !== 'boolean' || !Object.hasOwn(activityLabels, activity.phase)))) return;
       activities.set(project, activity);
+      if (observeNative) recordNativeActivity(project, observedNative, watched);
       if (activity?.kind === 'api' && (previous?.id !== activity.id || previous.phase !== activity.phase)) evictChats(project);
       if (previous !== undefined && activity?.terminal &&
           (previous?.id !== activity.id || previous.phase !== activity.phase)) {
@@ -2321,12 +2437,14 @@ function codex() {
       const detail = selectedProject()?.codexScopes ?
         'このプロジェクトのスレッドが見つかりません。' : 'このプロジェクトの端末・作業フォルダは未接続です。';
       destination.append(node('p', 'empty', detail));
-      ui.threadIds.delete(project);
-      storeTab();
+      if (!selectedProject()?.codexScopes) {
+        ui.threadIds.delete(project);
+        storeTab();
+      }
       showThread();
       return;
     }
-    if (!threads.some(item => item.id === ui.threadIds.get(project))) {
+    if (!ui.threadIds.get(project)) {
       ui.threadIds.set(project, threads[0].id);
       storeTab();
     }
@@ -2589,6 +2707,7 @@ window.addEventListener('pagehide', () => {
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) abortLocalDictation();
   else {
+    paintActivity();
     void refreshVisibleDashboard();
     void pollActivity();
   }

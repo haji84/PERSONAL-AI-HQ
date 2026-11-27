@@ -8,9 +8,9 @@ import {homedir} from 'node:os';
 import {basename, dirname, isAbsolute, join, resolve} from 'node:path';
 import {fileURLToPath, pathToFileURL} from 'node:url';
 import {pipeline} from 'node:stream/promises';
-import {readPortfolio} from './portfolio.mjs';
+import {readCurrentProject, readPortfolio} from './portfolio.mjs';
 import {createChatStore} from './chat-store.mjs';
-import {createCodexClient, isCodexLoopbackUrl} from './codex.mjs';
+import {createCodexClient, emptyNativeActivity, isCodexLoopbackUrl} from './codex.mjs';
 import {createOperations} from './operations.mjs';
 import {createExecutionAccess} from './execution-access.mjs';
 import {createPlanAuth, PLAN_AUTH_CALLBACK_PATH} from './chatgpt-plan-auth.mjs';
@@ -31,6 +31,8 @@ const defaultRuntime = process.platform === 'win32'
   : join(homedir(), 'Library', 'Application Support', 'Personal AI HQ', 'integration');
 const browserPolicy = "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; media-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 const sessionAge = 8 * 60 * 60;
+const nativeObservationTimeout = 4000;
+const nativeActivityWatch = /^([a-z0-9_-]{1,160}):([a-z0-9_-]{1,160})$/i;
 const error = (status, message) => Object.assign(new Error(message), {status});
 const apiMessages = {
   API_AUTHORIZATION_REQUIRED: 'この端末の通常API実行は認証が保留中です。',
@@ -66,6 +68,37 @@ const apiMessages = {
 function send(response, status, payload, extra = {}) {
   response.writeHead(status, {'Content-Type': 'application/json; charset=utf-8', ...extra});
   response.end(JSON.stringify(payload));
+}
+
+function activityWatches(params) {
+  const requested = params.getAll('watch');
+  if (params.getAll('native').length !== 1 || requested.length > 3 || new Set(requested).size !== requested.length) {
+    throw error(400, '確認するCodex作業を3件以内で指定してください。');
+  }
+  return requested.map(value => {
+    const match = nativeActivityWatch.exec(value);
+    if (!match) throw error(400, '確認するCodex作業の番号が正しくありません。');
+    return {threadId: match[1], turnId: match[2]};
+  });
+}
+
+async function observeNativeActivity(native, project, watches, isManaged, response) {
+  if (!project.cwd.length || !native.readActivity) return emptyNativeActivity('unconfigured');
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  const timer = setTimeout(abort, nativeObservationTimeout);
+  response.once('close', abort);
+  try {
+    const stopped = once(controller.signal, 'abort').then(() => emptyNativeActivity('unavailable'));
+    const read = native.readActivity(project.cwd, watches, {signal: controller.signal, isManaged});
+    return await Promise.race([read, stopped]);
+  } catch {
+    return emptyNativeActivity('unavailable');
+  } finally {
+    clearTimeout(timer);
+    response.off('close', abort);
+    abort();
+  }
 }
 
 async function body(request, limit) {
@@ -393,10 +426,19 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
     if (!project) throw error(404, '案件を見つけられませんでした。');
     if (get && route === '/api/execution/activity') {
       if (target.searchParams.getAll('project').length !== 1) throw error(404, '案件を見つけられませんでした。');
+      const watch = target.searchParams.getAll('native').includes('1') ? activityWatches(target.searchParams) : null;
       const {activity: codexActivity} = await operations.readActivity(project);
       const apiActivity = apiWork.activity(project);
       const activity = apiActivity && (!codexActivity || apiActivity.createdAt >= codexActivity.createdAt) ? apiActivity : codexActivity;
-      return send(response, 200, {activity});
+      if (!watch) return send(response, 200, {activity});
+      const nativeActivity = await observeNativeActivity(native, project, watch,
+        id => operations.hasManagedActivityThread(project, id), response);
+      if (response.destroyed) return;
+      const current = readCurrentProject(directory, project.id);
+      if (!current || current.cwd.length !== project.cwd.length || current.cwd.some(cwd => !project.cwd.includes(cwd))) {
+        throw error(404, '案件を見つけられませんでした。');
+      }
+      return send(response, 200, {activity, nativeActivity});
     }
     if (get && route === '/api/execution/handover') {
       const scopes = [...target.searchParams.getAll('receipt'), ...target.searchParams.getAll('thread')];

@@ -16,7 +16,7 @@ const priorTurn = {id: 'completed-turn', status: 'completed'};
 const admitPeer = async () => {};
 
 async function fixture(t, {accountType = 'chatgpt', redirect, thread = fixtureThread, turn = priorTurn, resumed = thread,
-  firstUser = 'fixture-request'} = {}) {
+  firstUser = 'fixture-request', rpcResults = {}} = {}) {
   const server = http.createServer();
   const websocket = new WebSocketServer({noServer: true});
   const calls = [];
@@ -59,7 +59,8 @@ async function fixture(t, {accountType = 'chatgpt', redirect, thread = fixtureTh
           'thread/items/list': {data: [{turnId: params?.turnId, item: {type: 'userMessage', clientId: firstUser}}]},
           'turn/steer': {turnId: fixtureTurn.id}, 'turn/interrupt': {},
         };
-        const result = results[method];
+        const result = rpcResults[method] ? rpcResults[method](params) : results[method];
+        if (result === 'hold') return;
         connection.send(JSON.stringify({id, ...(result ? {result} : {error: {code: -32601}})}));
       });
     });
@@ -74,6 +75,101 @@ async function fixture(t, {accountType = 'chatgpt', redirect, thread = fixtureTh
     return client;
   }};
 }
+
+test('native activity reports only scoped live flags and verified exact turn transitions', async t => {
+  const active = (id, activeFlags = [], extra = {}) => ({id, cwd: workspace, preview: 'private prompt',
+    status: {type: 'active', activeFlags}, ...extra});
+  const completedAt = 1760000000;
+  const rows = [
+    active('parent', ['waitingOnApproval'], {name: 'Parent'}),
+    active('child', ['waitingOnApproval', 'waitingOnUserInput'], {source: {subagent: 'review'},
+      agentRole: 'reviewer', path: '/private/history'}),
+    active('managed', ['waitingOnUserInput']),
+    active('other-child', [], {parentThreadId: 'parent'}),
+    active('outside', [], {cwd: foreignWorkspace}),
+    active('future-active', ['waitingOnFutureCondition']),
+    {id: 'missing-flags', cwd: workspace, status: {type: 'active'}},
+    {id: 'unknown', cwd: workspace, status: {type: 'notLoaded'}},
+    {id: 'idle', cwd: workspace, status: {type: 'idle'}},
+    {id: 'finished', cwd: workspace, status: {type: 'idle'}},
+    {id: 'advanced', cwd: workspace, status: {type: 'idle'}},
+  ];
+  const {client, calls} = await fixture(t, {rpcResults: {
+    'thread/list': () => ({data: rows, nextCursor: 'another-page'}),
+    'thread/read': ({threadId}) => ({thread: rows.find(row => row.id === threadId) ?? {id: threadId, cwd: workspace}}),
+    'thread/turns/list': ({threadId}) => ({data: [
+      threadId === 'finished' ? {id: 'prior-turn', status: 'completed', completedAt} :
+      threadId === 'advanced' ? {id: 'different-turn', status: 'interrupted'} :
+      {id: threadId + '-current', status: 'inProgress'},
+    ]}),
+  }});
+  const result = await client().readActivity([workspace], [
+    {threadId: 'finished', turnId: 'prior-turn'}, {threadId: 'advanced', turnId: 'prior-turn'},
+    {threadId: 'managed', turnId: 'managed-current'},
+  ], {isManaged: id => id === 'managed'});
+  assert.equal(result.status, 'observed');
+  assert.equal(result.truncated, true);
+  assert.equal(result.unconfirmed, 3);
+  assert.deepEqual(result.live.map(({id, phase, subagent, role, turnId}) => ({id, phase, subagent, role, turnId})), [
+    {id: 'parent', phase: 'approval', subagent: false, role: undefined, turnId: 'parent-current'},
+    {id: 'child', phase: 'approval-and-input', subagent: true, role: 'reviewer', turnId: 'child-current'},
+    {id: 'managed', phase: 'input', subagent: false, role: undefined, turnId: undefined},
+    {id: 'other-child', phase: 'running', subagent: true, role: undefined, turnId: 'other-child-current'},
+  ]);
+  assert.deepEqual(result.transitions, [{id: 'finished', title: 'Codexセッション', turnId: 'prior-turn',
+    phase: 'completed', endedAt: new Date(completedAt * 1000).toISOString()}]);
+  assert.ok(!JSON.stringify(result).includes('private'));
+  assert.equal(calls.find(([method]) => method === 'thread/list')[1].useStateDbOnly, true);
+  assert.ok(calls.filter(([method]) => method === 'thread/turns/list')
+    .every(([, params]) => params.itemsView === 'notLoaded' && params.limit === 1 && params.sortDirection === 'desc'));
+  assert.ok(!calls.some(([method, params]) => method.startsWith('thread/') && ['outside', 'managed'].includes(params.threadId)));
+  const foreign = await client().readActivity([workspace], [
+    {threadId: 'outside', turnId: 'prior-turn'}, {threadId: 'not-in-page', turnId: 'prior-turn'},
+  ]);
+  assert.deepEqual(foreign.transitions, []);
+  assert.ok(!calls.some(([method, params]) => method.startsWith('thread/') &&
+    ['outside', 'not-in-page'].includes(params.threadId)));
+});
+
+test('a terminal watch supersedes an earlier active snapshot and shares the latest-turn read', async t => {
+  const activity = {id: 'watched-thread', cwd: workspace, status: {type: 'active', activeFlags: []}};
+  let resolvedScope = workspace;
+  const {client, calls} = await fixture(t, {rpcResults: {
+    'thread/list': () => ({data: [activity]}),
+    'thread/read': () => ({thread: {...activity, cwd: resolvedScope, status: {type: 'idle'}}}),
+    'thread/turns/list': () => ({data: [{id: 'watched-turn', status: 'failed', completedAt: 1760000000}]}),
+  }});
+  const native = client();
+  const watch = [{threadId: 'watched-thread', turnId: 'watched-turn'}];
+  const result = await native.readActivity([workspace], watch);
+  assert.deepEqual(result.live, []);
+  assert.equal(result.transitions[0].phase, 'failed');
+  assert.equal(result.transitions[0].turnId, 'watched-turn');
+  assert.equal(calls.filter(([method]) => method === 'thread/turns/list').length, 1);
+  resolvedScope = foreignWorkspace;
+  const moved = await native.readActivity([workspace], watch);
+  assert.deepEqual([moved.live, moved.transitions, moved.unconfirmed], [[], [], 1]);
+  assert.equal(calls.filter(([method]) => method === 'thread/turns/list').length, 1);
+});
+
+test('native activity aborts a held list before starting turn reads and leaves the connection usable', async t => {
+  let held;
+  const {client, calls} = await fixture(t, {rpcResults: {
+    'thread/list': () => { held?.(); return held ? 'hold' : {data: []}; },
+  }});
+  const received = new Promise(resolve => { held = resolve; });
+  const signal = new AbortController();
+  const native = client();
+  const result = native.readActivity([workspace], [{threadId: 'finished', turnId: 'prior-turn'}], {signal: signal.signal});
+  await received;
+  signal.abort();
+  await assert.rejects(result, {name: 'AbortError'});
+  held = undefined;
+  assert.equal((await native.readActivity([workspace], [])).status, 'observed');
+  assert.deepEqual(calls.map(([method]) => method), ['initialize', 'initialized', 'thread/list', 'thread/list']);
+  const stdio = createCodexClient({command: 'unavailable-fixture-command'});
+  assert.equal((await stdio.readActivity([workspace], [])).status, 'unconfigured');
+});
 
 const request = {workspace, prompt: 'Run the fixture.', requestId: 'fixture-request', model: 'fixture-model', effort: 'low', onThread: () => true};
 

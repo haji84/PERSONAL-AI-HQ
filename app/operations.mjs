@@ -90,6 +90,8 @@ export function createOperations(directory, native, execution, {prepareHandover}
   const latest = db.prepare(`SELECT * FROM codex_operations WHERE rowid=(${latestRowId('?')})`);
   const latestThread = db.prepare(`SELECT * FROM codex_operations WHERE project=? AND threadId=?
     ORDER BY createdAt DESC, rowid DESC LIMIT 1`);
+  const managedActivityThread = db.prepare(`SELECT 1 FROM codex_operations WHERE threadId=?
+    AND workspace IN (SELECT value FROM json_each(?)) LIMIT 1`);
   const latestTarget = db.prepare(`SELECT * FROM codex_operations WHERE rowid=(
     ${latestRowId('?1', `AND ${targetsThread('?2')} AND (?3 IS NULL OR id<>?3)`)})`);
   const latestHandover = db.prepare(`SELECT * FROM codex_operations WHERE project=? AND handoverReceipt=?
@@ -294,6 +296,9 @@ export function createOperations(directory, native, execution, {prepareHandover}
     managesThread(project, thread) {
       const row = project.codexWrite && native.canWrite && latestThread.get(project.id, thread);
       return Boolean(row && project.cwd.includes(row.workspace));
+    },
+    hasManagedActivityThread(project, thread) {
+      return Boolean(managedActivityThread.get(thread, JSON.stringify(project.cwd)));
     },
     async read(project, id, receipt = null, thread = null) {
       if (receipt !== null && !receiptId.test(receipt)) throw problem(400, '引継ぎ元の受付番号を指定してください。');
