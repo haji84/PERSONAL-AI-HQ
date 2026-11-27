@@ -256,12 +256,14 @@ export async function readProjectForecastState(checkout, repository) {
     const verifiedTaskIds = new Set(verification.filter(task=>task.evidence.every(item=>
       proof.get(item.path)===item.sha256)).map(task=>task.id));
     const planning = Array.isArray(state.delivery?.tasks) ? state.delivery.tasks.slice(0,64) : [];
-    const byId = new Map(planning.filter(task=>lifecycleId.test(task?.id??'')).map(task=>[task.id,task]));
+    const byId = new Map();
+    for (const task of planning) if (lifecycleId.test(task?.id??'')) {
+      byId.set(task.id,byId.has(task.id)?null:task);
+    }
     const tasks = state.tasks.map(task=>({...byId.get(task.id),id:task.id,title:byId.get(task.id)?.title??task.title,
       status:task.status==='running'?'active':task.status,actionable:task.actionable,dependencies:task.depends_on}));
-    const [committedAt] = await Promise.all([reader.git('show','-s','--format=%cI',reader.revision)]);
     return {delivery:{...state.delivery,tasks,goal:state.goal.title,goalId:state.goal.id,
-      observationAt:iso(state.delivery?.observationAt)??iso(committedAt.toString().trim())},
+      observationAt:iso(state.delivery?.observationAt)},
       nextAction:state.next_action,status:state.status,verifiedTaskIds,
       source:link(reader.repository,reader.revision,lifecycleStateFile,'案件の保存済み進行状態')};
   } catch { return null; }

@@ -105,3 +105,41 @@ test('known later availability does not delay independent ready work and a read-
   assert.equal(report.schedule.completionDates.standard,'2026-11-28T03:25:00.000+09:00');
   assert.deepEqual(report.schedule.readyTaskIds,['ready']);
 });
+
+test('scoped state cannot use an unverified claim as completion evidence or unlock its next task', () => {
+  const requirement={id:'signed-artifact',implemented:true,review:{independent:true,status:'accepted'},
+    validation:{status:'passed',source:'recorded claim'},artifact:{usable:true}};
+  const source={observationAt:asOf,scopeComplete:true,capacity:{calendar:'continuous'},
+    requirements:[requirement],
+    tasks:[{id:'claim',status:'verified',requirements:[requirement],requirementIds:[requirement.id]},
+      task('delivery',5,{dependencies:['claim']})]};
+  const rejected=forecast(source,{now,verifiedTaskIds:new Set()});
+  assert.equal(rejected.tasks[0].verified,false);
+  assert.deepEqual(rejected.schedule.readyTaskIds,[]);
+  assert.equal(rejected.schedule.completionDates,null);
+  assert.equal(rejected.progress.formalCompletion,0);
+  assert.equal(rejected.checkpoints.accepted,0);
+  assert.ok(rejected.gaps.some(row=>row.code==='completion-evidence'));
+  const accepted=forecast(source,{now,verifiedTaskIds:new Set(['claim'])});
+  assert.equal(accepted.progress.formalCompletion,100);
+  assert.deepEqual(accepted.schedule.readyTaskIds,['delivery']);
+});
+
+test('a zero claim or a scheduled approval date cannot close an unverified task', () => {
+  const source={observationAt:asOf,scopeComplete:true,capacity:{calendar:'continuous'},
+    tasks:[task('unknown',0,{status:'unknown',actionable:false})]};
+  assert.equal(forecast(source,{now}).schedule.workMinutes,null);
+  assert.equal(forecast(source,{now}).schedule.completionDates,null);
+  const approval=forecast({...source,tasks:[task('held',9,{status:'approval',actionable:false,
+    availableAt:'2026-11-28T03:30:00+09:00'})]},{now});
+  assert.deepEqual(approval.schedule.workMinutes,range(9));
+  assert.equal(approval.schedule.completionDates,null);
+  const owner=forecast({...source,ownerAction:'承認待ち',tasks:[task('would-be-ready',9)]},{now});
+  assert.equal(owner.schedule.completionDates,null);
+  assert.deepEqual(owner.schedule.readyTaskIds,[]);
+  assert.equal(owner.nextUpdate.trigger,'owner-action');
+  const independent=forecast({...source,ownerAction:'配布時の本人確認',ownerActionAppliesTo:'release',
+    tasks:[task('before-release',9)]},{now});
+  assert.deepEqual(independent.schedule.readyTaskIds,['before-release']);
+  assert.equal(independent.schedule.completionDates,null);
+});

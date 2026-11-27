@@ -311,4 +311,14 @@ test('a scoped existing checkout contributes committed lifecycle state without i
   assert.equal(held.forecast.status,'paused');
   assert.equal(held.forecast.schedule.workMinutes,null);
   assert.deepEqual(held.forecast.schedule.readyTaskIds,[]);
+  state.status='active';
+  delete state.delivery.observationAt;
+  await commit({[source]:JSON.stringify(state),'proof.txt':'pass'});
+  let [undated]=await views();
+  assert.equal(undated.forecast.observedAt,null);
+  assert.equal(undated.forecast.schedule.completionDates,null);
+  await commit({'README.md':'Unrelated commit'});
+  [undated]=await views();
+  assert.equal(undated.forecast.observedAt,null);
+  assert.equal(undated.forecast.schedule.completionDates,null);
 });

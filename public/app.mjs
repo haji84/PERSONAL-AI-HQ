@@ -1218,6 +1218,11 @@ function projectForecastPanel(project) {
   const facts=node('dl','properties');
   const checks=forecast.checkpoints;
   if (checks) metric(facts,'記録済みの受入チェック',taskProgressLabel(checks));
+  if (forecast.progress) {
+    metric(facts,'実装完成率',forecast.progress.implementationCompletion,true);
+    metric(facts,'正式な要求達成率',forecast.progress.formalCompletion,true);
+    metric(facts,'実用完成率',forecast.progress.usableCompletion,true);
+  }
   if (forecast.stage) metric(facts,'現在の工程',forecast.stage);
   const work=schedule.workMinutes??schedule.recordedWorkMinutes;
   if (work) metric(facts,'記録のある工程の残工数',estimateLabel(work));
@@ -1256,7 +1261,8 @@ function projectForecastPanel(project) {
   }
   if (forecast.observedAt) metric(timings,'最終観測',time(forecast.observedAt));
   metric(timings,'次回の確認',forecast.nextUpdate.at ? time(forecast.nextUpdate.at) :
-    forecast.nextUpdate.trigger==='owner-resume'?'再開時':'正本に次の作業・観測が記録されたとき');
+    {'owner-resume':'再開時','owner-action':'利用者の対応が済んだとき'}[forecast.nextUpdate.trigger]??
+    '正本に次の作業・観測が記録されたとき');
   expanded.append(timings);
   const byId=new Map(asArray(forecast.tasks).map(task=>[task.id,task]));
   const taskIds=asArray(schedule.orderedTaskIds);

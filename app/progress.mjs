@@ -171,8 +171,8 @@ function comparableForecast(task, samples) {
 }
 
 function makeForecastTask(task, verifiedIds, now, comparableRuns) {
-  const verified = taskIsVerified(task) || (task.status === 'verified' && verifiedIds?.has(task.id) &&
-    task.externalWait !== 'unknown' && !taskHasOpenWork(task));
+  const verified = verifiedIds instanceof Set ? task.status === 'verified' && verifiedIds.has(task.id) &&
+    task.externalWait !== 'unknown' && !taskHasOpenWork(task) : taskIsVerified(task);
   const direct = remainingEstimate(task.remainingMinutes);
   const comparable = !direct && !verified ? comparableForecast(task,comparableRuns) : null;
   const proposed = direct ?? comparable?.remainingMinutes ?? null;
@@ -183,13 +183,14 @@ function makeForecastTask(task, verifiedIds, now, comparableRuns) {
   const expired = !verified && expires!==null && expires<=now;
   const rejectedCompletion = !verified && task.status==='verified';
   const remainingMinutes = verified ? {optimistic:0,standard:0,cautious:0} :
-    expired || (proposed?.cautious===0 && (rejectedCompletion || taskHasOpenWork(task))) ? null : proposed;
+    expired || proposed?.cautious===0 ? null : proposed;
   const estimate = comparable?.estimate ?? {basis:forecastString(task.estimate?.basis),
     confidence:['low','medium','high'].includes(task.estimate?.confidence)?task.estimate.confidence:null,
     assumptions:forecastList(task.estimate?.assumptions),evidence:forecastList(task.estimate?.evidence,8)};
   return {id:task.id,title:forecastString(task.title,140)??task.id,
     status:verified?'verified':rejectedCompletion?'unknown':forecastString(task.status,30)??'unknown',
-    verified,actionable:task.actionable!==false,expired,remainingMinutes,previousMinutes:expired?proposed:null,estimate,
+    verified,unconfirmedCompletion:rejectedCompletion,actionable:task.actionable!==false,expired,remainingMinutes,
+    previousMinutes:expired?proposed:null,estimate,
     dependencies:task.dependencies==null?[]:Array.isArray(task.dependencies) &&
       task.dependencies.length<=400 && task.dependencies.every(id=>typeof id==='string' && id.length<=120)
       ? task.dependencies : null,requirements:forecastList(task.requirementIds,64),
@@ -372,12 +373,20 @@ export function developmentForecast(delivery = {}, {now=Date.now(),status='activ
   delivery = delivery && typeof delivery==='object' ? delivery : {};
   const asOf = timestamp(delivery.observationAt);
   const paused = forecastProjectHolds.has(status);
-  const progress = requirementProgress(delivery.requirements);
   const target = forecastString(delivery.goal)??forecastString(typeof goal==='string'?goal:goal?.title);
   const raw = Array.isArray(delivery.tasks) ? delivery.tasks : [];
-  const validTasks = raw.length<=400 && raw.every(task=>typeof task?.id==='string' && task.id.length>0 && task.id.length<=120);
+  const validTasks = raw.length<=400 && new Set(raw.map(task=>task?.id)).size===raw.length &&
+    raw.every(task=>typeof task?.id==='string' && task.id.length>0 && task.id.length<=120);
   const tasks = validTasks ? raw.map(task=>makeForecastTask(task,verifiedTaskIds,now,delivery.comparableRuns)) : [];
-  const checkpoints = validTasks ? raw.map(task=>requirementProgress(task.requirements)).filter(Boolean) : [];
+  const scoped = verifiedTaskIds instanceof Set;
+  const confirmedRequirements = new Set(tasks.filter(task=>task.verified).flatMap(task=>task.requirements));
+  const requirements = scoped && Array.isArray(delivery.requirements) ? delivery.requirements.map(row=>
+    confirmedRequirements.has(row?.id) ? row : {id:row?.id,title:row?.title}) : delivery.requirements;
+  const progress = requirementProgress(requirements);
+  const checkpoints = validTasks ? raw.map((task,index)=>{
+    if (!scoped || tasks[index].verified || !Array.isArray(task.requirements)) return requirementProgress(task.requirements);
+    return requirementProgress(task.requirements.map(row=>({id:row?.id})));
+  }).filter(Boolean) : [];
   const checkTotal = checkpoints.reduce((sum,row)=>sum+row.total,0);
   const checkAccepted = checkpoints.reduce((sum,row)=>sum+row.accepted,0);
   const outstanding = tasks.filter(task=>!task.verified);
@@ -385,12 +394,14 @@ export function developmentForecast(delivery = {}, {now=Date.now(),status='activ
   const calendar = forecastCalendar(delivery.capacity?.calendar);
   const parallelism = Number.isSafeInteger(delivery.capacity?.parallelism) && delivery.capacity.parallelism>0
     ? Math.min(16,delivery.capacity.parallelism) : 1;
-  const waits = task=>!task.verified && (task.externalWait || (forecastTaskHolds.has(task.status) && task.availableAt===null) ||
-    task.ownerAction);
+  const waits = task=>!task.verified && (task.externalWait || Boolean(task.ownerAction) ||
+    (forecastTaskHolds.has(task.status) && (task.status!=='waiting' || task.availableAt===null)));
   const unresolved = outstanding.filter(waits);
-  const canDate = !paused && calendar && asOf!==null && asOf<=now;
+  const ownerAction = forecastString(delivery.ownerAction);
+  const ownerHold = ownerAction && delivery.ownerActionAppliesTo!=='release';
+  const canDate = !paused && !ownerAction && calendar && asOf!==null && asOf<=now;
   function calendarDates(selected) {
-    if (!canDate || !selected || selected.some(task=>waits(task) || (!task.verified &&
+    if (!canDate || !selected || selected.some(task=>waits(task) || task.unconfirmedCompletion || (!task.verified &&
       (!task.estimate.basis || !task.estimate.confidence)))) return null;
     const times=finishForecast(selected,parallelism,{asOf,calendar});
     if (!times || (selected.some(task=>!task.verified) && times.standard<now)) return null;
@@ -398,7 +409,7 @@ export function developmentForecast(delivery = {}, {now=Date.now(),status='activ
     return Object.values(dates).every(Boolean) ? dates : null;
   }
   const total = ordered && tasks.every(task=>task.remainingMinutes) ? forecastSum(tasks) : null;
-  const readyTaskIds = paused || !ordered ? [] : outstanding.filter(task=>task.actionable && !waits(task) && !forecastTaskHolds.has(task.status) &&
+  const readyTaskIds = paused || ownerHold || !ordered ? [] : outstanding.filter(task=>task.actionable && !task.unconfirmedCompletion && !waits(task) && !forecastTaskHolds.has(task.status) &&
     task.dependencies.every(id=>tasks.find(other=>other.id===id)?.verified) &&
     (task.availableAt===null || task.availableAt<=now)).map(task=>task.id);
   const original = forecastBaseline(Array.isArray(delivery.estimates) ? delivery.estimates.find(row=>row?.kind==='original') : null);
@@ -414,12 +425,16 @@ export function developmentForecast(delivery = {}, {now=Date.now(),status='activ
     baselineAt!==null && (completionDates || outstanding.length) ? (delta!==null ? delta>0 : now>baselineAt) : null;
   const gaps = [];
   const investigationMinutes=remainingEstimate(delivery.investigationMinutes);
-  const missing = (code,reason,action,taskIds=[]) => gaps.push({code,reason,action,taskIds,investigationMinutes});
+  const missing = (code,reason,action,taskIds=[]) => gaps.push({code,reason,action,taskIds,
+    investigationMinutes:['external-wait','owner-action'].includes(code)?null:investigationMinutes});
   if (!target) missing('goal','正式なGOALの参照がありません。','既存のGOAL、課題、または所有者の指示と照合する。');
   if (!progress) missing('requirements','全要求と受入済みの対応が確定していません。','要求の正本と成果物・検証証拠を照合する。');
   if (delivery.scopeComplete!==true) missing('scope','全要求を覆う残工程が確認されていません。','未達要求と既存の作業先を照合し、依存順を特定する。');
   if (!tasks.length || !ordered) missing('dependencies','工程の記録がないか、依存関係を解決できません。','工程一覧、依存ID、循環を正本で確認する。');
   if (asOf===null || asOf>now) missing('observation','有効な観測日時がありません。','発生済みの作業・完了と観測日時を正本で照合する。');
+  const unconfirmed=outstanding.filter(task=>task.unconfirmedCompletion);
+  if (unconfirmed.length) missing('completion-evidence','完了を証明する保存済みの証拠が一致しません。',
+    '完了条件と同じ版の成果物を再確認し、証拠のハッシュと受入結果を記録する。',unconfirmed.map(task=>task.id));
   const untimed=outstanding.filter(task=>!task.remainingMinutes&&!task.expired);
   if (untimed.length) missing('task-estimate','工程の残り工数を算出する根拠が足りません。',
     '各作業量・既存資産を確認し、同じ種類の実績または根拠付きの時間幅を取得する。',untimed.map(task=>task.id));
@@ -432,6 +447,7 @@ export function developmentForecast(delivery = {}, {now=Date.now(),status='activ
   if (unresolved.length) missing('external-wait','停止や外部待ちの解消時刻を確定できません。',
     unresolved.find(task=>task.resolution)?.resolution??'止まっている入力・承認・端末の状態を確認し、解消時に更新する。',
     unresolved.map(task=>task.id));
+  if (ownerAction) missing('owner-action','利用者の対応が残っています。',ownerAction);
   if (!calendar) missing('calendar','稼働を予定できる時間帯が未確認です。','担当と利用枠、稼働時間帯を確認し、経過時間から完成日時を計算する。');
   if (!original) missing('baseline','保存された開始前の見積もりがありません。','既存の履歴を照合し、復元した見込みには事後推定と記録する。');
   const start = timestamp(delivery.startedAt);
@@ -441,7 +457,7 @@ export function developmentForecast(delivery = {}, {now=Date.now(),status='activ
     outstanding.find(task=>readyTaskIds.includes(task.id))?.nextAction ?? gaps[0]?.action ?? null;
   return {goal:target,stage:forecastString(delivery.stage),status,observedAt:forecastJst(asOf),progress,
     checkpoints:checkTotal ? {accepted:checkAccepted,total:checkTotal,percent:progressPercent(checkAccepted,checkTotal)} : null,
-    requirements:Array.isArray(delivery.requirements)?delivery.requirements.slice(0,400).filter(row=>row?.id).map(row=>({
+    requirements:Array.isArray(requirements)?requirements.slice(0,400).filter(row=>row?.id).map(row=>({
       id:row.id,title:forecastString(row.title,140)??row.id,implemented:row.implemented===true,accepted:acceptance(row),
       usable:acceptance(row)&&row.artifact?.usable===true})):[],
     baseline:{kind:original?'original':retrospective?'retrospective':'unavailable',
@@ -453,8 +469,8 @@ export function developmentForecast(delivery = {}, {now=Date.now(),status='activ
       elapsedMinutes:finishForecast(ordered,parallelism),parallelism,completionDates,
       firstUsableDates,
       forecastDeltaMinutes:delta,delayed,readyTaskIds,orderedTaskIds:ordered?.map(task=>task.id)??[]},
-    tasks,gaps,nextAction:action,ownerAction:forecastString(delivery.ownerAction),
-    nextUpdate:{at:paused?null:forecastJst(timestamp(delivery.nextUpdateAt)??(asOf!==null&&asOf<=now?asOf+15*forecastMinute:null)),
-      trigger:paused?'owner-resume':'work-or-observation-change'},
+    tasks,gaps,nextAction:action,ownerAction,
+    nextUpdate:{at:paused||ownerHold?null:forecastJst(timestamp(delivery.nextUpdateAt)??(asOf!==null&&asOf<=now?asOf+15*forecastMinute:null)),
+      trigger:paused?'owner-resume':ownerHold?'owner-action':'work-or-observation-change'},
     diagnostics:forecastDiagnostics(delivery,tasks,delayed,progress)};
 }
