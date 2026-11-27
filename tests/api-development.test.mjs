@@ -402,7 +402,7 @@ test('Codex-to-API handover verifies an approved checkpoint, then sends exact co
       if (++nativeReads === lateMismatch) return {threadId, turnId: 'different-latest-turn', messages};
       return {threadId, turnId, messages: returnedMessages};
     }};
-  const {call, directory, source, requirements, portfolio, ledgerFile, commitFiles, open, store} = await fixture(t, async (_url, request) => {
+  const {call, directory, source, requirements, portfolio, ledgerFile, commitFiles, open, openReader, store} = await fixture(t, async (_url, request) => {
     const payload = JSON.parse(request.body);
     assert.equal(payload.text.format.name, 'project_advice');
     providerInputs.push(JSON.parse(payload.input[1].content));
@@ -437,6 +437,57 @@ test('Codex-to-API handover verifies an approved checkpoint, then sends exact co
   };
   await useCheckpoint(checkpoint);
   const ledger = await readFile(ledgerFile);
+  await t.test('approved completed Codex artifact and evidence are available without API or conversation access', async () => {
+    const reader = await openReader();
+    const list = options => reader('/api/artifacts/work', {query: {source: 'codex'}, ...options});
+    const download = (href, options = {}) => {
+      const link = new URL(href, 'https://fixture.invalid');
+      assert.equal(link.origin, 'https://fixture.invalid');
+      return reader(link.pathname, {query: {...Object.fromEntries(link.searchParams), ...options}});
+    };
+    try {
+      assert.equal((await list({auth: false})).status, 401);
+      assert.deepEqual((await (await list()).json()).artifacts, []);
+      await useCheckpoint({...checkpoint, shareArtifacts: true, shareConversation: false});
+      const response = await list();
+      assert.equal(response.status, 200);
+      const page = await response.json();
+      assert.equal(page.artifacts.length, 1);
+      assert.equal(page.nextOffset, null);
+      const [artifact] = page.artifacts;
+      assert.deepEqual([artifact.project, artifact.title, artifact.sha256], [id, 'source.mjs', checkpoint.artifacts[0].sha256]);
+      assert.equal(artifact.observedAt, row.updatedAt);
+      const artifactResponse = await download(artifact.href);
+      assert.equal(artifactResponse.status, 200);
+      assert.match(artifactResponse.headers.get('content-disposition'), /^attachment/);
+      assert.equal(await artifactResponse.text(), commit[0].text);
+      assert.equal(await (await download(artifact.evidence.requirements.href)).text(), await readFile(requirements, 'utf8'));
+      assert.equal(await (await download(artifact.evidence.verification.href)).text(), commit[1].text);
+      assert.deepEqual((await (await list({project: 'other-fixture'})).json()).artifacts, []);
+      assert.equal((await download(artifact.href, {project: 'other-fixture'})).status, 404);
+      assert.equal((await download(artifact.href, {id: 'unknown-other-operation'})).status, 404);
+      assert.equal((await download(artifact.href, {part: 'arbitrary'})).status, 404);
+      assert.equal((await download(artifact.href, {review: '0'.repeat(64)})).status, 404);
+      assert.deepEqual((await (await reader('/api/artifacts/work')).json()).artifacts, []);
+      assert.equal((await download(artifact.href, {index: '2'})).status, 404);
+
+      await writeFile(source, 'export const answer = 99;\n');
+      assert.equal((await download(artifact.href)).status, 404);
+      assert.deepEqual((await (await list()).json()).artifacts, []);
+      await writeFile(source, commit[0].text);
+      await useCheckpoint({...checkpoint, shareArtifacts: true, effectsReconciled: false});
+      assert.deepEqual((await (await list()).json()).artifacts, []);
+      assert.equal((await download(artifact.href)).status, 404);
+      await useCheckpoint({...checkpoint, shareArtifacts: true, requirementsSha256: {toString: null}});
+      assert.deepEqual((await (await list()).json()).artifacts, []);
+      assert.equal(providerInputs.length, 0);
+      assert.equal(nativeReads, 0);
+      assert.deepEqual(await readFile(ledgerFile), ledger);
+    } finally {
+      await writeFile(source, commit[0].text);
+      await useCheckpoint(checkpoint);
+    }
+  });
   const approved = await proof();
   const result = await approved.json();
   assert.equal(approved.status, 200, JSON.stringify(result));

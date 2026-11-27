@@ -171,7 +171,7 @@ async function committedFile(checkout, baseSha, name, tree, { ownerUid } = {}) {
   return bytes;
 }
 
-export async function readCommittedEvidence({ checkout, paths, signal }) {
+export async function readCommittedEvidence({ checkout, paths, signal, includeBytes = false }) {
   signal?.throwIfAborted();
   if (!Array.isArray(paths) || paths.length === 0 || paths.length > MAX_FILES) {
     throw new Error('A bounded list of committed API evidence paths is required');
@@ -193,7 +193,7 @@ export async function readCommittedEvidence({ checkout, paths, signal }) {
     const bytes = await committedFile(checkout, head, name, tree, { ownerUid });
     size += bytes.length;
     if (size > MAX_WORKSPACE_BYTES) throw new Error('Committed API evidence exceeds its size limit');
-    files.push({ path: name, sha256: hash(bytes) });
+    files.push({ path: name, sha256: hash(bytes), ...(includeBytes ? {bytes} : {}) });
   }
   signal?.throwIfAborted();
   if (checkoutHead(checkout) !== head) throw new Error('API evidence Git HEAD changed during readback');

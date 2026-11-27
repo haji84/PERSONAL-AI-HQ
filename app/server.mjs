@@ -17,6 +17,7 @@ import {createPlanAuth, PLAN_AUTH_CALLBACK_PATH} from './chatgpt-plan-auth.mjs';
 import {createChatGPTResponses} from './chatgpt-responses.mjs';
 import {ensurePrivateDirectory, readPrivateRuntimeToken} from './private-directory.mjs';
 import {createApiDevelopment} from './api-development.mjs';
+import {createNativeArtifacts} from './native-artifacts.mjs';
 import {createCodexPeerVerifier} from './codex-peer.mjs';
 import {localSpeechAvailable, localSpeechMaxChars, synthesizeLocalSpeech} from './local-speech.mjs';
 import {createTailnetAccess, tailnetCookieName} from './tailnet-access.mjs';
@@ -193,6 +194,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
   const operations = createOperations(directory, native, execution, {
     prepareHandover: (...args) => apiWork.prepareNativeHandover(...args),
   });
+  const nativeArtifacts = createNativeArtifacts(directory, operations.completedArtifactSource);
   const apiEnabled = Boolean(apiDevelopment);
   const apiWork = createApiDevelopment({...(!apiEnabled || apiDevelopment === true ? {} : apiDevelopment),
     directory, store: execution.store, conversations: chats, hasNativeWork: operations.hasNativeWork, hasActiveWork: operations.hasActiveWork,
@@ -416,9 +418,17 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
     if (get && route === '/api/artifacts/work') {
       const offset = Number(target.searchParams.get('offset') ?? 0);
       const scope = target.searchParams.get('project');
+      const source = target.searchParams.getAll('source');
       if (!Number.isSafeInteger(offset) || offset < 0) throw error(400, '成果物一覧の位置が正しくありません。');
       if ((scope !== null && !portfolio.projects.has(scope)) || target.searchParams.getAll('project').length > 1) {
         throw error(404, '案件を見つけられませんでした。');
+      }
+      if (source.length > 1 || (source.length && source[0] !== 'codex')) throw error(400, '成果物の取得元を確認できません。');
+      if (source[0] === 'codex') {
+        const projects = scope === null ? [...portfolio.projects.values()] : [portfolio.projects.get(scope)];
+        const result = await nativeArtifacts.list(projects, offset);
+        if (!signedIn()) throw error(401, 'サインインが必要です。');
+        return send(response, 200, result);
       }
       return send(response, 200, apiWork.listArtifacts(scope === null ? [...portfolio.projects.keys()] : [scope], offset));
     }
@@ -464,7 +474,17 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       if (target.searchParams.getAll('project').length !== 1) throw error(404, '案件を見つけられませんでした。');
       const value = target.searchParams.get('index');
       if (!value || !/^\d{1,2}$/.test(value)) throw error(404, apiMessages.API_ARTIFACT_NOT_FOUND);
-      const {bytes, name} = await apiWork.artifact(project, target.searchParams.get('id'), Number(value));
+      const source = target.searchParams.getAll('source');
+      const receipt = target.searchParams.get('id');
+      const part = target.searchParams.get('part');
+      if (source.length && (source.length !== 1 || source[0] !== 'codex' || route !== '/api/artifacts/work/file' ||
+          ['id', 'index', 'part', 'review'].some(key => target.searchParams.getAll(key).length !== 1))) {
+        throw error(404, apiMessages.API_ARTIFACT_NOT_FOUND);
+      }
+      const {bytes, name} = source.length
+        ? await nativeArtifacts.artifact(project, receipt, Number(value), part, target.searchParams.get('review'))
+        : await apiWork.artifact(project, receipt, Number(value));
+      if (!signedIn()) throw error(401, 'サインインが必要です。');
       const encoded = encodeURIComponent(name).replace(/[!'()*]/g, char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
       response.writeHead(200, {'Content-Type': 'application/octet-stream', 'Content-Length': bytes.length,
         'Content-Disposition': `attachment; filename*=UTF-8''${encoded}`});

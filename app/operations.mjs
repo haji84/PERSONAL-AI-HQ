@@ -284,6 +284,13 @@ export function createOperations(directory, native, execution, {prepareHandover}
       const row = latestAccepted.get(project.id, checkout);
       return row?.phase === 'completed' && row.threadId === threadId ? row : null;
     },
+    completedArtifactSource(project, checkout, {operationId, threadId, turnId}) {
+      if (typeof operationId !== 'string' || !allowedId.test(operationId) || typeof threadId !== 'string' ||
+          !nativeThreadId.test(threadId) || typeof turnId !== 'string' || !turnId || !project.cwd.includes(checkout)) return null;
+      const row = byId.get(project.id, operationId);
+      return row?.phase === 'completed' && row.workspace === checkout && row.threadId === threadId && row.turnId === turnId
+        ? {id: row.id, threadId: row.threadId, turnId: row.turnId, updatedAt: row.updatedAt} : null;
+    },
     updateExecution(project, update) {
       db.exec('BEGIN IMMEDIATE');
       try {

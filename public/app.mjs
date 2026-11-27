@@ -2660,9 +2660,12 @@ function codex() {
 }
 function artifacts() {
   const registered = asArray(ui.portfolio?.artifacts);
-  const workArtifacts = new Map();
+  const sources = [
+    {label: '通常API', name: undefined, files: new Map(), offset: 0},
+    {label: 'Codex', name: 'codex', files: new Map(), offset: 0},
+  ];
+  const openProof = new Set();
   let generation = 0;
-  let page = 0;
   const section = panel('確認済みの成果物');
   const scope = node('label', 'picker artifact-filter');
   const only = node('select');
@@ -2678,13 +2681,40 @@ function artifacts() {
   section.header.append(scope);
   const list = node('ul', 'rows');
   const empty = node('p', 'empty');
-  const workStatus = node('p', 'muted small');
-  workStatus.hidden = true;
   const searchWrap = node('div', 'search-wrap');
+  function codexDownload(label, href, asButton = false) {
+    const action = link(label, href, true, asButton);
+    if (!action || new URL(action.href).origin !== location.origin) return null;
+    action.download = '';
+    return action;
+  }
+
+  function proofFor(artifact) {
+    const actions = [['要件', artifact.evidence?.requirements], ['検証記録', artifact.evidence?.verification]]
+      .flatMap(([label, proof]) => {
+        if (typeof proof?.path !== 'string' || !proof.path) return [];
+        const download = codexDownload(label + ' · ' + proof.path, proof.href);
+        return download ? [listItem(download)] : [];
+      });
+    if (!actions.length) return null;
+    const details = node('details', 'small');
+    details.append(node('summary', '', '要件と検証記録'));
+    const proof = node('ul', 'marked-list');
+    proof.append(...actions);
+    details.append(proof);
+    details.open = openProof.has(artifact.href);
+    details.addEventListener('toggle', () => {
+      if (details.open) openProof.add(artifact.href);
+      else openProof.delete(artifact.href);
+    });
+    return details;
+  }
+
   function filter(query) {
-    const visible = [...registered, ...workArtifacts.values()].filter(item => (only.value !== 'project' || item.project === ui.project) &&
-      matches(query, item.title, item.description, item.observedAt, time(item.observedAt),
-        projectList().find(candidate => candidate.id === item.project)?.name))
+    const visible = [...registered, ...sources.flatMap(source => [...source.files.values()])]
+      .filter(item => (only.value !== 'project' || item.project === ui.project) &&
+        matches(query, item.title, item.description, item.observedAt, time(item.observedAt),
+          projectList().find(candidate => candidate.id === item.project)?.name))
       .sort((a, b) => (Date.parse(b.observedAt) || 0) - (Date.parse(a.observedAt) || 0));
     list.replaceChildren();
     for (const artifact of visible) {
@@ -2692,10 +2722,17 @@ function artifacts() {
       const main = node('div');
       main.append(node('h3', '', text(artifact.title)));
       const project = projectList().find(candidate => candidate.id === artifact.project);
-      main.append(node('p', 'muted small', (project?.name ?? 'プロジェクト不明') + ' · 確認 ' + time(artifact.observedAt)));
+      const fromCodex = artifact.workSource === 'codex';
+      main.append(node('p', 'muted small', (project?.name ?? 'プロジェクト不明') +
+        (fromCodex ? ' · Codex' : '') + ' · 確認 ' + time(artifact.observedAt)));
       if (artifact.description) main.append(node('p', '', artifact.description));
+      if (fromCodex) {
+        const proof = proofFor(artifact);
+        if (proof) main.append(proof);
+      }
       item.append(main);
-      const action = link(artifact.kind === 'file' ? '取得' : '開く', artifact.href, true, true);
+      const action = fromCodex ? codexDownload('取得', artifact.href, true) :
+        link(artifact.kind === 'file' ? '取得' : '開く', artifact.href, true, true);
       if (action) item.append(action);
       else item.append(chip('unknown', '取得先未確認'));
       list.append(listItem(item));
@@ -2703,44 +2740,73 @@ function artifacts() {
     empty.hidden = visible.length > 0;
     empty.textContent = query ? '一致する成果物がありません。' : '表示できる確認済みの成果物はありません。';
   }
-  const more = button('以前の検証済み成果物を表示', () => loadWork());
-  more.hidden = true;
-  async function loadWork() {
+  const controls = node('div', 'pagination run-actions');
+  for (const source of sources) {
+    source.more = button('以前の' + source.label + '成果物を表示', () => loadWork(source));
+    source.more.hidden = true;
+    source.retry = button(source.label + 'の成果物を再取得', () => loadWork(source));
+    source.retry.hidden = true;
+    source.status = node('p', 'muted small');
+    source.status.setAttribute('role', 'status');
+    source.status.hidden = true;
+    controls.append(source.more, source.status, source.retry);
+  }
+
+  async function loadWork(source) {
+    if (source.request || source.offset === null) return;
     const generationAtStart = generation;
     const current = () => section.root.isConnected && generationAtStart === generation;
-    const offset = page;
-    more.disabled = true;
+    const offset = source.offset;
+    const request = new AbortController();
+    source.request = request;
+    source.more.disabled = source.retry.disabled = true;
     try {
-      const result = await api(apiPath('/api/artifacts/work', {project: only.value === 'project' ? ui.project : undefined, offset}));
+      const result = await api(apiPath('/api/artifacts/work', {
+        project: only.value === 'project' ? ui.project : undefined, source: source.name, offset,
+      }), {signal: request.signal});
       if (!current()) return;
-      for (const file of asArray(result.artifacts)) workArtifacts.set(file.href, file);
-      page = Number.isSafeInteger(result.nextOffset) && result.nextOffset > offset ? result.nextOffset : null;
-      more.hidden = page === null;
-      workStatus.hidden = true;
+      if (!Array.isArray(result?.artifacts)) throw new Error('Invalid artifact response');
+      for (const file of result.artifacts) {
+        if (typeof file?.href !== 'string' || (source.name && file.kind !== 'file')) continue;
+        source.files.set(file.href, {...file, workSource: source.name});
+      }
+      source.offset = Number.isSafeInteger(result.nextOffset) && result.nextOffset > offset ? result.nextOffset : null;
+      source.more.hidden = source.offset === null;
+      source.status.hidden = source.retry.hidden = true;
       filter(search.value);
     } catch {
       if (!current()) return;
-      workStatus.textContent = '通常APIの成果物を読み取れませんでした。';
-      workStatus.hidden = false;
-    } finally { if (current()) more.disabled = false; }
+      source.status.textContent = source.label + 'の成果物を読み取れませんでした。';
+      source.status.hidden = source.retry.hidden = false;
+      source.more.hidden = true;
+    } finally {
+      if (current()) {
+        source.request = null;
+        source.more.disabled = source.retry.disabled = false;
+      }
+    }
   }
   const search = queryInput('artifact-search', '成果物を検索', '成果物を検索', filter);
   only.addEventListener('change', () => {
     ui.searches.set('artifact-filter', only.value);
     storeTab();
     generation++;
-    page = 0;
-    more.hidden = true;
-    workArtifacts.clear();
+    for (const source of sources) {
+      source.request?.abort();
+      source.request = null;
+      source.offset = 0;
+      source.more.hidden = source.status.hidden = source.retry.hidden = true;
+      source.files.clear();
+    }
     filter(search.value);
-    void loadWork();
+    for (const source of sources) void loadWork(source);
   });
   searchWrap.append(search);
   section.body.remove();
-  section.root.append(searchWrap, empty, list, workStatus, more);
+  section.root.append(searchWrap, empty, list, controls);
   dom.content.append(section.root);
   filter(search.value);
-  void loadWork();
+  for (const source of sources) void loadWork(source);
 }
 function emptyProject() {
   dom.content.append(node('p', 'empty panel', '上のプロジェクト欄から対象を選んでください。'));
