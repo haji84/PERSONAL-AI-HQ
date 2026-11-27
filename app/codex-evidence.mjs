@@ -12,6 +12,11 @@ const absolutePathText = /(^|[\s="'(<:\u0060])((?:[a-z]:[\\/]|\\\\|\/)[^\s"'<>|;
 const windowsWorkspace = /^[a-z]:[\\/]|^\\\\/i;
 const posixShellLauncher = /^(["']?)\/(?:usr\/)?bin\/(?:bash|sh|zsh)\1[ \t]+-[a-z]*c[ \t]+/u;
 const windowsShellLauncher = /^(["']?)(?:[a-z]:\\Windows\\System32\\(?:cmd\.exe|WindowsPowerShell\\v1\.0\\powershell\.exe)|cmd(?:\.exe)?|powershell(?:\.exe)?)\1(?:[ \t]+(?:\/[ds]|-NoProfile|-NonInteractive))*[ \t]+(?:\/c|-Command)[ \t]+/iu;
+// Recognize the standard PowerShell 7 install and the Codex-owned packaged shell in recorded commands.
+const powershell7Launcher = /^(["']?)(?:pwsh(?:\.exe)?|[a-z]:[\\/]Program Files[\\/](?:PowerShell[\\/]7|WindowsApps[\\/]OpenAI\.CodexPrimaryRuntime\.[a-z0-9.-]+_[\d.]+_(?:x64|arm64)__3k8sg7r9htsxt[\\/]dependencies[\\/]native[\\/]powershell)[\\/]pwsh\.exe)\1(?=[ \t]|$)/iu;
+const powershell7Command = /^(?:[ \t]+-(?:NoLogo|NoProfile|NonInteractive))*[ \t]+-Command[ \t]+/iu;
+const windowsCommandStart = /^(?:&[ \t]*)?(?:"([^"\r\n]+)"|'([^'\r\n]+)'|([^\s"'<>;&|]+))/u;
+const powershell7Name = /^pwsh(?:\.(?:exe|cmd|bat|ps1))?$/iu;
 const literalAbsolutePath = /(["'])((?:[a-z]:|[\\/])[^"'\r\n]*)\1|(?<![^\s"'=<>|;(&,\u0060])((?:[a-z]:|[\\/])[^\s"'<>|;)&,\u0060]*)/giu;
 const unresolvedPath = /(?:^|[\s"'=<>|;(&,\\/\u0060])(?:\.\.(?=$|[\s"'\\/>|;)&,])|~(?:[\w.-]+)?(?=$|[\s"'\\/])|\$(?:\{[^}\r\n]+\}|(?:env:)?[a-z_][a-z0-9_]*)|%[a-z_][a-z0-9_]*%)/iu;
 
@@ -39,15 +44,33 @@ function outsideCommandAction(actions, workspace, cwd) {
   });
 }
 
-function outsideCommandLiteral(command, workspace, cwd) {
+function commandInScope(command, workspace, cwd) {
   // The native shell wrapper is an executable, not a file argument. Check the payload.
-  const launcher = windowsWorkspace.test(workspace) ? windowsShellLauncher : posixShellLauncher;
-  const payload = command.replace(launcher, '');
-  if (unresolvedPath.test(payload)) return true;
-  for (const match of payload.matchAll(literalAbsolutePath)) {
-    if (relativeMetadata(workspace, match[2] ?? match[3], true, cwd) === undefined) return true;
+  const windows = windowsWorkspace.test(workspace);
+  const trimmed = windows ? command.trimStart() : command;
+  const pwsh = windows && powershell7Launcher.exec(trimmed);
+  let display = command;
+  let payload;
+  if (pwsh) {
+    const args = trimmed.slice(pwsh[0].length);
+    const flags = powershell7Command.exec(args);
+    if (!flags) return;
+    payload = args.slice(flags[0].length).trim();
+    if (!payload || /^(?:"-"|'-'|-)(?:\s|$)|^(["'])\s*\1$/u.test(payload)) return;
+    display = 'pwsh.exe' + args;
+  } else {
+    if (windows) {
+      const start = windowsCommandStart.exec(trimmed);
+      const executable = start?.[1] ?? start?.[2] ?? start?.[3];
+      if (executable && powershell7Name.test(win32.basename(executable))) return;
+    }
+    payload = command.replace(windows ? windowsShellLauncher : posixShellLauncher, '');
   }
-  return false;
+  if (unresolvedPath.test(payload)) return;
+  for (const match of payload.matchAll(literalAbsolutePath)) {
+    if (relativeMetadata(workspace, match[2] ?? match[3], true, cwd) === undefined) return;
+  }
+  return display;
 }
 
 function cleanText(value) {
@@ -75,12 +98,13 @@ function commandEvidence(raw, workspace) {
   if (Number.isSafeInteger(item.durationMs) && item.durationMs >= 0) entry.durationMs = item.durationMs;
 
   const command = typeof item.command === 'string' && item.command.length <= 16000 && cleanText(item.command);
-  if (cwd === undefined || !command || credential.test(command) || sensitiveCommand.test(command) ||
-      outsideCommandAction(item.commandActions, workspace, item.cwd) || outsideCommandLiteral(command, workspace, item.cwd)) {
+  const scoped = cwd !== undefined && command && !credential.test(command) && !sensitiveCommand.test(command) &&
+    !outsideCommandAction(item.commandActions, workspace, item.cwd) && commandInScope(command, workspace, item.cwd);
+  if (!scoped) {
     entry.outputState = 'hidden';
     return entry;
   }
-  const commandText = displayText(command, workspace, 1200);
+  const commandText = displayText(scoped, workspace, 1200);
   entry.command = commandText.text;
   if (commandText.truncated) entry.truncated = true;
   if (raw.outputDeferred === true) {

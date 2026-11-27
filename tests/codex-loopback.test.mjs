@@ -302,6 +302,65 @@ test('unknown command actions hide outside literals in both the evidence page an
   assert.equal(deferred.entry.output, 'fixture-deferred-local');
 });
 
+test('PowerShell 7 evidence shows scoped command results and hides opaque or external inputs', async t => {
+  const projectRoot = 'C:\\Fixture\\Project';
+  const turnId = 'powershell-evidence-turn';
+  const installed = '"C:\\Program Files\\PowerShell\\7\\pwsh.exe"';
+  const packaged = '"C:\\Program Files\\WindowsApps\\OpenAI.CodexPrimaryRuntime.v26-813-10124-0_26.813.10124.0_x64__3k8sg7r9htsxt\\dependencies\\native\\powershell\\pwsh.exe"';
+  const make = (id, command, outputDeferred = false) => ({
+    turnId, outputDeferred, item: {id, command, type: 'commandExecution', status: 'completed', cwd: projectRoot,
+      commandActions: [{type: 'unknown', command}], aggregatedOutput: 'fixture-' + id, exitCode: 0},
+  });
+  const rows = [
+    make('local', installed + ' -NoLogo -NoProfile -NonInteractive -Command "node --test proof.test.mjs"'),
+    make('deferred', 'C:\\Program Files\\PowerShell\\7\\pwsh.exe -NoProfile -Command "Write-Output proof"', true),
+    make('bare', 'pwsh -NoProfile -Command "Write-Output proof"'),
+    make('packaged', packaged + ' -NoProfile -Command "Write-Output proof"'),
+    make('leading-space', '  pwsh.exe -NoProfile -Command "Write-Output proof"'),
+    make('outside', installed + ' -NoProfile -Command "Get-Content B:\\Outside\\example.txt"'),
+    make('outside-unc', installed + " -Command 'Get-Content \"\\\\server\\share\\example.txt\"'"),
+    make('secret', installed + ' -NoProfile -Command "Write-Output $env:PRIVATE_VALUE"'),
+    make('unknown-launcher', '"C:\\Unapproved\\pwsh.exe" -Command "Write-Output proof"'),
+    make('different-package', packaged.replace('3k8sg7r9htsxt', '0000000000000') + ' -Command "Write-Output proof"'),
+    make('encoded', 'pwsh -EncodedCommand ZgBpAHgAdAB1AHIAZQA='),
+    make('spaced-encoded', ' pwsh -EncodedCommand ZgBpAHgAdAB1AHIAZQA='),
+    make('relative-encoded', '.\\pwsh.exe -EncodedCommand ZgBpAHgAdAB1AHIAZQA='),
+    make('relative-call', '& ".\\bin\\pwsh.exe" -EncodedCommand ZgBpAHgAdAB1AHIAZQA='),
+    make('stdin', 'pwsh -NoProfile -Command -'),
+    make('stdin-quoted', 'pwsh.exe -Command "-" example'),
+    make('file', 'pwsh.exe -File proof.ps1'),
+    make('other-flag', 'pwsh.exe -CommandWithArgs "Write-Output proof"'),
+  ];
+  const {client} = await fixture(t, {thread: {...fixtureThread, cwd: projectRoot}, rpcResults: {
+    'thread/items/list': ({cursor, limit}) => cursor
+      ? {data: rows.slice(limit), nextCursor: null}
+      : {data: rows.slice(0, limit), nextCursor: 'powershell-page-2'},
+    'thread/items/read': ({itemIds: [id]}) => ({data: [{...rows.find(row => row.item.id === id), outputDeferred: false}]}),
+  }});
+  const native = client();
+  const read = item => native.readTurnEvidence([projectRoot], fixtureThread.id, turnId, item ? {item} : {});
+  const first = await read();
+  assert.equal(first.nextCursor, 'powershell-page-2');
+  const second = await native.readTurnEvidence([projectRoot], fixtureThread.id, turnId, {cursor: first.nextCursor});
+  assert.equal(second.nextCursor, null);
+  const entries = [...first.entries, ...second.entries];
+  assert.deepEqual(entries.map(({id, outputState}) => [id, outputState]), [
+    ['local', 'visible'], ['deferred', 'deferred'], ['bare', 'visible'], ['packaged', 'visible'], ['leading-space', 'visible'],
+    ...rows.slice(5).map(({item}) => [item.id, 'hidden']),
+  ]);
+  assert.match(entries[0].command, /pwsh\.exe.*node --test proof\.test\.mjs/i);
+  assert.doesNotMatch(entries[0].command, /Program Files/i);
+  assert.equal(entries[0].output, 'fixture-local');
+  assert.equal((await read('deferred')).entry.output, 'fixture-deferred');
+  for (const {item: {id}} of rows.slice(5)) {
+    const {entry} = await read(id);
+    assert.equal(entry.outputState, 'hidden', id);
+    assert.equal(entry.command, undefined);
+    assert.equal(entry.output, undefined);
+    assert.equal(entry.exitCode, 0);
+  }
+});
+
 test('loopback rejects any noncanonical destination, unsafe token, and mixed transport synchronously', () => {
   const url = 'ws://127.0.0.1:8123';
   for (const invalidUrl of ['ws://localhost:8123', 'ws://127.1:8123', 'ws://[::1]:8123', 'ws://0.0.0.0:8123',
