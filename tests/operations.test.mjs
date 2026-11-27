@@ -305,6 +305,91 @@ test('native completion wins over a pending cancellation and stale receipts cann
   event('turn/completed', {threadId: 'fixture-thread', turn: {id: next.id + '-turn', status: 'interrupted'}});
   assert.equal((await operations.cancel(project, next.id)).operation.phase, 'cancelled');
   assert.equal(interrupts, 1);
+  await assert.rejects(operations.start(project, {...request, id: 'old-resume-after-cancel', resume: request.id}),
+    {status: 409, code: 'CODEX_RESUME_TARGET_UNAVAILABLE'});
+});
+
+test('selected thread reads and continuations remain tied to that thread and its latest receipt', async t => {
+  const {project, open} = await fixture(t);
+  const sent = [];
+  const operations = open({async submit(input) {
+    const threadId = input.knownId ?? input.requestId + '-thread';
+    assert.equal(input.onThread(threadId), true);
+    sent.push([input.requestId, input.knownId, input.previousTurnId]);
+    return {turn: {id: input.requestId + '-turn', status: 'completed'}};
+  }});
+  await operations.start(project, {id: 'selected-first', prompt: 'A fixture'});
+  await operations.start(project, {id: 'separate-second', prompt: 'A separate fixture'});
+  assert.equal((await operations.read(project)).operation.id, 'separate-second');
+  assert.equal((await operations.read(project, null, null, 'selected-first-thread')).operation.id, 'selected-first');
+  assert.equal((await operations.read(project, null, null, 'external-thread')).operation, null);
+  const request = {id: 'continued-first', prompt: 'Continue this thread', resume: 'selected-first'};
+  await assert.rejects(operations.start(project, {...request, expectedThreadId: 'separate-second-thread'}),
+    {status: 409, code: 'CODEX_RESUME_TARGET_UNAVAILABLE'});
+  assert.equal(sent.length, 2);
+  const exact = {...request, expectedThreadId: 'selected-first-thread'};
+  await operations.start(project, exact);
+  assert.deepEqual(sent.at(-1), ['continued-first', 'selected-first-thread', 'selected-first-turn']);
+  assert.equal((await operations.start(project, exact)).operation.id, 'continued-first');
+  await assert.rejects(operations.start(project, {...exact, id: 'obsolete-first'}),
+    {status: 409, code: 'CODEX_RESUME_TARGET_UNAVAILABLE'});
+  assert.equal(sent.length, 3);
+});
+
+test('selected thread lookup recovers an unsent receipt and preserves its cancellation across restart', async t => {
+  const {project, open} = await fixture(t);
+  let lateSend;
+  const first = open({async submit(input) {
+    if (input.knownId) {
+      lateSend = input.onThread;
+      return new Promise(() => {});
+    }
+    assert.equal(input.onThread('fixture-thread'), true);
+    return {turn: {id: 'fixture-turn', status: 'completed'}};
+  }});
+  const original = {id: 'thread-original', prompt: 'A fixture'};
+  await first.start(project, original);
+  const resumed = {id: 'thread-unsent', prompt: 'Withhold this fixture', resume: original.id, expectedThreadId: 'fixture-thread'};
+  await first.start(project, resumed);
+  const second = open({async submit() { assert.fail('The cancelled thread cannot send'); }});
+  let chosen = (await second.read(project, null, null, 'fixture-thread')).operation;
+  assert.deepEqual([chosen.id, chosen.threadId, chosen.expectedThreadId, chosen.phase],
+    [resumed.id, null, resumed.expectedThreadId, 'reserved']);
+  await second.cancel(project, resumed.id);
+  assert.equal(lateSend('fixture-thread'), false);
+  chosen = (await second.read(project, null, null, 'fixture-thread')).operation;
+  assert.deepEqual([chosen.id, chosen.phase], [resumed.id, 'cancelled']);
+  await assert.rejects(second.start(project, {...resumed, id: 'thread-revival'}), {code: 'CODEX_RESUME_TARGET_UNAVAILABLE'});
+});
+
+test('a resumed receipt does not adopt a foreign turn from an event with its own client ID', async t => {
+  const {project, open} = await fixture(t);
+  let nativeEvent, interrupts = 0;
+  const operations = open({
+    onEvent(callback) { nativeEvent = callback; },
+    async submit(input) {
+      assert.equal(input.onThread('fixture-thread'), true);
+      if (!input.knownId) return {turn: {id: 'first-turn', status: 'completed'}};
+      nativeEvent('item/started', {threadId: 'fixture-thread', turnId: 'external-turn',
+        item: {type: 'userMessage', clientId: input.requestId}});
+      throw new Error('Could not verify the first user item');
+    },
+    async findSubmission(_workspace, _thread, _client, turn, verifiesOwnership) {
+      assert.equal(turn, null);
+      assert.equal(verifiesOwnership, true);
+      return null;
+    },
+    async interrupt() { interrupts++; },
+  });
+  await operations.start(project, {id: 'thread-first-turn', prompt: 'A fixture'});
+  const resumed = {id: 'thread-next-turn', prompt: 'Continue', resume: 'thread-first-turn', expectedThreadId: 'fixture-thread'};
+  await operations.start(project, resumed);
+  await until(async () => (await operations.read(project, resumed.id)).operation.phase === 'unconfirmed');
+  const result = await operations.read(project, resumed.id);
+  assert.equal(result.operation.phase, 'unconfirmed');
+  assert.equal(result.operation.turnId, null);
+  assert.equal((await operations.cancel(project, resumed.id)).operation.phase, 'cancelling');
+  assert.equal(interrupts, 0);
 });
 
 test('cancel adopts an existing ordinary interrupt across connections without dispatching a second one', async t => {

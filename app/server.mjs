@@ -440,8 +440,19 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       }
     }
     if (route === '/api/codex/run') {
-      if (get) return send(response, 200, await operations.read(project, target.searchParams.get('id'), target.searchParams.get('handoverReceipt')));
-      if (post) return send(response, 202, await operations.start(project, await jsonBody(request, 768 * 1024)));
+      if (get) {
+        if (target.searchParams.has('thread') && (target.searchParams.getAll('thread').length !== 1 ||
+            target.searchParams.getAll('project').length !== 1)) throw error(400, '照合するスレッドを1件指定してください。');
+        return send(response, 200, await operations.read(project, target.searchParams.get('id'),
+          target.searchParams.get('handoverReceipt'), target.searchParams.get('thread')));
+      }
+      if (post) {
+        const input = await jsonBody(request, 768 * 1024);
+        if (input?.expectedThreadId !== undefined && target.searchParams.getAll('project').length !== 1) {
+          throw error(400, '案件を1件指定してください。');
+        }
+        return send(response, 202, await operations.start(project, input));
+      }
     }
     if (post && route === '/api/codex/interrupt') {
       const data = await jsonBody(request, 4096);
@@ -484,8 +495,13 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       return send(response, 200, result);
     }
     if (get && route === '/api/codex/thread') {
-      if (!project.cwd.length) throw error(404, 'この案件のCodex接続情報がありません。');
-      return send(response, 200, await native.readThread(project.cwd, target.searchParams.get('id'), target.searchParams.get('cursor')));
+      if (!project.cwd.length || target.searchParams.getAll('project').length !== 1 || target.searchParams.getAll('id').length !== 1) {
+        throw error(404, 'この案件のCodex接続情報がありません。');
+      }
+      const id = target.searchParams.get('id');
+      const {desktopThreadId, ...view} = await native.readThread(project.cwd, id, target.searchParams.get('cursor'));
+      const managed = operations.managesThread(project, id);
+      return send(response, 200, {...view, managed, ...(!remote && !managed && desktopThreadId === id ? {desktopThreadId} : {})});
     }
     throw error(404, '見つかりませんでした。');
   }
@@ -496,7 +512,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       if (response.headersSent) { response.destroy(); return; }
       const status = typeof problem?.status === 'number' ? problem.status : 500;
       send(response, status, {error: status === 500 ? '状態を読み取れませんでした。' : apiMessages[problem.code] ?? problem.message,
-        ...(problem.code === 'CODEX_IMAGE_MODEL_UNAVAILABLE' ? {code: problem.code} : {})});
+        ...(['CODEX_IMAGE_MODEL_UNAVAILABLE', 'CODEX_RESUME_TARGET_UNAVAILABLE'].includes(problem.code) ? {code: problem.code} : {})});
     });
   });
   const server = makeServer(false);

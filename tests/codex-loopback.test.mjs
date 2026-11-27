@@ -9,11 +9,14 @@ import {createCodexClient, isCodexLoopbackUrl} from '../app/codex.mjs';
 const fixtureToken = randomBytes(32).toString('base64url');
 const workspace = 'C:\\Fixture\\owner';
 const foreignWorkspace = 'C:\\Fixture\\other';
-const fixtureThread = {id: 'exact-thread', cwd: workspace, modelProvider: 'openai'};
+const fixtureThread = {id: '018f1cd1-6658-7fc4-bcc4-13fbdd3555a1', cwd: workspace, modelProvider: 'openai',
+  status: {type: 'idle'}, ephemeral: false};
 const fixtureTurn = {id: 'exact-turn', status: 'inProgress'};
+const priorTurn = {id: 'completed-turn', status: 'completed'};
 const admitPeer = async () => {};
 
-async function fixture(t, {accountType = 'chatgpt', redirect} = {}) {
+async function fixture(t, {accountType = 'chatgpt', redirect, thread = fixtureThread, turn = priorTurn, resumed = thread,
+  firstUser = 'fixture-request'} = {}) {
   const server = http.createServer();
   const websocket = new WebSocketServer({noServer: true});
   const calls = [];
@@ -50,8 +53,10 @@ async function fixture(t, {accountType = 'chatgpt', redirect} = {}) {
         const results = {
           initialize: {}, 'account/read': {requiresOpenaiAuth: true, account: accountType && {type: accountType}},
           'thread/list': {data: [fixtureThread, {id: 'outside', cwd: foreignWorkspace}]},
-          'thread/read': {thread: params?.threadId === 'outside' ? {id: 'outside', cwd: foreignWorkspace} : fixtureThread},
-          'thread/start': {thread: fixtureThread}, 'thread/resume': {thread: fixtureThread}, 'turn/start': {turn: fixtureTurn},
+          'thread/read': {thread: params?.threadId === 'outside' ? {id: 'outside', cwd: foreignWorkspace} : thread},
+          'thread/start': {thread}, 'thread/resume': {thread: resumed}, 'turn/start': {turn: fixtureTurn},
+          'thread/turns/list': {data: turn ? [turn] : []},
+          'thread/items/list': {data: [{turnId: params?.turnId, item: {type: 'userMessage', clientId: firstUser}}]},
           'turn/steer': {turnId: fixtureTurn.id}, 'turn/interrupt': {},
         };
         const result = results[method];
@@ -113,7 +118,8 @@ test('authorized loopback shares initialization and preserves scope, checks, and
   assert.equal(calls.some(([method]) => method === 'thread/start' || method === 'thread/resume'), false);
   await assert.rejects(native.submit({...request, onThread: () => false}), {status: 503});
   assert.equal(calls.some(([method]) => method === 'turn/start'), false);
-  assert.deepEqual(await native.submit({...request, knownId: fixtureThread.id}), {threadId: fixtureThread.id, turn: fixtureTurn});
+  assert.deepEqual(await native.submit({...request, knownId: fixtureThread.id, previousTurnId: priorTurn.id}),
+    {threadId: fixtureThread.id, turn: fixtureTurn});
   const [, turn] = calls.find(([method]) => method === 'turn/start');
   assert.equal(turn.threadId, fixtureThread.id);
   assert.equal(turn.clientUserMessageId, request.requestId);
@@ -138,6 +144,40 @@ test('authorized loopback shares initialization and preserves scope, checks, and
   ]);
   assert.equal(await native.steer({workspace, threadId: fixtureThread.id, turnId: fixtureTurn.id,
     prompt: 'Add one instruction.', requestId: 'fixture-steering'}), fixtureTurn.id);
+});
+
+test('cross-client or stale native turns cannot receive a managed continuation', async t => {
+  const active = {...fixtureThread, status: {type: 'active'}};
+  for (const [name, options, mayResume] of [
+    ['already active', {thread: active}, false],
+    ['active after resume', {resumed: active}, true],
+    ['different latest turn', {turn: {...priorTurn, id: 'newer-turn'}}, false],
+    ['in-progress latest turn', {turn: {...priorTurn, status: 'inProgress'}}, false],
+  ]) {
+    await t.test(name, async run => {
+      const {client, calls} = await fixture(run, options);
+      await assert.rejects(client().submit({...request, knownId: fixtureThread.id, previousTurnId: priorTurn.id}),
+        {code: 'CODEX_RESUME_TARGET_UNAVAILABLE'});
+      assert.equal(calls.some(([method]) => method === 'thread/resume'), mayResume);
+      assert.equal(calls.some(([method]) => method === 'turn/start'), false);
+    });
+  }
+});
+
+test('a verified desktop handoff identifies only a persisted native thread', async t => {
+  const persisted = await fixture(t);
+  const ephemeral = await fixture(t, {thread: {...fixtureThread, ephemeral: true}});
+  assert.equal((await persisted.client().readThread([workspace], fixtureThread.id)).desktopThreadId, fixtureThread.id);
+  assert.equal((await ephemeral.client().readThread([workspace], fixtureThread.id)).desktopThreadId, undefined);
+  await assert.rejects(persisted.client().readThread([foreignWorkspace], fixtureThread.id), {status: 404});
+});
+
+test('Codex adding this client to a different active turn does not confer ownership of that turn', async t => {
+  const {client, calls} = await fixture(t, {firstUser: 'external-writer'});
+  const native = client();
+  await assert.rejects(native.submit({...request, knownId: fixtureThread.id, previousTurnId: priorTurn.id}), {status: 503});
+  assert.equal(calls.filter(([method]) => method === 'turn/start').length, 1);
+  assert.equal(calls.some(([method]) => method === 'turn/interrupt'), false);
 });
 
 test('a denied handshake, redirect, or logged-out account never starts a writable connection elsewhere', async t => {

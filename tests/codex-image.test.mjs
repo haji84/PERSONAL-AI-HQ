@@ -37,20 +37,24 @@ async function fixture(t, {catalog = [fixtureModel('image-model', true, ['text',
   const calls = [];
   let app;
   let turn = 0;
+  let firstUserId;
   t.after(async () => {
     await app?.close();
     for (const client of websocket.clients) client.terminate();
     await new Promise(resolve => server.close(resolve));
     await rm(directory, {recursive: true, force: true});
   });
-  const thread = {id: 'exact-thread', cwd: workspace, modelProvider: 'openai'};
+  const thread = {id: 'exact-thread', cwd: workspace, modelProvider: 'openai', ephemeral: false, status: {type: 'idle'}};
   websocket.on('connection', connection => {
     connection.on('message', bytes => {
       const {id, method, params} = JSON.parse(bytes);
       if (id === undefined) return;
       calls.push([method, params]);
       const results = {initialize: {}, 'account/read': {account: {type: 'chatgpt'}, requiresOpenaiAuth: true},
-        'model/list': {data: catalog}, 'thread/start': {thread}, 'thread/resume': {thread}, 'thread/read': {thread}};
+        'model/list': {data: catalog}, 'thread/start': {thread}, 'thread/resume': {thread}, 'thread/read': {thread},
+        'thread/items/list': {data: [{turnId: params?.turnId, item: {type: 'userMessage', clientId: firstUserId}}]},
+        'thread/turns/list': {data: turn ? [{id: `exact-turn-${turn}`, status: 'completed'}] : []}};
+      if (method === 'turn/start') firstUserId = params.clientUserMessageId;
       const result = method === 'turn/start' ? {turn: {id: `exact-turn-${++turn}`, status: 'completed'}} : results[method];
       connection.send(JSON.stringify({id, ...(result ? {result} : {error: {code: -32601}})}));
     });
@@ -84,6 +88,9 @@ test('one validated image is sent on the pinned Codex turn and replay never repe
   assert.equal((await start.json()).operation.image, undefined);
   const terminal = await readCompleted(call, first.id);
   assert.equal(terminal.threadId, 'exact-thread');
+  const wrongThread = await run({...task, id: 'fixture-image-mismatch', resume: first.id, expectedThreadId: 'another-thread'});
+  assert.equal(wrongThread.status, 409);
+  assert.equal((await wrongThread.json()).code, 'CODEX_RESUME_TARGET_UNAVAILABLE');
   assert.equal(terminal.fingerprint, undefined);
   assert.equal(JSON.stringify(terminal).includes(png), false);
   assert.equal((await run(first)).status, 202);

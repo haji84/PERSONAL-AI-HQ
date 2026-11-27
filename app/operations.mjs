@@ -11,6 +11,7 @@ const nativeTerminal = new Set(['completed', 'interrupted', 'failed']);
 const terminal = new Set([...nativeTerminal, 'cancelled']);
 const observationWindowMs = 15000;
 const allowedId = /^[a-z0-9_-]{8,80}$/i;
+const nativeThreadId = /^[a-z0-9_-]{1,160}$/i;
 const receiptId = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
 const reviewHash = /^[a-f0-9]{64}$/;
 const imageByteLimit = 512 * 1024;
@@ -25,6 +26,7 @@ const imageSignatures = new Map([
 const steerClientId = id => `hq:steer:${id}`;
 const timestamp = () => new Date().toISOString();
 const problem = (status, message, code) => Object.assign(new Error(message), {status, code});
+const resumeUnavailable = () => problem(409, 'このスレッドの最新の作業を照合できません。', 'CODEX_RESUME_TARGET_UNAVAILABLE');
 const phase = value => nativeTerminal.has(value) ? value : value === 'inProgress' ? 'running' : null;
 const visiblePhase = row => row.cancellationRequestedAt && active.has(row.phase) ? 'cancelling' : row.phase;
 
@@ -69,6 +71,7 @@ export function createOperations(directory, native, execution, {prepareHandover}
     if (!columns.includes('handoverReview')) db.exec('ALTER TABLE codex_operations ADD COLUMN handoverReview TEXT');
     if (!columns.includes('cancellationRequestedAt')) db.exec('ALTER TABLE codex_operations ADD COLUMN cancellationRequestedAt TEXT');
     if (!columns.includes('cancellationDispatchedAt')) db.exec('ALTER TABLE codex_operations ADD COLUMN cancellationDispatchedAt TEXT');
+    if (!columns.includes('expectedThreadId')) db.exec('ALTER TABLE codex_operations ADD COLUMN expectedThreadId TEXT');
     if (!columns.includes('interruptionDispatchedAt')) {
       db.exec('ALTER TABLE codex_operations ADD COLUMN interruptionDispatchedAt TEXT');
       // Old active pauses did not distinguish preflight from a possibly sent interrupt.
@@ -80,8 +83,15 @@ export function createOperations(directory, native, execution, {prepareHandover}
     db.exec('COMMIT');
   } catch (error) { db.exec('ROLLBACK'); db.close(); throw error; }
   const byId = db.prepare('SELECT * FROM codex_operations WHERE project=? AND id=?');
-  const latestRowId = param => `SELECT rowid FROM codex_operations WHERE project=${param} ORDER BY createdAt DESC, rowid DESC LIMIT 1`;
+  const targetsThread = param => `(threadId=${param} OR (threadId IS NULL AND expectedThreadId=${param}
+    AND phase IN ('reserved','sending','running','interrupting','unconfirmed','cancelled')))`;
+  const latestRowId = (project, filter = '') => `SELECT rowid FROM codex_operations WHERE project=${project}
+    ${filter} ORDER BY createdAt DESC, rowid DESC LIMIT 1`;
   const latest = db.prepare(`SELECT * FROM codex_operations WHERE rowid=(${latestRowId('?')})`);
+  const latestThread = db.prepare(`SELECT * FROM codex_operations WHERE project=? AND threadId=?
+    ORDER BY createdAt DESC, rowid DESC LIMIT 1`);
+  const latestTarget = db.prepare(`SELECT * FROM codex_operations WHERE rowid=(
+    ${latestRowId('?1', `AND ${targetsThread('?2')} AND (?3 IS NULL OR id<>?3)`)})`);
   const latestHandover = db.prepare(`SELECT * FROM codex_operations WHERE project=? AND handoverReceipt=?
     ORDER BY threadId IS NOT NULL DESC, createdAt DESC, rowid DESC LIMIT 1`);
   const latestScoped = db.prepare(`SELECT id, project, workspace, phase, threadId, turnId, createdAt, updatedAt, startedAt,
@@ -97,11 +107,12 @@ export function createOperations(directory, native, execution, {prepareHandover}
     ORDER BY createdAt DESC, rowid DESC LIMIT 1`);
   const launchedHandover = db.prepare(`SELECT 1 FROM codex_operations WHERE project=? AND handoverReceipt=?
     AND handoverReview IS NOT NULL AND threadId IS NOT NULL LIMIT 1`);
-  const byClientId = db.prepare(`SELECT * FROM codex_operations WHERE threadId=? AND id=? AND turnId IS NULL
+  // A user item on an existing thread could have been added to another client's active turn.
+  const byClientId = db.prepare(`SELECT * FROM codex_operations WHERE threadId=? AND id=? AND turnId IS NULL AND expectedThreadId IS NULL
     AND phase IN ('sending','unconfirmed') LIMIT 1`);
   const byTurn = db.prepare('SELECT * FROM codex_operations WHERE threadId=? AND turnId=? LIMIT 1');
-  const insert = db.prepare(`INSERT INTO codex_operations(project,id,workspace,fingerprint,phase,createdAt,updatedAt,stage,explicitRoute,handoverReceipt,handoverReview)
-    SELECT ?1,?2,?3,?4,'reserved',?5,?6,?7,?8,?9,?10 WHERE ?11 IS NULL OR EXISTS (
+  const insert = db.prepare(`INSERT INTO codex_operations(project,id,workspace,fingerprint,phase,createdAt,updatedAt,stage,explicitRoute,handoverReceipt,handoverReview,expectedThreadId)
+    SELECT ?1,?2,?3,?4,'reserved',?5,?6,?7,?8,?9,?10,?12 WHERE ?11 IS NULL OR EXISTS (
       SELECT 1 FROM codex_operations WHERE project=?1 AND id=?11 AND workspace=?3 AND threadId IS NOT NULL AND turnId IS NOT NULL
         AND phase IN ('completed','interrupted','failed'))`);
   const setThread = db.prepare(`UPDATE codex_operations SET threadId=?,phase='sending',updatedAt=? WHERE project=? AND id=? AND phase='reserved'`);
@@ -129,10 +140,10 @@ export function createOperations(directory, native, execution, {prepareHandover}
       WHEN (phase='reserved' AND threadId IS NULL) OR phase='interrupted' THEN 'cancelled' ELSE phase END,
     cancellationDispatchedAt=coalesce(cancellationDispatchedAt,interruptionDispatchedAt),
     cancellationRequestedAt=?1, updatedAt=?1
-    WHERE id=?2 AND workspace=?3 AND rowid=(${latestRowId('?4')})
+    WHERE id=?2 AND workspace=?3 AND rowid=(${latestRowId('?4', `AND (?5 IS NULL OR ${targetsThread('?5')})`)})
       AND cancellationRequestedAt IS NULL AND phase NOT IN ('completed','failed','cancelled')`);
   const claimCancellation = db.prepare(`UPDATE codex_operations SET phase='interrupting',cancellationDispatchedAt=?1,updatedAt=?1
-    WHERE id=?2 AND workspace=?3 AND rowid=(${latestRowId('?4')}) AND threadId=?5 AND turnId=?6
+    WHERE id=?2 AND workspace=?3 AND rowid=(${latestRowId('?4', `AND ${targetsThread('?5')}`)}) AND threadId=?5 AND turnId=?6
       AND cancellationRequestedAt IS NOT NULL AND cancellationDispatchedAt IS NULL
       AND phase IN ('sending','running','interrupting','unconfirmed')`);
   const steeringById = db.prepare('SELECT * FROM codex_steering WHERE project=? AND id=?');
@@ -152,9 +163,9 @@ export function createOperations(directory, native, execution, {prepareHandover}
   function response(row) {
     if (!row) return null;
     const {fingerprint, workspace, handoverReview, handoverReceipt, interruptionDispatchedAt, cancellationDispatchedAt,
-      cancellationRequestedAt, ...view} = row;
+      cancellationRequestedAt, expectedThreadId, ...view} = row;
     return {...view, phase: visiblePhase(row), ...(handoverReceipt ? {handoverReceipt} : {}),
-      ...(cancellationRequestedAt ? {cancellationRequestedAt} : {})};
+      ...(cancellationRequestedAt ? {cancellationRequestedAt} : {}), ...(expectedThreadId ? {expectedThreadId} : {})};
   }
 
   function steeringResponse(row) {
@@ -252,7 +263,8 @@ export function createOperations(directory, native, execution, {prepareHandover}
     if (prior?.id === row.id && Date.now() - prior.at < observationWindowMs) return row;
     reconciled.set(row.project, {id: row.id, at: Date.now()});
     try {
-      const exact = await native.findSubmission(row.workspace, row.threadId, row.id, row.turnId);
+      const exact = await native.findSubmission(row.workspace, row.threadId, row.id, row.turnId,
+        ...(row.expectedThreadId && !row.turnId ? [true] : []));
       const observed = typeof exact?.id === 'string' && exact.id && (!row.turnId || exact.id === row.turnId) ? phase(exact.status) : null;
       if (observed) advance(row, observed, exact.id, exact.startedAt ?? null);
       else if (row.phase === 'sending' && age >= 30000) markUnconfirmed.run(timestamp(), row.project, row.id);
@@ -279,10 +291,17 @@ export function createOperations(directory, native, execution, {prepareHandover}
         return result;
       } catch (error) { db.exec('ROLLBACK'); throw error; }
     },
-    async read(project, id, receipt = null) {
+    managesThread(project, thread) {
+      const row = project.codexWrite && native.canWrite && latestThread.get(project.id, thread);
+      return Boolean(row && project.cwd.includes(row.workspace));
+    },
+    async read(project, id, receipt = null, thread = null) {
       if (receipt !== null && !receiptId.test(receipt)) throw problem(400, '引継ぎ元の受付番号を指定してください。');
-      const row = id ? byId.get(project.id, id)
-        : receipt ? latestHandover.get(project.id, receipt) : latest.get(project.id);
+      if (thread !== null && (!nativeThreadId.test(thread) || id !== null || receipt !== null)) {
+        throw problem(400, '照合するスレッドを1件指定してください。');
+      }
+      const row = thread !== null ? latestTarget.get(project.id, thread, null) :
+        id ? byId.get(project.id, id) : receipt ? latestHandover.get(project.id, receipt) : latest.get(project.id);
       if (row && (!project.cwd.includes(row.workspace) || (receipt && row.handoverReceipt !== receipt))) return {operation: null};
       return {operation: response(await runtimeResult(row))};
     },
@@ -298,11 +317,13 @@ export function createOperations(directory, native, execution, {prepareHandover}
     async start(project, input) {
       const handover = input?.handover;
       const beginsHandover = handover !== undefined;
+      const threadTarget = input?.expectedThreadId;
       if (!input || typeof input.id !== 'string' || !allowedId.test(input.id) ||
           typeof input.prompt !== 'string' || !input.prompt.trim() || input.prompt.length > 16000 ||
           (input.model !== undefined && typeof input.model !== 'string') ||
           (input.effort !== undefined && typeof input.effort !== 'string') ||
           (input.resume !== undefined && typeof input.resume !== 'string') ||
+          (threadTarget !== undefined && (typeof threadTarget !== 'string' || !nativeThreadId.test(threadTarget) || !input.resume)) ||
           (input.route !== undefined && !ROUTES.includes(input.route)) ||
           (input.stage !== undefined && !STAGES.includes(input.stage)) ||
           (beginsHandover && (!handover || typeof handover.receipt !== 'string' || !receiptId.test(handover.receipt) ||
@@ -314,11 +335,16 @@ export function createOperations(directory, native, execution, {prepareHandover}
       const reference = validatedDocument(input.document);
       const previous = input.resume ? byId.get(project.id, input.resume) : null;
       const expected = await confirmedWorkspace(project);
-      if (input.resume && (!previous?.threadId || !previous.turnId || !nativeTerminal.has(previous.phase) || previous.workspace !== expected)) {
-        throw problem(409, 'この作業を同じCodexスレッドで続けられません。');
-      }
+      const resumeIsCurrent = () => {
+        if (!input.resume) return true;
+        if (!previous?.threadId || (threadTarget !== undefined && threadTarget !== previous.threadId)) return false;
+        const row = latestTarget.get(project.id, previous.threadId, input.id);
+        return row?.id === previous.id && row.workspace === expected && row.turnId === previous.turnId &&
+          Boolean(row.turnId) && nativeTerminal.has(row.phase);
+      };
       const choice = input.stage || input.route ? [input.stage, input.route] : [];
       const identity = [input.prompt, input.model, input.effort, input.resume, ...choice];
+      if (threadTarget !== undefined) identity.push({expectedThreadId: threadTarget});
       if (beginsHandover) identity.push(handover.receipt, handover.review);
       if (attachment) identity.push({mime: attachment.image.mime, sha256: attachment.digest});
       if (reference) identity.push({name: reference.document.name, sha256: reference.digest});
@@ -330,6 +356,7 @@ export function createOperations(directory, native, execution, {prepareHandover}
       };
       let row = duplicate();
       if (row) return {operation: response(row)};
+      if (!resumeIsCurrent()) throw resumeUnavailable();
       const stage = input.stage ?? previous?.stage ?? 'implementation';
       const route = input.route ?? previous?.explicitRoute ?? null;
       const handoverReceipt = handover?.receipt ?? previous?.handoverReceipt ?? null;
@@ -367,9 +394,10 @@ export function createOperations(directory, native, execution, {prepareHandover}
         throw error;
       }
       try {
+        if (!resumeIsCurrent()) throw resumeUnavailable();
         if (!insert.run(project.id, input.id, expected, digest, timestamp(), timestamp(), stage, route, handoverReceipt,
-          handover?.review ?? null, input.resume ?? null).changes) {
-          throw problem(409, 'この作業を同じCodexスレッドで続けられません。');
+          handover?.review ?? null, input.resume ?? null, previous?.threadId ?? null).changes) {
+          throw resumeUnavailable();
         }
       }
       catch (error) {
@@ -379,7 +407,7 @@ export function createOperations(directory, native, execution, {prepareHandover}
         throw error;
       }
       row = byId.get(project.id, input.id);
-      const maySubmit = () => !closed && byId.get(project.id, input.id)?.phase === 'reserved' && !alreadyLaunched() &&
+      const maySubmit = () => !closed && byId.get(project.id, input.id)?.phase === 'reserved' && resumeIsCurrent() && !alreadyLaunched() &&
         (!execution || execution.isCurrent(project, selection.revision, stage, expected, route, handoverReceipt));
       let readyForTurn = !handoverReceipt;
       let stillCurrent;
@@ -392,19 +420,22 @@ export function createOperations(directory, native, execution, {prepareHandover}
         await checkHandoverUsage();
         readyForTurn = true;
       } : undefined;
-      void native.submit({workspace: expected, prompt: submittedPrompt, knownId: previous?.threadId,
+      void native.submit({workspace: expected, prompt: submittedPrompt, knownId: previous?.threadId, previousTurnId: previous?.turnId,
         model: selection.model, effort: selection.effort, requestId: input.id, ...(attachment ? {image: attachment.image} : {}),
         ...(reference ? {document: reference.document} : {}),
         beforeThread: maySubmit, ...(beforeTurn ? {beforeTurn} : {}),
-        onThread: id => readyForTurn && maySubmit() && (!beginsHandover || stillCurrent?.() === true) &&
+        onThread: id => (!previous || id === previous.threadId) &&
+          readyForTurn && maySubmit() && (!beginsHandover || stillCurrent?.() === true) &&
           setThread.run(id, timestamp(), project.id, input.id).changes === 1,
       }).then(result => {
         advance(row, phase(result.turn.status) ?? 'running', result.turn.id, timestamp());
-      }).catch(() => {
+      }).catch(error => {
         if (!closed) {
           const current = byId.get(project.id, input.id);
           if (current?.phase === 'reserved') {
-            if (handoverReceipt) append.run('送信直前の引継ぎ条件またはCodex接続を確認できませんでした。', timestamp(), project.id, input.id);
+            const failure = error?.code === 'CODEX_RESUME_TARGET_UNAVAILABLE' ? resumeUnavailable().message :
+              handoverReceipt ? '送信直前の引継ぎ条件またはCodex接続を確認できませんでした。' : '';
+            if (failure) append.run(failure, timestamp(), project.id, input.id);
             advance(current, 'failed');
           }
           else markUnconfirmed.run(timestamp(), project.id, input.id);
@@ -444,11 +475,13 @@ export function createOperations(directory, native, execution, {prepareHandover}
       if (closed) throw problem(503, 'Codexの接続を確認できません。');
       const authorized = readCurrentProject(directory, project.id);
       if (!authorized?.codexWrite) throw problem(403, 'この案件は履歴の参照のみです。');
-      if (!authorized.cwd.includes(workspace) || row.workspace !== workspace || latest.get(project.id)?.id !== id) {
+      const thread = row.threadId ?? row.expectedThreadId;
+      const newest = () => thread ? latestTarget.get(project.id, thread, null) : latest.get(project.id);
+      if (!authorized.cwd.includes(workspace) || row.workspace !== workspace || newest()?.id !== id) {
         throw problem(409, '最新のCodex作業だけを中止できます。');
       }
-      const requested = requestCancellation.run(timestamp(), id, workspace, project.id).changes;
-      if (latest.get(project.id)?.id !== id) throw problem(409, '最新のCodex作業だけを中止できます。');
+      const requested = requestCancellation.run(timestamp(), id, workspace, project.id, thread).changes;
+      if (newest()?.id !== id) throw problem(409, '最新のCodex作業だけを中止できます。');
       const current = byId.get(project.id, id);
       if (active.has(current.phase) && current.threadId) {
         if (requested && current.phase === 'running' && current.turnId) void dispatchCancellation(current);

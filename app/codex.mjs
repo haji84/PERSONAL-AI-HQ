@@ -2,13 +2,18 @@ import {spawn} from 'node:child_process';
 import {existsSync} from 'node:fs';
 import {Agent} from 'node:http';
 import {createConnection} from 'node:net';
+import {setTimeout as delay} from 'node:timers/promises';
 import WebSocket from 'ws';
 
 const unavailable = message => Object.assign(new Error(message), {status: 503});
 const missing = message => Object.assign(new Error(message), {status: 404});
 const unverified = () => Object.assign(new Error('Codexの確定した会話を照合できませんでした。'),
   {status: 409, code: 'HANDOVER_CONVERSATION_UNVERIFIED'});
+const resumeUnavailable = () => Object.assign(new Error('このスレッドの最新の作業を照合できません。'),
+  {status: 409, code: 'CODEX_RESUME_TARGET_UNAVAILABLE'});
 const threadId = /^[a-z0-9_-]{1,160}$/i;
+const desktopThreadId = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u;
+const terminalTurns = new Set(['completed', 'interrupted', 'failed']);
 const handoverItemId = /^[a-z0-9_.:-]{1,160}$/i;
 const steeringClientId = /^hq:steer:[a-z0-9_-]{8,80}$/i;
 const turnItemPageLimit = 12;
@@ -356,15 +361,37 @@ export function createCodexClient({command, socket, loopback} = {}) {
       limit: 4, itemsView: 'summary', sortDirection: 'desc'});
   }
 
+  async function verifyResumeTarget(rpc, thread, previousTurnId, loaded) {
+    const status = thread.status?.type;
+    if (thread.ephemeral !== false || thread.modelProvider !== 'openai' ||
+        (status !== 'idle' && (loaded || status !== 'notLoaded')) ||
+        typeof previousTurnId !== 'string' || !threadId.test(previousTurnId)) throw resumeUnavailable();
+    const result = await rpc.call('thread/turns/list', {threadId: thread.id, limit: 1,
+      itemsView: 'notLoaded', sortDirection: 'desc'});
+    const [latest] = items(result?.data);
+    if (result?.data?.length !== 1 || latest?.id !== previousTurnId || !terminalTurns.has(latest.status)) throw resumeUnavailable();
+  }
+
+  async function startedBy(rpc, id, turnId, clientId) {
+    const result = await rpc.call('thread/items/list', {threadId: id, turnId,
+      limit: turnItemPageLimit, sortDirection: 'asc'});
+    const first = items(result?.data).find(entry => entry?.item?.type === 'userMessage');
+    return first ? first.turnId === turnId && first.item.clientId === clientId : null;
+  }
+
   return {
     canWrite,
     onEvent(listener) { listeners.add(listener); return () => listeners.delete(listener); },
     async subscriptionReady() { return canWrite && await subscriptionReady(await current()); },
-    async submit({workspace, prompt, knownId, model, effort, requestId, beforeThread, beforeTurn, onThread, image, document}) {
+    async submit({workspace, prompt, knownId, previousTurnId, model, effort, requestId, beforeThread, beforeTurn, onThread, image, document}) {
       if (!canWrite) throw unavailable('独立して稼働するCodex接続が必要です。');
       const rpc = await current();
       if (!await subscriptionReady(rpc)) throw unavailable('ChatGPTプランの認証を確認できません。');
-      if (knownId) await scopedThread([workspace], knownId);
+      if (knownId) {
+        const current = await scopedThread([workspace], knownId);
+        if (current.rpc !== rpc) throw resumeUnavailable();
+        await verifyResumeTarget(rpc, current.thread, previousTurnId, false);
+      }
       const beginThread = () => {
         if (beforeThread && !beforeThread()) throw unavailable('送信権限を確認できませんでした。');
       };
@@ -379,6 +406,12 @@ export function createCodexClient({command, socket, loopback} = {}) {
         throw unavailable('分離作業先をCodexで確認できませんでした。');
       }
       if (beforeTurn) await beforeTurn();
+      if (knownId) {
+        if (thread.status?.type !== 'idle') throw resumeUnavailable();
+        const current = await scopedThread([workspace], knownId);
+        if (current.rpc !== rpc) throw resumeUnavailable();
+        await verifyResumeTarget(rpc, current.thread, previousTurnId, true);
+      }
       const input = [{type: 'text', text: prompt, text_elements: []}];
       if (image) input.push({type: 'image', url: `data:${image.mime};base64,${image.data}`});
       if (document) input.push({type: 'text', text_elements: [], text: documentReference + JSON.stringify(document)});
@@ -388,8 +421,18 @@ export function createCodexClient({command, socket, loopback} = {}) {
           excludeTmpdirEnvVar: true, excludeSlashTmp: true}, ...(model ? {model} : {}), ...(effort ? {effort} : {})}, () => {
         if (onThread(thread.id) !== true) throw unavailable('送信権限を確認できませんでした。');
       });
-      if (!answer?.turn?.id) throw unavailable('Codexの受理IDを確認できませんでした。');
-      return {threadId: thread.id, turn: answer.turn};
+      const confirmedTurn = answer?.turn;
+      if (!confirmedTurn?.id || (knownId && confirmedTurn.id === previousTurnId)) throw unavailable('Codexの受理IDを確認できませんでした。');
+      if (knownId) {
+        let owner = await startedBy(rpc, knownId, confirmedTurn.id, requestId);
+        if (owner === null) {
+          // The new turn may be returned before its first persisted input is visible.
+          await delay(250);
+          owner = await startedBy(rpc, knownId, confirmedTurn.id, requestId);
+        }
+        if (owner !== true) throw unavailable('Codexの受理IDを確認できませんでした。');
+      }
+      return {threadId: thread.id, turn: confirmedTurn};
     },
     async interrupt(workspace, id, turnId, beforeSend) {
       const {rpc} = await scopedThread([workspace], id);
@@ -416,7 +459,9 @@ export function createCodexClient({command, socket, loopback} = {}) {
       const result = await recentTurns(rpc, id, cursor);
       const turns = items(result.data).map(turn => ({id: turn.id, status: clean(turn.status, 32) || 'unknown',
         messages: plainMessages(turn.items), itemCount: items(turn.items).length})).reverse();
-      return {thread: threadView(thread), turns, nextCursor: cursorText(result.nextCursor)};
+      return {thread: threadView(thread), turns, nextCursor: cursorText(result.nextCursor),
+        ...(thread.ephemeral === false && thread.id.length === 36 && desktopThreadId.test(thread.id)
+          ? {desktopThreadId: thread.id} : {})};
     },
     async readHandoverTurn(workspace, id, turnId, clientId) {
       if (typeof workspace !== 'string' || !workspace || typeof turnId !== 'string' || !threadId.test(turnId) ||
@@ -432,14 +477,17 @@ export function createCodexClient({command, socket, loopback} = {}) {
           confirmed.durationMs !== latest.durationMs) throw unverified();
       return {threadId: id, turnId, messages};
     },
-    async findSubmission(workspace, id, clientId, turnId) {
+    async findSubmission(workspace, id, clientId, turnId, requireFirstUser = false) {
       const {rpc} = await scopedThread([workspace], id);
       let cursor = null;
       for (let page = 0; page < 3; page++) {
         const result = await recentTurns(rpc, id, cursor);
         const exact = items(result.data).find(turn => turnId ? turn.id === turnId :
           items(turn.items).some(item => item?.type === 'userMessage' && item.clientId === clientId));
-        if (exact) return {id: exact.id, status: exact.status, startedAt: iso(exact.startedAt)};
+        if (exact) {
+          if (requireFirstUser && !await startedBy(rpc, id, exact.id, clientId)) return null;
+          return {id: exact.id, status: exact.status, startedAt: iso(exact.startedAt)};
+        }
         cursor = cursorText(result.nextCursor);
         if (!cursor) break;
       }
