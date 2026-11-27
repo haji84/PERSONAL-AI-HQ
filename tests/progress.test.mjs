@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {criticalPath, deliveryProgress, observedTime, requirementProgress} from '../app/progress.mjs';
+import {criticalPath, deliveryProgress, observedTime, requirementProgress, remainingEstimate} from '../app/progress.mjs';
 
 const duration = (id, minutes, dependencies = []) => ({id, dependencies,
   remainingMinutes: {optimistic: minutes, standard: minutes + 2, cautious: minutes + 4}});
@@ -10,6 +10,23 @@ test('critical path counts independent work once and preserves unknown external 
   assert.deepEqual(criticalPath(tasks), {optimistic: 26, standard: 30, cautious: 34});
   assert.equal(criticalPath([...tasks, {...duration('human', 0, ['verify']), externalWait: 'unknown'}]), null);
   assert.equal(criticalPath([duration('cycle', 0, ['cycle'])]), null);
+});
+
+test('remaining estimates preserve zero and reject inverted, string or incomplete durations', () => {
+  const zero = {optimistic: 0, standard: 0, cautious: 0};
+  assert.deepEqual(remainingEstimate(zero), zero);
+  assert.equal(remainingEstimate({optimistic: 10, standard: 5, cautious: 20}), null);
+  assert.equal(remainingEstimate({optimistic: '5', standard: 10, cautious: 20}), null);
+  assert.equal(remainingEstimate({standard: 10, cautious: 20}), null);
+});
+
+test('a completion label cannot zero the schedule unless the scoped requirements were accepted', () => {
+  const task = {...duration('work', 10), status: 'verified'};
+  assert.deepEqual(criticalPath([task]), task.remainingMinutes);
+  assert.equal(criticalPath([{id: 'unproven', status: 'verified'}]), null);
+  assert.equal(criticalPath([{id: 'unproven', status: 'verified',
+    remainingMinutes: {optimistic: 0, standard: 0, cautious: 0}}]), null);
+  assert.deepEqual(criticalPath([{...task, requirements: [{id: 'unmet'}]}]), task.remainingMinutes);
 });
 
 test('a fixture run or an unimplemented requirement cannot shrink the formal denominator', () => {

@@ -25,6 +25,19 @@ export function requirementProgress(requirements) {
     usableCompletion: integerPercent(useful, total)};
 }
 
+export function remainingEstimate(value) {
+  const {optimistic, standard, cautious} = value ?? {};
+  if (![optimistic, standard, cautious].every(isMinutes) || optimistic > standard || standard > cautious) return null;
+  return {optimistic, standard, cautious};
+}
+
+export function taskIsVerified(task, counts = requirementProgress(task?.requirements)) {
+  const remaining = task?.remaining;
+  const hasRemainingWork = Array.isArray(remaining) && remaining.some(item => typeof item === 'string' && item.trim());
+  return task?.status === 'verified' && counts !== null && counts.accepted === counts.total &&
+    task.externalWait !== 'unknown' && !hasRemainingWork;
+}
+
 export function criticalPath(tasks) {
   if (!Array.isArray(tasks) || tasks.length === 0 || tasks.length > 400) return null;
   const ids = tasks.map(task => task?.id);
@@ -40,11 +53,11 @@ export function criticalPath(tasks) {
     const dependencies = task.dependencies ?? [];
     if (!Array.isArray(dependencies) || dependencies.some(dependency => typeof dependency !== 'string')) return null;
     let durations = [0, 0, 0];
-    if (task.status !== 'verified') {
-      const estimate = task.remainingMinutes;
-      if (!estimate || task.externalWait === 'unknown') return null;
+    if (!taskIsVerified(task)) {
+      const estimate = remainingEstimate(task.remainingMinutes);
+      if (!estimate || task.externalWait === 'unknown' ||
+        (task.status === 'verified' && estimate.cautious === 0)) return null;
       durations = [estimate.optimistic, estimate.standard, estimate.cautious];
-      if (!durations.every(isMinutes) || durations[0] > durations[1] || durations[1] > durations[2]) return null;
     }
     visiting.add(id);
     const predecessor = dependencies.map(finish);

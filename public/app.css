@@ -127,6 +127,16 @@ main { width: 100%; max-width: 1440px; margin: 0 auto; padding: 33px clamp(16px,
 .panel-header > * { min-width: 0; }
 .panel-body { padding: 0 19px 18px; overflow-wrap: anywhere; }
 .panel-body h3 { margin-top: 18px; margin-bottom: 7px; }
+.development-tasks, .task-progress-list { display: grid; gap: 12px; min-width: 0; }
+.task-project + .task-project { padding-top: 12px; border-top: 1px solid var(--line); }
+.task-project-heading, .task-title { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.task-project-heading { margin-bottom: 8px; }
+.task-progress-list { list-style: none; padding: 0; margin: 0; }
+.task-progress-row { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 6px 24px; padding: 10px 12px; background: var(--surface-soft); border-radius: 8px; }
+.task-progress-row p, .task-progress-row .marked-list { margin: 3px 0; }
+.task-progress-row > p { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 4px 12px; }
+.task-progress-facts { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr); gap: 10px; margin: 0; }
+.task-progress-facts dd { margin: 3px 0 0; }
 .muted { color: var(--muted); }
 .small { font-size: .79rem; }
 .strong { font-weight: 700; }
@@ -199,6 +209,7 @@ fieldset { min-width: 0; padding: 0; margin: 0; border: 0; }
   .conversation-layout { grid-template-columns: minmax(174px, .58fr) minmax(0, 1fr); }
 }
 @media (max-width: 720px) {
+  .task-progress-row { grid-template-columns: minmax(0, 1fr); }
   html { scroll-padding-top: 125px; }
   .shell { display: block; }
   .rail { position: fixed; top: auto; bottom: 0; left: 0; right: 0; z-index: 9; height: auto; display: block; padding: 4px 6px max(4px, env(safe-area-inset-bottom)); border: 0; border-top: 1px solid var(--line); background: var(--surface); }

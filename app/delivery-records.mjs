@@ -11,6 +11,7 @@ const timelinePath = initiative + '/DELIVERY.md';
 const firstReleasePath = initiative + '/mac-first-release-observation.json';
 const ownerRequestPath = initiative + '/OWNER_REQUEST_20261127.txt';
 const ownerCoveragePath = initiative + '/owner-requirement-coverage.json';
+const portfolioObservationPath = initiative + '/portfolio-observation.json';
 const ownerPath = 'OWNER_REQUIREMENTS.md';
 const auditPath = 'verification/final-shared-goal-audit.json';
 const commitId = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
@@ -165,6 +166,28 @@ export async function readDeliveryRecord(source) {
   } catch {
     return {status:'unavailable', scope, ...(requirementsReview && {requirementsReview}), observedAt:null, links:[]};
   }
+}
+
+export async function readPortfolioTaskRecords(source) {
+  try {
+    const reader = await openSource(source);
+    const [file] = await reader.files(reader.revision, [portfolioObservationPath]);
+    const observation = JSON.parse(file).taskProgress;
+    const observedAt = iso(observation?.observedAt);
+    const records = observation?.projects;
+    if (!observedAt || !Array.isArray(records) || records.length > 250) return null;
+    const projects = new Map();
+    for (const record of records) {
+      const repository = gitHubRepository(record?.repository)?.toLowerCase();
+      if (!repository || projects.has(repository) || !Array.isArray(record.tasks)) return null;
+      projects.set(repository, {...record, observationAt: iso(record.observationAt) ?? observedAt});
+    }
+    return {observedAt, projects, source: link(reader.repository, reader.revision, portfolioObservationPath, '案件の観測記録')};
+  } catch { return null; }
+}
+
+export function tasksForRepository(observation, repository) {
+  return observation?.projects.get(gitHubRepository(repository)?.toLowerCase()) ?? null;
 }
 
 function isSourceReference(text) {

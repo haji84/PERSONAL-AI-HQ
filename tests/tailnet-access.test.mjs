@@ -32,13 +32,14 @@ function call(target, path, {method = 'GET', headers = {}, body} = {}) {
 }
 
 async function fixture(t, options = {}, {includeCodexScope = false} = {}) {
-  const directory = await mkdtemp(join(await realpath(tmpdir()), 'hq-tailnet-test-'));
+  const root = await mkdtemp(join(await realpath(tmpdir()), 'hq-tailnet-test-'));
+  const directory = join(root, 'runtime');
   const expectedOrigin = options.tailnet?.origin ?? origin;
   const expectedHost = new URL(expectedOrigin).host;
   let app;
   t.after(async () => {
     await app?.close();
-    await rm(directory, {recursive: true, force: true});
+    await rm(root, {recursive: true, force: true});
   });
   await ensurePrivateDirectory(directory);
   await writeFile(join(directory, 'portfolio.json'), JSON.stringify({

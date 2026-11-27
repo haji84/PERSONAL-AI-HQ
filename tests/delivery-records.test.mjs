@@ -8,6 +8,7 @@ import test from 'node:test';
 import {readCurrentProject, readPortfolio} from '../app/portfolio.mjs';
 import * as deliveryRecords from '../app/delivery-records.mjs';
 import {startOwnerApp} from '../app/server.mjs';
+import {ensurePrivateDirectory} from '../app/private-directory.mjs';
 
 const initiative = 'docs/initiatives/chatgpt-codex-integration';
 const repository = 'https://github.com/fixture-owner/delivery-records';
@@ -15,8 +16,9 @@ const ref = 'refs/heads/stable-test';
 const hash = value => createHash('sha256').update(value).digest('hex');
 
 async function fixture(t) {
-  const directory = await mkdtemp(join(await realpath(tmpdir()), 'hq-delivery-'));
-  t.after(() => rm(directory, {recursive:true, force:true}));
+  const root = await mkdtemp(join(await realpath(tmpdir()), 'hq-delivery-'));
+  t.after(() => rm(root, {recursive:true, force:true}));
+  const directory = await ensurePrivateDirectory(join(root, 'runtime'));
   const checkout = join(directory, 'checkout');
   await mkdir(checkout);
   const git = (args, date) => execFileSync('git', args, {cwd:checkout, encoding:'utf8',
@@ -59,6 +61,49 @@ const plan = `# 実行記録
 const first = {goalStartedAt:'2026-11-27T06:25:25Z', firstUsableAt:'2026-11-27T06:51:19Z',
   elapsedToFirstUsableSeconds:1554, observedAt:'2026-11-27T07:08:21Z', platform:'MacBook',
   localReadback:{anonymousDataStatus:401, ownerSessionStatus:303, portfolioRows:18}};
+
+test('dashboard task observations follow committed records and preserve project identity and pause state', async t => {
+  const {directory, checkout, commit, configure, portfolioPath} = await fixture(t);
+  const path = initiative + '/portfolio-observation.json';
+  const observedAt = '2026-11-27T15:30:00.000Z';
+  const tracked = 'https://github.com/fixture-owner/Tracked';
+  const taskProgress = {observedAt, projects: [{repository: tracked,
+    tasks: [{id: 'verification', title: 'Initial work', status: 'active'}]}]};
+  const original = {taskProgress};
+  const saved = await commit({[path]: JSON.stringify(original)});
+  await configure([
+    {id: 'same-repository', name: 'Tracked', state: 'paused', repository: tracked.toLowerCase() + '.git'},
+    {id: 'different-repository', name: 'Different', repository: tracked + '-different'},
+  ]);
+  const settings = JSON.parse(await readFile(portfolioPath, 'utf8'));
+  settings.taskProgressSource = {checkout, repository, ref};
+  await writeFile(portfolioPath, JSON.stringify(settings));
+  const view = async () => (await readPortfolio(directory, undefined, true)).view;
+  const initial = await view();
+  assert.equal(initial.taskProgressSource.status, 'current');
+  assert.equal(initial.taskProgressSource.observedAt, observedAt);
+  assert.ok(initial.taskProgressSource.evidence.url.includes(saved));
+  assert.equal(initial.projects[0].state, 'paused');
+  assert.equal(initial.projects[0].tasks[0].title, 'Initial work');
+  assert.deepEqual(initial.projects[1].tasks, []);
+  assert.ok(!JSON.stringify(initial).includes(checkout));
+
+  taskProgress.projects[0].tasks[0].title = 'Saved update';
+  await writeFile(join(checkout, path), JSON.stringify(original));
+  assert.equal((await view()).projects[0].tasks[0].title, 'Initial work');
+  await commit({[path]: JSON.stringify(original)});
+  assert.equal((await view()).projects[0].tasks[0].title, 'Saved update');
+  settings.projects[1].repository = tracked;
+  await writeFile(portfolioPath, JSON.stringify(settings));
+  const ambiguous = await view();
+  assert.equal(ambiguous.taskProgressSource.unmatched, 1);
+  assert.ok(ambiguous.projects.every(project => !project.tasks.length));
+  taskProgress.projects.push({...taskProgress.projects[0]});
+  await commit({[path]: JSON.stringify(original)});
+  assert.equal((await view()).taskProgressSource.status, 'unavailable');
+  assert.deepEqual((await view()).projects[0].tasks, []);
+  assert.deepEqual(JSON.parse(await readFile(portfolioPath, 'utf8')), settings);
+});
 
 test('the initial estimate and actual first usable delivery come from fixed commits while the next action updates', async t => {
   const {directory, checkout, commit, configure, portfolioPath} = await fixture(t);
