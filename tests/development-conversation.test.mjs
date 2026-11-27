@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import {mkdtemp, rm} from 'node:fs/promises';
+import {mkdtemp, realpath, rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
-import {join} from 'node:path';
+import {basename, dirname, join} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
 import test from 'node:test';
 import {createChatStore} from '../app/chat-store.mjs';
@@ -12,25 +12,44 @@ const conversationId = `api/${request.id}`;
 const completion = {id: request.id, outcome: 'completed', summary: '独立テストに合格。',
   updatedAt: '2026-11-27T08:42:00.000Z'};
 
-async function directory(t) {
-  const path = await mkdtemp(join(tmpdir(), 'hq-development-conversation-'));
-  t.after(() => rm(path, {recursive: true, force: true}));
-  return path;
+async function fixture(t) {
+  const temp = await realpath(tmpdir());
+  const path = await mkdtemp(join(temp, 'hq-development-conversation-'));
+  const opened = new Set();
+  const keep = entry => {
+    opened.add(entry);
+    return entry;
+  };
+  function close(entry) {
+    entry.close();
+    opened.delete(entry);
+  }
+  t.after(async () => {
+    for (const entry of Array.from(opened).reverse()) close(entry);
+    const target = await realpath(path);
+    assert.equal(dirname(target), temp);
+    assert.ok(basename(target).startsWith('hq-development-conversation-'));
+    await rm(target, {recursive: true, force: true});
+  });
+  return {
+    database: () => keep(new DatabaseSync(join(path, 'conversations.sqlite'))),
+    store: () => keep(createChatStore(path)),
+    close,
+  };
 }
 
 test('migrates existing exports and lists API work in the same project history', async t => {
-  const path = await directory(t);
-  const old = new DatabaseSync(join(path, 'conversations.sqlite'));
+  const unit = await fixture(t);
+  const old = unit.database();
   const original = [{role: 'user', text: '以前の会話', createdAt: null}];
   old.exec(`CREATE TABLE conversations (
     project TEXT NOT NULL, id TEXT NOT NULL, title TEXT NOT NULL, imported_at TEXT NOT NULL,
     modified REAL NOT NULL, messages TEXT NOT NULL, PRIMARY KEY(project,id))`);
   old.prepare('INSERT INTO conversations VALUES (?,?,?,?,?,?)').run('example', 'export-1', '履歴',
     '2026-11-01T00:00:00.000Z', 1, JSON.stringify(original));
-  old.close();
+  unit.close(old);
 
-  const store = createChatStore(path);
-  t.after(() => store.close());
+  const store = unit.store();
   const start = store.beginDevelopment('example', request).conversation;
   assert.equal(start.id, conversationId);
   assert.equal(start.source, 'api-development');
@@ -55,13 +74,12 @@ test('migrates existing exports and lists API work in the same project history',
 });
 
 test('preserves interrupted and unconfirmed work across restart and competing replays', async t => {
-  const path = await directory(t);
-  const first = createChatStore(path);
+  const unit = await fixture(t);
+  const first = unit.store();
   first.beginDevelopment('example', request);
-  first.close();
+  unit.close(first);
 
-  const second = createChatStore(path);
-  t.after(() => second.close());
+  const second = unit.store();
   assert.equal(second.read('example', conversationId, 0).conversation.outcome, 'in_progress');
   assert.throws(() => second.beginDevelopment('example', {...request, prompt: '上書き'}), {status: 409});
   const interrupted = {...completion, outcome: 'interrupted', summary: ''};
