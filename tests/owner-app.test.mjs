@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import {mkdir, mkdtemp, readFile, realpath, rm, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join, resolve, sep} from 'node:path';
+import {DatabaseSync} from 'node:sqlite';
 import test from 'node:test';
 import {startOwnerApp} from '../app/server.mjs';
 import {ensurePrivateDirectory} from '../app/private-directory.mjs';
@@ -24,6 +25,7 @@ async function fixture(t) {
       assert.deepEqual(paths, ['/fixture-scope']);
       return {data: [], nextCursor: null};
     },
+    async findSubmission() { nativeReads++; return null; },
   }});
   t.after(async () => {
     await app.close();
@@ -65,6 +67,32 @@ test('owner credentials are one-use and private API calls never expose the works
   assert.equal((await fetch(`${app.url}/api/codex/threads?project=other`, {headers: {cookie}})).status, 404);
   assert.equal((await fetch(`${app.url}/api/codex/threads?project=example`, {headers: {cookie}})).status, 200);
   assert.equal(reads(), 1);
+});
+
+test('execution activity is owner-scoped and returns only status metadata', async t => {
+  const {app, directory, reads} = await fixture(t);
+  const observedAt = '2026-01-01T00:00:00.000Z';
+  const db = new DatabaseSync(join(directory, 'conversations.sqlite'));
+  const insert = db.prepare(`INSERT INTO codex_operations
+    (id,project,workspace,fingerprint,phase,threadId,turnId,createdAt,updatedAt,startedAt,output)
+    VALUES (?,?,?,'private-digest',?,'private-thread','private-turn',?,?,?,'private-output')`);
+  insert.run('fixture-operation', 'example', '/fixture-scope', 'interrupted', observedAt, observedAt, observedAt);
+  insert.run('out-of-scope-operation', 'example', '/different-workspace', 'running', '2026-02-01T00:00:00.000Z', observedAt, observedAt);
+  insert.run('different-project-operation', 'another', '/fixture-scope', 'running', '2026-02-01T00:00:00.000Z', observedAt, observedAt);
+  db.close();
+  const url = `${app.url}/api/execution/activity`;
+  assert.equal((await fetch(`${url}?project=example`)).status, 401);
+  const cookie = await login(app);
+  const call = path => fetch(app.url + path, {headers: {cookie}});
+  assert.equal((await (await call('/api/session')).json()).capabilities.executionActivity, true);
+  assert.equal((await call('/api/execution/activity?project=EXAMPLE')).status, 404);
+  assert.equal((await call('/api/execution/activity?project=another')).status, 404);
+  assert.equal((await call('/api/execution/activity?project=example&project=another')).status, 404);
+  const result = await call('/api/execution/activity?project=example');
+  assert.equal(result.status, 200);
+  assert.deepEqual(await result.json(), {activity: {id: 'fixture-operation', kind: 'codex',
+    phase: 'interrupted', observedAt, createdAt: observedAt, startedAt: observedAt, terminal: true}});
+  assert.equal(reads(), 0);
 });
 
 test('an imported conversation survives restart and rejected cross-origin requests never write it', async t => {

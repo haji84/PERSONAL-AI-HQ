@@ -56,10 +56,18 @@ const ui = {
 const resources = new Map();
 const runStates = new Map();
 const chatStreams = new Map();
+const activities = new Map();
+const activityLabels = {
+  reserved: '受付済み', sending: 'Codexへの送信を確認中', running: '実行中', interrupting: '中断を要求中',
+  unconfirmed: '状態未確認', completed: 'ターン完了', interrupted: '中断済み', failed: '実行失敗',
+};
 let requestSequence = 0;
 let mounted = 0;
 let pendingScroll;
 let stopRunView;
+let activityTimer;
+let activityPollRunning = false;
+let activitySession;
 
 function storePreferences() {
   writeStorage(localStorage, prefsKey, {
@@ -203,10 +211,76 @@ function gate(title, description, canRetry) {
 }
 function endSession() {
   stopRunView?.();
+  clearTimeout(activityTimer);
+  activities.clear();
+  activitySession = undefined;
   resources.clear();
   ui.portfolio = null;
   dom.content.replaceChildren();
   gate('サインイン', 'この端末のサインイン用ファイルを開いてください。', true);
+}
+function activityPanel() {
+  const section = node('section', 'stack');
+  section.id = 'project-activity';
+  section.hidden = true;
+  return section;
+}
+function paintActivity() {
+  const section = document.getElementById('project-activity');
+  if (!section) return;
+  const activity = activities.get(ui.project);
+  if (!activity) {
+    section.hidden = true;
+    section.replaceChildren();
+    return;
+  }
+  const status = node('p', 'small');
+  const phase = !activity.terminal && Date.now() - Date.parse(activity.observedAt) > 30000 ? 'unconfirmed' : activity.phase;
+  status.append(chip(phase, activityLabels[phase]),
+    node('span', 'muted', '  最終確認 ' + time(activity.observedAt)));
+  section.replaceChildren(node('h3', '', 'このアプリからのCodex実行'), status);
+  section.hidden = false;
+}
+async function pollActivity() {
+  if (ui.capabilities.executionActivity !== true || !ui.portfolio || !ui.project || activityPollRunning) return;
+  clearTimeout(activityTimer);
+  if (document.hidden) return;
+  activityPollRunning = true;
+  const session = activitySession ??= Symbol();
+  const currentProject = ui.project;
+  const selected = new Set([currentProject]);
+  for (const [id, value] of activities) {
+    if (value && !value.terminal && selected.size < 3 && projectList().some(project => project.id === id)) selected.add(id);
+  }
+  try {
+    await Promise.allSettled([...selected].map(async project => {
+      const previous = activities.get(project);
+      let activity;
+      try {
+        ({activity} = await api(apiPath('/api/execution/activity', {project}), {signal: AbortSignal.timeout(6500)}));
+      } catch {
+        if (activitySession === session && previous && !previous.terminal) {
+          activities.set(project, {...previous, phase: 'unconfirmed'});
+        }
+        return;
+      }
+      if (activitySession !== session || (activity !== null && (typeof activity?.id !== 'string' ||
+          typeof activity.terminal !== 'boolean' || !Object.hasOwn(activityLabels, activity.phase)))) return;
+      activities.set(project, activity);
+      if (previous !== undefined && activity?.terminal &&
+          (previous?.id !== activity.id || previous.phase !== activity.phase)) {
+        const name = projectList().find(item => item.id === project)?.name;
+        const messages = {completed: 'Codexのターンが完了しました。', interrupted: 'Codexの実行が中断されました。', failed: 'Codexの実行に失敗しました。'};
+        if (name && messages[activity.phase]) setNotice(`${name} · ${messages[activity.phase]}`, activity.phase === 'failed');
+      }
+    }));
+    paintActivity();
+  } finally {
+    activityPollRunning = false;
+    if (activitySession === session && !document.hidden) {
+      activityTimer = setTimeout(() => void pollActivity(), ui.project === currentProject ? 8000 : 0);
+    }
+  }
 }
 function apiPath(path, values = {}) {
   const query = new URLSearchParams();
@@ -430,9 +504,17 @@ function projectDetail() {
   metric(facts, '動作検証済み割合', m.verifiedCompletion, true);
   metric(facts, '実用完成率', m.usableCompletion, true);
   metric(facts, '完成予定', time(m.estimateFinish));
+  if (project.schedule?.originalDueAt) metric(facts, '当初の完成予定', time(project.schedule.originalDueAt));
+  const remaining = project.schedule?.remainingMinutes;
+  if (Number.isFinite(remaining?.standard)) {
+    const minutes = new Intl.NumberFormat('ja-JP', {maximumFractionDigits: 1});
+    metric(facts, '残りの目安', `${minutes.format(remaining.optimistic)}〜${minutes.format(remaining.cautious)}分（標準 ${minutes.format(remaining.standard)}分）`);
+  }
   metric(facts, '累計実作業時間', Number.isFinite(m.activeMinutes) ? m.activeMinutes + '分' : null);
   metric(facts, '情報の取得時刻', time(project.observedAt ?? ui.portfolio?.observedAt));
   detail.body.append(facts);
+  if (project.schedule?.delayed === true) detail.body.append(node('p', 'notice-chip chip', '当初予定に対して遅延しています'));
+  if (ui.capabilities.executionActivity === true) detail.body.append(activityPanel());
   if (asArray(project.remaining).length) {
     detail.body.append(node('h3', '', '確認・作業が残っている項目'));
     appendStrings(detail.body, project.remaining);
@@ -1483,6 +1565,8 @@ function render(restore = true) {
   };
   dom['page-summary'].textContent = summaries[ui.view];
   screens[ui.view]();
+  paintActivity();
+  void pollActivity();
   if (restore) restoreScroll();
 }
 async function refresh() {
@@ -1536,6 +1620,7 @@ for (const input of ['wheel', 'touchstart', 'pointerdown', 'keydown']) {
   window.addEventListener(input, () => { pendingScroll = null; }, {passive: true});
 }
 window.addEventListener('pagehide', () => { if (!dom.shell.hidden) rememberScroll(); });
+document.addEventListener('visibilitychange', () => { if (!document.hidden) void pollActivity(); });
 if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
 setTheme();
 void activate();

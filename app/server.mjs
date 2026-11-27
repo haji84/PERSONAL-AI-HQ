@@ -223,7 +223,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       const enabled = native.canWrite === true && portfolio?.view.projects.some(project => project.codexWrite) === true &&
         await Promise.resolve(native.subscriptionReady?.()).catch(() => false) === true;
       return send(response, 200, {authenticated, capabilities: {chatImport: true, codexWrite: enabled,
-        executionSettings: authenticated, chatgptPlan: authenticated && Boolean(plan)}});
+        executionSettings: authenticated, executionActivity: authenticated, chatgptPlan: authenticated && Boolean(plan)}});
     }
     if (post && route === '/api/session') {
       if (!['null', url].includes(request.headers.origin)) throw error(403, 'ログイン元を確認できません。');
@@ -258,6 +258,10 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
 
     const project = portfolio.projects.get(target.searchParams.get('project'));
     if (!project) throw error(404, '案件を見つけられませんでした。');
+    if (get && route === '/api/execution/activity') {
+      if (target.searchParams.getAll('project').length !== 1) throw error(404, '案件を見つけられませんでした。');
+      return send(response, 200, await operations.readActivity(project));
+    }
     if (route === '/api/execution/settings') {
       if (get) return send(response, 200, execution.settings(project));
       if (post) {

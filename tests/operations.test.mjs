@@ -126,3 +126,29 @@ test('steering is tied to the current turn and a retry never sends the instructi
   await assert.rejects(operations.steer(project, {...extra, prompt: 'Changed'}), {status: 409});
   assert.equal(additions, 1);
 });
+
+test('stale running activity is unconfirmed until exact native observation', async t => {
+  const {project, workspace, open, age} = await fixture(t);
+  const request = {id: 'activity-stale', prompt: 'A fixture'};
+  const first = open({async submit(input) {
+    assert.equal(input.onThread('fixture-thread'), true);
+    return {turn: {id: 'fixture-turn', status: 'inProgress'}};
+  }});
+  await first.start(project, request);
+  assert.equal((await first.readActivity(project)).activity.phase, 'running');
+  first.close();
+  age(request.id);
+  const unreachable = open({async findSubmission() { throw new Error('Unavailable'); }});
+  const stale = (await unreachable.readActivity(project)).activity;
+  assert.deepEqual([stale.phase, stale.observedAt, stale.terminal], ['unconfirmed', '2000-01-01T00:00:00.000Z', false]);
+  unreachable.close();
+  const reachable = open({async findSubmission(...args) {
+    assert.deepEqual(args, [workspace, 'fixture-thread', request.id, 'fixture-turn']);
+    return {id: 'fixture-turn', status: 'inProgress'};
+  }});
+  const confirmed = (await reachable.readActivity(project)).activity;
+  assert.equal(confirmed.phase, 'running');
+  assert.ok(confirmed.observedAt > stale.observedAt);
+  assert.equal(confirmed.terminal, false);
+  assert.deepEqual(await reachable.readActivity({...project, cwd: []}), {activity: null});
+});

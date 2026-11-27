@@ -5,6 +5,7 @@ import {DatabaseSync} from 'node:sqlite';
 
 const active = new Set(['reserved', 'sending', 'running', 'interrupting', 'unconfirmed']);
 const terminal = new Set(['completed', 'interrupted', 'failed']);
+const observationWindowMs = 15000;
 const allowedId = /^[a-z0-9_-]{8,80}$/i;
 const steerClientId = id => `hq:steer:${id}`;
 const timestamp = () => new Date().toISOString();
@@ -28,6 +29,9 @@ export function createOperations(directory, native, execution) {
     );`);
   const byId = db.prepare('SELECT * FROM codex_operations WHERE project=? AND id=?');
   const latest = db.prepare('SELECT * FROM codex_operations WHERE project=? ORDER BY createdAt DESC LIMIT 1');
+  const latestScoped = db.prepare(`SELECT id, project, workspace, phase, threadId, turnId, createdAt, updatedAt, startedAt
+    FROM codex_operations WHERE project=?
+    AND workspace IN (SELECT value FROM json_each(?)) ORDER BY createdAt DESC, rowid DESC LIMIT 1`);
   const activeRun = db.prepare(`SELECT 1 FROM codex_operations WHERE project=?
     AND phase IN ('reserved','sending','running','interrupting','unconfirmed') LIMIT 1`);
   const byClientId = db.prepare(`SELECT * FROM codex_operations WHERE threadId=? AND id=? AND turnId IS NULL
@@ -55,7 +59,7 @@ export function createOperations(directory, native, execution) {
 
   function advance(row, state, turnId, startedAt = null) {
     if (closed || !row) return;
-    if (state === 'running' && byId.get(row.project, row.id)?.phase === 'interrupting') return;
+    if (state === 'running' && byId.get(row.project, row.id)?.phase === 'interrupting') state = 'interrupting';
     change.run(state, turnId ?? null, timestamp(), startedAt, row.project, row.id, turnId ?? null, turnId ?? null);
   }
   function response(row) {
@@ -120,9 +124,9 @@ export function createOperations(directory, native, execution) {
       expireReservation.run(timestamp(), row.project, row.id, new Date(Date.now() - 30000).toISOString());
       return byId.get(row.project, row.id);
     }
-    if (!row.threadId || (age < 15000 && row.phase !== 'unconfirmed')) return row;
+    if (!row.threadId || (age < observationWindowMs && row.phase !== 'unconfirmed') || !native.findSubmission) return row;
     const prior = reconciled.get(row.project);
-    if (prior?.id === row.id && Date.now() - prior.at < 15000) return row;
+    if (prior?.id === row.id && Date.now() - prior.at < observationWindowMs) return row;
     reconciled.set(row.project, {id: row.id, at: Date.now()});
     try {
       const exact = await native.findSubmission(row.workspace, row.threadId, row.id, row.turnId);
@@ -130,7 +134,7 @@ export function createOperations(directory, native, execution) {
       if (observed) advance(row, observed, exact.id, exact.startedAt ?? null);
       else if (row.phase === 'sending' && age >= 30000) markUnconfirmed.run(timestamp(), row.project, row.id);
       return byId.get(row.project, row.id);
-    } catch { return row; }
+    } catch { return closed ? row : byId.get(row.project, row.id); }
   }
 
   return {
@@ -147,6 +151,14 @@ export function createOperations(directory, native, execution) {
       const row = id ? byId.get(project.id, id) : latest.get(project.id);
       if (row && !project.cwd.includes(row.workspace)) return {operation: null};
       return {operation: response(await runtimeResult(row))};
+    },
+    async readActivity(project) {
+      const row = await runtimeResult(latestScoped.get(project.id, JSON.stringify(project.cwd)));
+      if (!row) return {activity: null};
+      const isTerminal = terminal.has(row.phase);
+      const isRecent = Date.now() - Date.parse(row.updatedAt) < observationWindowMs;
+      return {activity: {id: row.id, kind: 'codex', phase: isTerminal || isRecent ? row.phase : 'unconfirmed',
+        observedAt: row.updatedAt, createdAt: row.createdAt, startedAt: row.startedAt, terminal: isTerminal}};
     },
     async start(project, input) {
       if (!input || typeof input.id !== 'string' || !allowedId.test(input.id) ||
