@@ -233,6 +233,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       throw error(400, '会話の入力とモデルを指定してください。');
     }
     const attachment = validatedDocument(input.document);
+    if (attachment && input.image !== undefined) throw error(400, '添付を1件だけ選んでください。');
     const controller = new AbortController();
     liveRequests.add(controller);
     const cancel = () => controller.abort();
@@ -252,6 +253,9 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
         const catalog = {accountType: 'chatgpt', data: entries.map((value, index) => ({id: value.slug,
           isDefault: index === 0, reasoningEfforts: []}))};
         selection = await execution.authorize(project, {stage: 'consultation', model: input.model, catalog});
+        if (input.image !== undefined && !entries.some(entry => entry.slug === selection.model && entry.acceptsImages === true)) {
+          throw error(400, '画像入力に対応するChatGPTのモデルを選んでください。');
+        }
       }
       signal.throwIfAborted();
       const confirmRoute = () => {
@@ -607,7 +611,16 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
     }
     if (route === '/api/chat/live') {
       if (get) return send(response, 200, {turn: chats.readLive(project.id, target.searchParams.get('id'))});
-      if (post) return liveChat(project, await jsonBody(request, 96 * 1024), response);
+      if (post) return liveChat(project, await jsonBody(request, 768 * 1024), response);
+    }
+    if (get && route === '/api/chat/live/image') {
+      const params = target.searchParams;
+      const photo = ['project', 'id', 'turn'].every(key => params.getAll(key).length === 1) &&
+        chats.readLiveImage(project.id, params.get('id'), params.get('turn'));
+      if (!photo) throw error(404, 'この会話の添付画像を確認できません。');
+      response.writeHead(200, {'Content-Type': photo.mime});
+      response.end(Buffer.from(photo.data, 'base64'));
+      return;
     }
     if (post && route === '/api/chat/speech') {
       if (target.searchParams.getAll('project').length !== 1) throw error(404, '案件を指定してください。');

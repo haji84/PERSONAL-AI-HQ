@@ -1,9 +1,14 @@
+import {validatedImage} from './image-attachment.mjs';
+
 const base = 'https://api.openai.com/v1';
 const eventLimit = 1024 * 1024;
 export const chatInputLimit = 48000;
 export const chatOutputLimit = 120000;
 export const chatMessageLimit = 17;
 export const chatModelPattern = /^[a-z0-9][a-z0-9_.:-]{0,159}$/i;
+// The account catalog gives slugs. These exact models also document image input for Responses.
+const visionModels = new Set(['gpt-6.2-sol', 'gpt-6.2-astra', 'gpt-6.1-sol']);
+const imageUrlPrefix = /^data:(image\/(?:png|jpeg|webp));base64,/;
 
 const errors = {
   CHATGPT_PLAN_AUTH_REQUIRED: 'ChatGPT plan authorization is required.',
@@ -130,7 +135,8 @@ export function createChatGPTResponses({auth, fetchImpl = globalThis.fetch}) {
         .filter(model => model?.visibility === 'list' && typeof model.slug === 'string' &&
           chatModelPattern.test(model.slug) && typeof model.display_name === 'string' &&
           model.display_name.trim() && model.display_name.length <= 240)
-        .map(model => ({slug: model.slug, displayName: model.display_name}));
+        .map(model => ({slug: model.slug, displayName: model.display_name,
+          ...(visionModels.has(model.slug) && {acceptsImages: true})}));
     },
 
     async *stream({model, messages, signal, beforeSend}) {
@@ -138,21 +144,38 @@ export function createChatGPTResponses({auth, fetchImpl = globalThis.fetch}) {
           !messages.length || messages.length > chatMessageLimit) {
         throw new ChatGPTPlanError('CHATGPT_PLAN_INVALID_REQUEST');
       }
+      const invalid = () => new ChatGPTPlanError('CHATGPT_PLAN_INVALID_REQUEST');
       let inputLength = 0;
+      let includedImage = false;
+      const addText = text => {
+        if (typeof text !== 'string' || !text.trim()) throw invalid();
+        inputLength += text.length;
+        if (inputLength > chatInputLimit) throw invalid();
+        return text;
+      };
       const input = messages.map(message => {
         const {role, content} = message ?? {};
-        if (role !== 'user' && role !== 'assistant') throw new ChatGPTPlanError('CHATGPT_PLAN_INVALID_REQUEST');
-        let parts;
-        if (typeof content === 'string' && content.trim()) parts = [content];
-        else if (role === 'user' && Array.isArray(content) && content.length === 2 &&
-            content.every(part => part?.type === 'input_text' && typeof part.text === 'string' && part.text.trim())) {
-          parts = content.map(part => part.text);
-        } else {
-          throw new ChatGPTPlanError('CHATGPT_PLAN_INVALID_REQUEST');
+        if (role !== 'user' && role !== 'assistant') throw invalid();
+        if (typeof content === 'string') return {role, content: addText(content)};
+        if (role !== 'user' || !Array.isArray(content) || content.length !== 2 || content[0]?.type !== 'input_text') {
+          throw invalid();
         }
-        inputLength += parts.reduce((length, part) => length + part.length, 0);
-        if (inputLength > chatInputLimit) throw new ChatGPTPlanError('CHATGPT_PLAN_INVALID_REQUEST');
-        return {role, content: typeof content === 'string' ? content : parts.map(text => ({type: 'input_text', text}))};
+        const prompt = {type: 'input_text', text: addText(content[0].text)};
+        const attachment = content[1];
+        if (attachment?.type === 'input_text') {
+          return {role, content: [prompt, {type: 'input_text', text: addText(attachment.text)}]};
+        }
+        if (includedImage || !visionModels.has(model) || attachment?.type !== 'input_image' ||
+            typeof attachment.image_url !== 'string' || attachment.detail !== 'auto') throw invalid();
+        const prefix = imageUrlPrefix.exec(attachment.image_url);
+        if (!prefix) throw invalid();
+        try {
+          validatedImage({mime: prefix[1], data: attachment.image_url.slice(prefix[0].length)});
+        } catch {
+          throw invalid();
+        }
+        includedImage = true;
+        return {role, content: [prompt, {type: 'input_image', image_url: attachment.image_url, detail: 'auto'}]};
       });
 
       const response = await request('/responses', {signal, beforeSend, body: {model, input, store: false, stream: true}});

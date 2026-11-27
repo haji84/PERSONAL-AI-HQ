@@ -1070,3 +1070,59 @@ test('a scoped ChatGPT plan stream preserves text and never repeats the provider
   assert.equal((await send(app.url, {...data, id: 'turn-after-pause'})).status, 409);
   assert.equal(runs, 1);
 });
+
+test('ChatGPT image send keeps the actual bytes behind the owner and conversation scope', async t => {
+  const {directory, start} = await runtimeFixture(t);
+  await writeFile(join(directory, 'portfolio.json'), JSON.stringify({...seed,
+    projects:[...seed.projects,{id:'other', name:'Other'}]}), {mode:0o600});
+  let runs = 0;
+  let held = false;
+  const app = await start({codex:{}, plan:{responses:{
+    async models() {
+      return [{slug:'vision', displayName:'Vision', ...(!held && {acceptsImages:true})},
+        {slug:'text-only', displayName:'Text'}];
+    },
+    async *stream({model,messages}) {
+      runs++;
+      assert.equal(model,'vision');
+      assert.equal(messages[0].content[1].image_url, 'data:' + image.mime + ';base64,' + image.data);
+      yield '保存しました';
+    },
+  }}});
+  const cookie = await login(app);
+  const image = {mime:'image/png',data:'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aF0kAAAAASUVORK5CYII='};
+  const request = {id:'image-request', prompt:'確認', model:'vision', image};
+  const post = (payload, authentication = cookie) => fetch(app.url + '/api/chat/live?project=example', {method:'POST',
+    headers:{cookie:authentication, Origin:app.url, 'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+  assert.equal((await post(request,'')).status,401);
+  assert.equal((await post({...request, model:'text-only'})).status,400);
+  assert.equal((await post({...request, document:{name:'text.txt',text:'同時に送らない'}})).status,400);
+  assert.equal((await post({...request, image:{...image, mime:'image/jpeg'}})).status,400);
+  assert.equal(runs,0);
+  const first = await post(request);
+  assert.equal(first.status,200);
+  const wire = await first.text();
+  assert.ok(!wire.includes(image.data));
+  const {turn} = wire.trim().split('\n\n').map(event=>JSON.parse(event.slice(6))).at(-1);
+  assert.equal(turn.status,'completed');
+  assert.equal(turn.image.mime,'image/png');
+  held = true;
+  assert.match(await (await post(request)).text(), /"status":"completed"/);
+  assert.equal((await post({...request, id:'image-during-hold'})).status,400);
+  assert.equal(runs,1);
+  const id = encodeURIComponent(turn.conversationId);
+  const path = '/api/chat/live/image?project=example&id=' + id + '&turn=' + turn.id;
+  assert.equal((await fetch(app.url + path)).status,401);
+  for (const other of [path.replace('project=example','project=other'),path + '&id=' + id,
+    path.replace(id,encodeURIComponent('live/wrong'))]) {
+    assert.equal((await fetch(app.url+other, {headers:{cookie}})).status,404);
+  }
+  const stored = await fetch(app.url + path,{headers:{cookie}});
+  assert.equal(stored.headers.get('content-type'),'image/png');
+  assert.equal(stored.headers.get('cache-control'),'no-store');
+  assert.deepEqual(Buffer.from(await stored.arrayBuffer()),Buffer.from(image.data,'base64'));
+  const history = await fetch(app.url + '/api/chat?project=example&id=' + id,{headers:{cookie}});
+  const saved = await history.json();
+  assert.deepEqual(saved.conversation.messages[0].image,turn.image);
+  assert.ok(!JSON.stringify(saved).includes(image.data));
+});

@@ -4,6 +4,7 @@ import {join} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
 import {ROUTES, STAGES} from './execution-policy.mjs';
 import {validatedDocument} from './text-attachment.mjs';
+import {validatedImage} from './image-attachment.mjs';
 import {readCurrentProject} from './portfolio.mjs';
 
 const active = new Set(['reserved', 'sending', 'running', 'interrupting', 'unconfirmed']);
@@ -14,37 +15,12 @@ const allowedId = /^[a-z0-9_-]{8,80}$/i;
 const nativeThreadId = /^[a-z0-9_-]{1,160}$/i;
 const receiptId = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
 const reviewHash = /^[a-f0-9]{64}$/;
-const imageByteLimit = 512 * 1024;
-const imageBase64Limit = 4 * Math.ceil(imageByteLimit / 3);
-const pngMagic = Buffer.from('89504e470d0a1a0a', 'hex');
-const jpegMagic = Buffer.from('ffd8ff', 'hex');
-const imageSignatures = new Map([
-  ['image/png', bytes => bytes.subarray(0, pngMagic.length).equals(pngMagic)],
-  ['image/jpeg', bytes => bytes.subarray(0, jpegMagic.length).equals(jpegMagic)],
-  ['image/webp', bytes => bytes.toString('latin1', 0, 4) === 'RIFF' && bytes.toString('latin1', 8, 12) === 'WEBP'],
-]);
 const steerClientId = id => `hq:steer:${id}`;
 const timestamp = () => new Date().toISOString();
 const problem = (status, message, code) => Object.assign(new Error(message), {status, code});
 const resumeUnavailable = () => problem(409, 'このスレッドの最新の作業を照合できません。', 'CODEX_RESUME_TARGET_UNAVAILABLE');
 const phase = value => nativeTerminal.has(value) ? value : value === 'inProgress' ? 'running' : null;
 const visiblePhase = row => row.cancellationRequestedAt && active.has(row.phase) ? 'cancelling' : row.phase;
-
-function validatedImage(value) {
-  if (value === undefined) return null;
-  const invalid = () => problem(400, 'PNG、JPEG、WebPの画像を1枚指定してください。');
-  const tooLarge = () => problem(413, '画像は512 KiB以下にしてください。');
-  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length !== 2 ||
-      !Object.hasOwn(value, 'mime') || !Object.hasOwn(value, 'data')) throw invalid();
-  const {mime, data} = value;
-  const matches = imageSignatures.get(mime);
-  if (!matches || typeof data !== 'string' || !data.length) throw invalid();
-  if (data.length > imageBase64Limit) throw tooLarge();
-  const bytes = Buffer.from(data, 'base64');
-  if (bytes.toString('base64') !== data || !matches(bytes)) throw invalid();
-  if (bytes.length > imageByteLimit) throw tooLarge();
-  return {image: {mime, data}, digest: createHash('sha256').update(bytes).digest('hex')};
-}
 
 export function createOperations(directory, native, execution, {prepareHandover} = {}) {
   const db = new DatabaseSync(join(directory, 'conversations.sqlite'));

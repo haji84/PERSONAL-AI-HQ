@@ -1650,7 +1650,33 @@ function speechControls(project, text) {
   control.append(toggle, status, audio);
   return control;
 }
-function messageBubble(item) {
+function chatHistoryImage(item, scope) {
+  const image = item.image;
+  if (!scope || !codexImageTypes.includes(image?.mime) || !Number.isSafeInteger(image.size) ||
+      image.size < 1 || image.size > codexImageLimit || !/^[a-f0-9]{64}$/.test(image.sha256 ?? '') ||
+      typeof item.turnId !== 'string' || !/^[a-z0-9_.:-]{1,160}$/i.test(item.turnId)) return null;
+  const {project, id} = scope;
+  const details = node('details', 'scope-info');
+  details.append(node('summary', '', `添付画像（${Math.ceil(image.size / 1024)} KiB）`));
+  details.addEventListener('toggle', () => {
+    if (!details.open || !details.isConnected || ui.view !== 'chat' || ui.project !== project ||
+        ui.chatIds.get(project) !== id || details.children.length !== 1) return;
+    const photo = node('img', 'camera-preview');
+    photo.alt = '会話に添付された画像';
+    photo.referrerPolicy = 'no-referrer';
+    photo.addEventListener('error', () => {
+      if (photo.isConnected) photo.replaceWith(node('p', 'small muted', '添付画像を取得できませんでした。'));
+    }, {once: true});
+    const path = apiPath('/api/chat/live/image', {project, id, turn: item.turnId});
+    details.append(photo);
+    if (scope.reuseImage) {
+      details.append(button('この画像を下書きに添付', () => scope.reuseImage(path, image, id)));
+    }
+    photo.src = path;
+  });
+  return details;
+}
+function messageBubble(item, imageScope) {
   const user = item.role === 'user';
   const box = node('div', 'message' + (user ? ' user' : ''));
   const label = (user ? 'あなた' : 'AI') + (item.createdAt ? ' · ' + time(item.createdAt) : '');
@@ -1662,6 +1688,10 @@ function messageBubble(item) {
     original.tabIndex = 0;
     reference.append(node('summary', '', attachment.name), original);
     box.append(reference);
+  }
+  if (user) {
+    const image = chatHistoryImage(item, imageScope);
+    if (image) box.append(image);
   }
   if (!user && ui.view === 'chat' && ui.capabilities.localSpeech === true && typeof item.text === 'string' && item.text.trim()) {
     box.append(speechControls(ui.project, item.text));
@@ -1689,9 +1719,9 @@ function showApiReceipts(destination, receipts) {
   details.append(node('summary', '', apiReceiptSummary(receipts)), responses);
   destination.append(details);
 }
-function messagesInto(parent, items, onTop) {
+function messagesInto(parent, items, onTop, imageScope) {
   const payload = asArray(items).filter(item => ['user', 'assistant', 'agent'].includes(item?.role));
-  const nodes = payload.map(messageBubble);
+  const nodes = payload.map(item => messageBubble(item, imageScope));
   if (onTop) parent.prepend(...nodes);
   else parent.append(...nodes);
   return nodes.length;
@@ -1750,55 +1780,147 @@ function planComposer(project, onConversation) {
   const referenceLabel = node('label', 'picker');
   const reference = node('input');
   reference.type = 'checkbox';
-  referenceLabel.append(reference, node('span', '', '選択中の会話から最近の発言と資料を引き継ぐ'));
+  referenceLabel.append(reference, node('span', '', '選択中の会話から最近の発言とテキスト資料を引き継ぐ'));
   const attachmentField = node('div', 'stack');
   const attachmentLabel = node('label', 'picker');
   const attachmentInput = node('input');
   attachmentInput.type = 'file';
-  attachmentInput.accept = textDocumentExtensions.join(',');
-  attachmentLabel.append(node('span', '', 'テキスト資料を添付（16 KiBまで）'), attachmentInput);
+  const attachmentTitle = node('span');
+  attachmentLabel.append(attachmentTitle, attachmentInput);
   const attachmentStatus = node('span', 'small muted');
   attachmentStatus.setAttribute('role', 'status');
-  let readingDocument = false;
-  let documentError = '';
-  let documentSelection = 0;
+  const imageModels = new Set();
+  let consultationSettings;
+  let readingAttachment = false;
+  let attachmentError = '';
+  let attachmentSelection = 0;
+  let photoGeneration = 0;
+  let disposed = false;
   const attached = () => ui.attachmentDrafts.get(draftKey);
-  const currentAttachmentField = () => attachmentInput.isConnected && ui.view === 'chat' && ui.project === project;
+  const draftConversationId = () => reference.checked ? ui.chatIds.get(project) ?? null : null;
+  const matchesImageConversation = (attachment, conversationId) =>
+    !attachment || !Object.hasOwn(attachment, 'sourceConversationId') || attachment.sourceConversationId === (conversationId ?? null);
+  const savedSource = attached()?.sourceConversationId;
+  if (savedSource && ui.chatIds.get(project) === savedSource) reference.checked = true;
+  reference.addEventListener('change', () => { closeCamera(); controls(); });
+  const currentAttachmentField = () => !disposed && attachmentInput.isConnected && ui.view === 'chat' && ui.project === project;
+  const imageAllowed = slug => imageModels.has(slug) &&
+    !['paused', 'approval', 'limit', 'blocked', 'offline', 'waiting', 'completed'].includes(selectedProject()?.state) &&
+    codexCameraRouteAllowed(consultationSettings?.value?.settings, 'consultation');
+  const camera = createCodexCamera({maxBytes: codexImageLimit, onCapture: file => stageAttachment(file, true),
+    onActiveChange: () => queueMicrotask(controls)});
+  function closeCamera() {
+    photoGeneration++;
+    camera?.close();
+  }
+  function onVisibility() { if (document.hidden) closeCamera(); }
+  if (camera) {
+    document.addEventListener('visibilitychange', onVisibility);
+    window.addEventListener('pagehide', closeCamera);
+  }
+  const cleanup = () => {
+    disposed = true;
+    photoGeneration++;
+    if (camera) {
+      document.removeEventListener('visibilitychange', onVisibility);
+      window.removeEventListener('pagehide', closeCamera);
+      camera.dispose();
+    }
+    runViewCleanups.delete(cleanup);
+  };
+  runViewCleanups.add(cleanup);
+  model.addEventListener('change', () => { closeCamera(); controls(); });
   const clearAttachment = button('添付を外す', () => {
-    documentSelection++;
-    readingDocument = false;
-    documentError = '';
+    closeCamera();
+    attachmentSelection++;
+    readingAttachment = false;
+    attachmentError = '';
     ui.attachmentDrafts.delete(draftKey);
     controls();
   });
-  attachmentInput.addEventListener('change', async () => {
-    const file = attachmentInput.files?.[0];
-    if (!file) return;
-    attachmentInput.value = '';
-    const selection = ++documentSelection;
-    ui.attachmentDrafts.delete(draftKey);
-    readingDocument = true;
-    documentError = '';
+  async function stageAttachment(file, captured = false) {
+    if (!file || !currentAttachmentField()) return;
+    if (!captured) closeCamera();
+    const isImage = codexImageTypes.includes(file.type);
+    const selectedModel = model.value;
+    const sourceConversationId = draftConversationId();
+    const pending = ui.chatIntents.get(project);
+    if (captured && (document.hidden || pending || chatStreams.has(project) || !imageAllowed(selectedModel))) return;
+    const generation = photoGeneration;
+    const selection = ++attachmentSelection;
+    readingAttachment = true;
+    attachmentError = '';
     controls();
-    const checkSelection = () => selection === documentSelection && currentAttachmentField();
+    const checkSelection = () => selection === attachmentSelection && currentAttachmentField();
     try {
       const ext = file.name.slice(file.name.lastIndexOf('.')).toLowerCase();
-      if (!file.size || file.size > textDocumentLimit || !textDocumentExtensions.includes(ext)) {
+      if (isImage) {
+        if (!imageAllowed(selectedModel)) throw new Error('画像入力に対応する相談経路とモデルを確認してください。');
+        if (!file.size || file.size > codexImageLimit) throw new Error('512 KiB以下の画像を選んでください。');
+      } else if (!file.size || file.size > textDocumentLimit || !textDocumentExtensions.includes(ext)) {
         throw new Error('16 KiB以下のテキスト、Markdown、CSV、JSONを選んでください。');
       }
       const bytes = new Uint8Array(await file.arrayBuffer());
-      let text;
-      try { text = documentDecoder.decode(bytes); }
-      catch { throw new Error('UTF-8で保存した資料を選んでください。'); }
-      const digest = await attachmentDigest(bytes, file.name);
-      if (checkSelection()) ui.attachmentDrafts.set(draftKey, {document: {name: file.name, text}, digest});
+      let document;
+      if (!isImage) {
+        try { document = {name: file.name, text: documentDecoder.decode(bytes)}; }
+        catch { throw new Error('UTF-8で保存した資料を選んでください。'); }
+      }
+      const digest = await attachmentDigest(bytes, isImage ? '' : file.name);
+      if (!checkSelection() || (captured && (generation !== photoGeneration ||
+          sourceConversationId !== draftConversationId() || !imageAllowed(model.value)))) return;
+      ui.attachmentDrafts.set(draftKey, isImage ? {file, digest, ...(captured && {sourceConversationId})} : {document, digest});
     } catch (error) {
-      if (checkSelection()) documentError = error.message;
+      if (checkSelection()) attachmentError = error.message;
     } finally {
-      if (checkSelection()) { readingDocument = false; controls(); }
+      if (checkSelection()) { readingAttachment = false; controls(); }
     }
+  }
+  attachmentInput.addEventListener('change', () => {
+    const file = attachmentInput.files?.[0];
+    attachmentInput.value = '';
+    void stageAttachment(file);
   });
-  attachmentField.append(attachmentLabel, attachmentStatus, clearAttachment);
+  async function reuseImage(path, expected, conversationId) {
+    if (!currentAttachmentField() || ui.chatIds.get(project) !== conversationId) return;
+    if (!imageAllowed(model.value) || readingAttachment || ui.chatIntents.has(project) || chatStreams.has(project)) {
+      setNotice('画像に対応するモデルを選び、保留中の応答を確認してから添付してください。', true);
+      return;
+    }
+    closeCamera();
+    const generation = photoGeneration;
+    const selection = ++attachmentSelection;
+    const isCurrent = () => selection === attachmentSelection && currentAttachmentField();
+    const sameConversation = () => generation === photoGeneration && ui.chatIds.get(project) === conversationId;
+    readingAttachment = true;
+    attachmentError = '';
+    controls();
+    try {
+      const response = await fetch(path, {credentials: 'same-origin'});
+      if (response.status === 401) { endSession(); return; }
+      if (!response.ok || response.headers.get('content-type') !== expected.mime) {
+        throw new Error('添付画像を取得できませんでした。');
+      }
+      const bytes = await response.arrayBuffer();
+      const digest = await attachmentDigest(new Uint8Array(bytes));
+      if (!isCurrent() || !sameConversation()) return;
+      if (bytes.byteLength !== expected.size || digest !== expected.sha256) {
+        throw new Error('保存した画像と一致しません。');
+      }
+      const suffix = expected.mime === 'image/jpeg' ? 'jpg' : expected.mime.slice(6);
+      ui.attachmentDrafts.set(draftKey, {file: new File([bytes], '添付画像.' + suffix, {type: expected.mime}),
+        digest, sourceConversationId: conversationId});
+      reference.checked = true;
+      draft.focus();
+    } catch (error) {
+      if (isCurrent() && sameConversation()) attachmentError = error.message;
+    } finally {
+      if (isCurrent()) { readingAttachment = false; controls(); }
+    }
+  }
+  attachmentField.append(attachmentLabel);
+  if (camera) attachmentField.append(camera.root);
+  attachmentField.append(attachmentStatus, clearAttachment);
   const output = node('pre', 'run-output');
   output.setAttribute('aria-label', 'ChatGPTの応答');
   output.tabIndex = 0;
@@ -1837,23 +1959,41 @@ function planComposer(project, onConversation) {
     aborted: '応答を中断し、取得済みの部分を保存しました。', interrupted: '応答が途切れ、取得済みの部分を保存しました。',
     incomplete: '応答が完了せず、取得済みの部分を保存しました。', failed: '応答を確認できませんでした。接続と利用枠を確認してください。',
   };
+  function matchesAttachment(intent, attachment) {
+    if (intent?.imageSha256) return Boolean(attachment?.file && attachment.digest === intent.imageSha256);
+    if (intent?.documentDigest) return Boolean(attachment?.document && attachment.digest === intent.documentDigest);
+    return true;
+  }
   function controls() {
+    if (!currentAttachmentField()) return;
     const active = chatStreams.get(project)?.controller;
     const pending = ui.chatIntents.get(project);
     const attachment = attached();
-    const needsFile = Boolean(pending?.documentDigest) && pending.documentDigest !== attachment?.digest;
-    send.disabled = !canSend || Boolean(active) || Boolean(pending) || readingDocument || Boolean(documentError);
+    const allowsImage = imageAllowed(model.value);
+    const imageBlocked = Boolean((attachment?.file || pending?.imageSha256) &&
+      (!allowsImage || (pending?.imageSha256 && !imageAllowed(pending.model))));
+    const wrongConversation = !matchesImageConversation(attachment, draftConversationId());
+    const needsFile = !matchesAttachment(pending, attachment);
+    camera?.setAvailable(canSend && allowsImage && !active && !pending && !readingAttachment);
+    send.disabled = !canSend || Boolean(active || pending || camera?.active) || readingAttachment ||
+      Boolean(attachmentError) || imageBlocked || wrongConversation;
     stop.hidden = !active;
     check.hidden = !ui.chatTurns.has(project) || Boolean(active);
     retry.hidden = !pending || Boolean(active);
-    retry.disabled = readingDocument || needsFile;
+    retry.disabled = readingAttachment || needsFile || imageBlocked || wrongConversation || Boolean(camera?.active || attachmentError);
     discard.hidden = retry.hidden;
     output.hidden = !output.textContent;
-    attachmentInput.disabled = Boolean(active) || (Boolean(pending) && !pending.documentDigest);
-    clearAttachment.hidden = !attachment && !documentError && !readingDocument;
+    attachmentInput.accept = [...textDocumentExtensions, ...(allowsImage ? codexImageTypes : [])].join(',');
+    attachmentTitle.textContent = allowsImage ? '画像・テキスト資料を添付（画像512 KiB、資料16 KiBまで）'
+      : 'テキスト資料を添付（16 KiBまで）';
+    attachmentInput.disabled = Boolean(active || camera?.active) || (Boolean(pending) && !pending.documentDigest && !pending.imageSha256);
+    clearAttachment.hidden = !attachment && !attachmentError && !readingAttachment;
     clearAttachment.disabled = Boolean(active);
-    attachmentStatus.textContent = readingDocument ? '添付を照合しています。'
-      : documentError || (needsFile ? '再送するには最初と同じ資料を選んでください。' : attachment?.document.name ?? '');
+    attachmentStatus.textContent = readingAttachment ? '添付を照合しています。' : attachmentError ||
+      (wrongConversation ? '元の会話を引き継ぐか、添付を外してください。' :
+        imageBlocked ? '画像に対応する相談経路とモデルを確認してください。' :
+          needsFile ? (pending.imageSha256 ? '再送するには最初と同じ画像を選んでください。' : '再送するには最初と同じ資料を選んでください。') :
+            attachment?.file?.name ?? attachment?.document?.name ?? '');
   }
   function showTurn(turn, selectConversation = true) {
     if (!turn) { status.textContent = 'この受付番号の応答はまだ確認できません。'; return; }
@@ -1863,7 +2003,7 @@ function planComposer(project, onConversation) {
     const intent = ui.chatIntents.get(project);
     if (terminal && intent?.id === turn.id) {
       ui.chatIntents.delete(project);
-      if (intent.documentDigest && attached()?.digest === intent.documentDigest) ui.attachmentDrafts.delete(draftKey);
+      if ((intent.documentDigest || intent.imageSha256) && matchesAttachment(intent, attached())) ui.attachmentDrafts.delete(draftKey);
       storeTab();
     }
     if (selectConversation && turn.conversationId && terminal) {
@@ -1880,11 +2020,11 @@ function planComposer(project, onConversation) {
   }
   function sendMessage() {
     const prompt = draft.value.trim();
-    if (send.disabled || !prompt || !model.value) {
+    if (!currentAttachmentField() || camera?.active || send.disabled || !prompt || !model.value) {
       if (!prompt) status.textContent = '相談する内容を入力してください。';
       return;
     }
-    const conversationId = reference.checked ? ui.chatIds.get(project) : undefined;
+    const conversationId = draftConversationId() ?? undefined;
     if (conversationId && /^(?:api|codex)\//.test(conversationId)) {
       status.textContent = '別の経路の記録をChatGPTプランに引き継ぐには、作業の照合が必要です。';
       return;
@@ -1893,18 +2033,24 @@ function planComposer(project, onConversation) {
     const id = crypto.randomUUID();
     const attachment = attached();
     ui.chatIntents.set(project, {id, conversationId, model: model.value, prompt,
-      ...(attachment ? {documentDigest: attachment.digest} : {})});
+      ...(attachment?.file ? {imageSha256: attachment.digest} : attachment ? {documentDigest: attachment.digest} : {})});
     ui.chatTurns.set(project, id);
     storeTab();
     void submitIntent();
   }
   async function submitIntent() {
     const intent = ui.chatIntents.get(project);
-    if (!intent || !canSend || chatStreams.has(project) || readingDocument) return;
-    const {documentDigest, ...payload} = intent;
+    if (!currentAttachmentField() || !intent || !canSend || chatStreams.has(project) || readingAttachment || camera?.active || attachmentError) return;
+    const {documentDigest, imageSha256, ...payload} = intent;
     const attachment = attached();
-    if (documentDigest && documentDigest !== attachment?.digest) {
-      status.textContent = '最初と同じ資料を選んでから再送してください。';
+    if (!matchesAttachment(intent, attachment)) {
+      status.textContent = imageSha256 ? '最初と同じ画像を選んでから再送してください。' : '最初と同じ資料を選んでから再送してください。';
+      return;
+    }
+    if (!matchesImageConversation(attachment, intent.conversationId) ||
+        !matchesImageConversation(attachment, draftConversationId())) return;
+    if (imageSha256 && (!imageAllowed(model.value) || !imageAllowed(intent.model))) {
+      status.textContent = '画像入力に対応する相談経路とモデルを確認してください。';
       return;
     }
     const controller = new AbortController();
@@ -1914,9 +2060,20 @@ function planComposer(project, onConversation) {
     status.textContent = 'ChatGPTに送っています…';
     controls();
     try {
+      if (documentDigest) payload.document = attachment.document;
+      if (imageSha256) {
+        const bytes = new Uint8Array(await attachment.file.arrayBuffer());
+        if (!currentAttachmentField()) return;
+        if (document.hidden || controller.signal.aborted || ui.chatIntents.get(project) !== intent ||
+            ui.chatIds.get(project) !== selected || !matchesImageConversation(attachment, draftConversationId()) ||
+            !imageAllowed(model.value) || !imageAllowed(intent.model)) {
+          status.textContent = '画像の送信を保留しました。相談先を確認して同じ受付番号を使えます。';
+          return;
+        }
+        payload.image = {mime: attachment.file.type, data: imageBase64(bytes)};
+      }
       const response = await fetch(apiPath('/api/chat/live', {project}), {method: 'POST', credentials: 'same-origin',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({...payload, ...(documentDigest ? {document: attachment.document} : {})}),
+        headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload),
         signal: controller.signal});
       if (response.status === 401) endSession();
       if (!response.ok) {
@@ -1951,6 +2108,7 @@ function planComposer(project, onConversation) {
   void (async () => {
     try {
       const account = await api('/api/chat/plan');
+      if (!currentAttachmentField()) return;
       if (!['connected', 'refresh_required'].includes(account.status)) {
         status.textContent = account.status === 'storage_unavailable' ? 'この端末でChatGPTプランの認証を保存できません。' :
           'ChatGPTプランで相談するには、このアプリの利用を承認してください。';
@@ -1958,10 +2116,18 @@ function planComposer(project, onConversation) {
         return;
       }
       const {models} = await api('/api/chat/plan/models');
+      if (!currentAttachmentField()) return;
       for (const entry of asArray(models)) {
         const option = node('option', '', entry.displayName);
         option.value = entry.slug;
+        if (entry.acceptsImages === true) imageModels.add(entry.slug);
         model.append(option);
+      }
+      const pendingModel = ui.chatIntents.get(project)?.model;
+      if (pendingModel && Array.from(model.options).some(option => option.value === pendingModel)) model.value = pendingModel;
+      if (imageModels.size) {
+        consultationSettings = viewResource(memoryKey('execution-settings', project), apiPath('/api/execution/settings', {project}));
+        if (consultationSettings.pending) void consultationSettings.pending.then(controls);
       }
       canSend = model.options.length > 0;
       status.textContent = canSend ? ui.chatIntents.has(project) ? '前の応答の受付を確認できます。' : 'ChatGPTプランに接続しています。' :
@@ -1973,7 +2139,8 @@ function planComposer(project, onConversation) {
       if (error.status === 403) { signIn.textContent = 'ChatGPTで再認証'; signIn.hidden = false; }
     }
   })();
-  return area.root;
+  const conversationChanged = () => { closeCamera(); controls(); };
+  return {root: area.root, conversationChanged, reuseImage};
 }
 function importSection(project) {
   const box = node('div', 'import-box');
@@ -2143,6 +2310,8 @@ function chat() {
   let cleanupHandoff;
   let cleanupAdvice;
   let advisoryThread;
+  let plan;
+  let previousConversation;
   function showAdvice(nativeId) {
     if (ui.capabilities.apiDevelopment !== true || advisoryThread === nativeId) return;
     advisoryThread = nativeId;
@@ -2161,6 +2330,10 @@ function chat() {
     cleanupHandoff?.();
     cleanupHandoff = undefined;
     const id = ui.chatIds.get(project);
+    if (previousConversation !== id) {
+      previousConversation = id;
+      plan?.conversationChanged();
+    }
     const nativeId = id?.startsWith('codex/') ? id.slice('codex/'.length) : null;
     showAdvice(nativeId);
     if (!id) {
@@ -2191,7 +2364,8 @@ function chat() {
       const messages = node('div', 'messages messages-embedded');
       destination.append(messages);
       const empty = node('p', 'muted', '表示できる発言がありません。');
-      if (!messagesInto(messages, conversation.messages)) messages.append(empty);
+      const imageScope = conversation.source === 'chatgpt-live' ? {project, id, reuseImage: plan?.reuseImage} : undefined;
+      if (!messagesInto(messages, conversation.messages, false, imageScope)) messages.append(empty);
       let offset = result.nextOffset;
       let cursor = result.nextCursor;
       const detailIsCurrent = () => messages.isConnected && ui.project === project && ui.chatIds.get(project) === id;
@@ -2217,7 +2391,7 @@ function chat() {
             messages.prepend(load);
           } else {
             const added = asArray(page.conversation?.messages);
-            if (messagesInto(messages, added)) empty.remove();
+            if (messagesInto(messages, added, false, imageScope)) empty.remove();
             conversation.messages = [...asArray(conversation.messages), ...added];
             updateTransfer();
             result.nextOffset = page.nextOffset;
@@ -2301,15 +2475,18 @@ function chat() {
   if (ui.capabilities.chatImport === true) collection.root.append(importSection(project));
   const current = node('div', 'stack');
   current.append(thread.root);
-  if (ui.capabilities.chatgptPlan === true) current.append(planComposer(project, id => {
-    if (ui.view !== 'chat' || ui.project !== project || !layout.isConnected) return;
-    explicitSelection = true;
-    ui.chatIds.set(project, id);
-    storeTab();
-    evictChats(project);
-    showChatDetails();
-    searchChats(search.value);
-  }));
+  if (ui.capabilities.chatgptPlan === true) {
+    plan = planComposer(project, id => {
+      if (ui.view !== 'chat' || ui.project !== project || !layout.isConnected) return;
+      explicitSelection = true;
+      ui.chatIds.set(project, id);
+      storeTab();
+      evictChats(project);
+      showChatDetails();
+      searchChats(search.value);
+    });
+    current.append(plan.root);
+  }
   if (ui.capabilities.apiDevelopment === true) current.append(adviceHost);
   layout.append(collection.root, current, chatDevelopmentPanel(details));
   dom.content.append(layout);

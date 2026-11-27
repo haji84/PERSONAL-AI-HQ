@@ -222,3 +222,33 @@ test('provider context omits an oversized prior attachment without altering save
     content.reduce((length, part) => length + part.text.length, 0) : content.length), 0) <= chatInputLimit);
   assert.deepEqual(store.read('example', turn.conversationId, 0).conversation.messages[0].document, document);
 });
+
+test('preserves an image after restart and forwards bytes only when explicitly attached again', async t => {
+  const unit = await fixture(t);
+  const first = unit.store();
+  const image = {mime: 'image/png', data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aF0kAAAAASUVORK5CYII='};
+  const source = 'data:' + image.mime + ';base64,' + image.data;
+  const inputImage = {type: 'input_image', image_url: source, detail: 'auto'};
+  const {turn, messages} = first.beginLive('example', {...request, image, allowImageContext: true});
+  assert.deepEqual(messages[0], {role: 'user', content: [{type: 'input_text', text: request.prompt}, inputImage]});
+  assert.equal(turn.image?.mime, image.mime);
+  assert.equal(turn.image.size, Buffer.from(image.data, 'base64').length);
+  assert.match(turn.image.sha256, /^[a-f0-9]{64}$/);
+  assert.equal(turn.image.data, undefined);
+  first.finishLive('example', request.id, {status: 'completed', text: '確認済み'});
+  unit.close(first);
+  const reopened = unit.store();
+  assert.deepEqual(reopened.read('example', turn.conversationId, 0).conversation.messages[0].image, turn.image);
+  assert.deepEqual(reopened.readLiveImage('example', turn.conversationId, request.id), image);
+  assert.equal(reopened.readLiveImage('other', turn.conversationId, request.id), null);
+  assert.equal(reopened.readLiveImage('example', 'another-conversation', request.id), null);
+  assert.equal(reopened.beginLive('example', {...request, image}).duplicate, true);
+  assert.throws(() => reopened.beginLive('example', request), {status: 409});
+  const next = {id: 'request-followup', conversationId: turn.conversationId, model: request.model, prompt: '先ほどの画像は？'};
+  const followup = reopened.beginLive('example', {...next, allowImageContext: true});
+  assert.ok(followup.messages.every(message => typeof message.content === 'string'));
+  reopened.finishLive('example', next.id, {status:'completed', text:'回答'});
+  const continued = reopened.beginLive('example', {...next, id:'request-later', image});
+  assert.ok(continued.messages.slice(0,-1).every(message => typeof message.content === 'string'));
+  assert.deepEqual(continued.messages.at(-1).content[1], inputImage);
+});

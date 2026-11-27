@@ -140,3 +140,29 @@ test('does not emit output beyond the durable text limit', async () => {
   assert.equal((await iterator.next()).value, 'partial');
   await assert.rejects(iterator.next(), {code: 'CHATGPT_PLAN_INCOMPLETE'});
 });
+
+test('identifies documented image models in the signed-in catalog and sends bounded inline images', async () => {
+  const imageUrl = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aF0kAAAAASUVORK5CYII=';
+  const image = {type: 'input_image', image_url: imageUrl, detail: 'auto'};
+  const input = [{role: 'user', content: [{type: 'input_text', text: '画像を確認'}, image]}];
+  let requests = 0;
+  const client = createChatGPTResponses({auth, fetchImpl: async (_url, init) => {
+    requests++;
+    if (init.method === 'GET') return Response.json({models: [
+      {visibility: 'list', slug: 'gpt-6.2-sol', display_name: 'Sol'},
+      {visibility: 'list', slug: 'another-model', display_name: 'Another', input_modalities: ['image']},
+    ]});
+    assert.deepEqual(JSON.parse(init.body), {model: 'gpt-6.2-sol', input, store: false, stream: true});
+    return sse([encode.encode(event('response.completed', {response: {status: 'completed'}}))]);
+  }});
+  assert.deepEqual(await client.models(), [
+    {slug: 'gpt-6.2-sol', displayName: 'Sol', acceptsImages: true},
+    {slug: 'another-model', displayName: 'Another'},
+  ]);
+  assert.equal((await client.stream({model: 'gpt-6.2-sol', messages: input}).next()).done, true);
+  for (const messages of [[...input, ...input], [{role: 'user', content: [input[0].content[0],
+    {...image, image_url: 'https://private.example/image.png'}]}], [{role: 'assistant', content: input[0].content}]]) {
+    await assert.rejects(client.stream({model: 'gpt-6.2-sol', messages}).next(), {code: 'CHATGPT_PLAN_INVALID_REQUEST'});
+  }
+  assert.equal(requests, 2);
+});

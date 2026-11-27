@@ -3,6 +3,7 @@ import {chmodSync, lstatSync} from 'node:fs';
 import {join} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
 import {chatInputLimit, chatMessageLimit, chatModelPattern, chatOutputLimit} from './chatgpt-responses.mjs';
+import {validatedImage} from './image-attachment.mjs';
 import {apiAdviceMaxLength} from './api-response.mjs';
 
 const date = value => Number.isFinite(value) && value >= 0 && value < 253402300800 ? new Date(value * 1000).toISOString() : null;
@@ -65,10 +66,20 @@ function archiveView(row, offset = 0) {
 
 const documentText = ({name, text}) => '添付資料（' + name + '）\n' + text;
 
-function providerMessage({role, text, document}) {
-  return {role, content: document ? [
-    {type: 'input_text', text}, {type: 'input_text', text: documentText(document)},
-  ] : text};
+function providerMessage({role, text, document, image}) {
+  const attachment = image ? {type: 'input_image', image_url: 'data:' + image.mime + ';base64,' + image.data, detail: 'auto'} :
+    document ? {type: 'input_text', text: documentText(document)} : null;
+  return {role, content: attachment ? [{type: 'input_text', text}, attachment] : text};
+}
+
+function storedAttachment(value) {
+  if (!value) return {};
+  const attachment = JSON.parse(value);
+  return attachment.image ? {image: attachment.image} : {document: attachment};
+}
+
+function imageMetadata({mime, size, sha256}) {
+  return {mime, size, sha256};
 }
 
 function boundedHistory(messages, budget = chatInputLimit) {
@@ -165,9 +176,12 @@ export function createChatStore(directory, {now = Date.now} = {}) {
   const staleTurns = db.prepare(`UPDATE live_turns SET status='interrupted',updated_at=?
     WHERE project=? AND status='in_progress' AND lease_until<=?`);
   const saveTurn = db.prepare(`UPDATE live_turns SET status=?,text=?,updated_at=? WHERE project=? AND id=? AND status='in_progress'`);
-  const recentTurns = db.prepare(`SELECT prompt,text,document FROM live_turns WHERE project=? AND conversation_id=? AND status='completed'
-    ORDER BY rowid DESC LIMIT 8`);
-  const page = db.prepare(`SELECT role,text,document,createdAt,status,turnId FROM (
+  const recentTurns = db.prepare(`SELECT prompt,text,
+    CASE WHEN json_type(document,'$.image')='object' THEN NULL ELSE document END AS document
+    FROM live_turns WHERE project=? AND conversation_id=? AND status='completed' ORDER BY rowid DESC LIMIT 8`);
+  const page = db.prepare(`SELECT role,text,
+    CASE WHEN json_type(document,'$.image')='object' THEN json_remove(document,'$.image.data') ELSE document END AS document,
+    createdAt,status,turnId FROM (
     SELECT rowid AS sequence,0 AS part,'user' AS role,prompt AS text,document,created_at AS createdAt,status,id AS turnId FROM live_turns
       WHERE project=?1 AND conversation_id=?2
     UNION ALL
@@ -194,8 +208,10 @@ export function createChatStore(directory, {now = Date.now} = {}) {
 
   function turnView(row) {
     if (!row) return null;
-    const {requestedConversationId, document, ...turn} = row;
-    return document ? {...turn, document: {name: JSON.parse(document).name}} : turn;
+    const {requestedConversationId, document: saved, ...turn} = row;
+    const {document, image} = storedAttachment(saved);
+    if (image) return {...turn, image: imageMetadata(image)};
+    return document ? {...turn, document: {name: document.name}} : turn;
   }
 
   function expireTurnLeases(project, time) {
@@ -233,7 +249,7 @@ export function createChatStore(directory, {now = Date.now} = {}) {
       const snapshot = JSON.parse(history);
       const messages = snapshot.slice(offset, offset + 41);
       const current = page.all({1: project, 2: id, 3: 41 - messages.length, 4: Math.max(0, offset - snapshot.length)});
-      messages.push(...current.map(({document, ...message}) => document ? {...message, document: JSON.parse(document)} : message));
+      messages.push(...current.map(({document, ...message}) => ({...message, ...storedAttachment(document)})));
       return {conversation: {...details, source: 'chatgpt-live', messages: messages.slice(0, 40)},
         nextOffset: messages.length > 40 ? offset + 40 : null};
     },
@@ -287,7 +303,7 @@ export function createChatStore(directory, {now = Date.now} = {}) {
       });
     },
     hasActiveLive: project => Boolean(activeProject.get(project, now())),
-    beginLive(project, {id, conversationId = null, model, prompt, document}, beforeReserve) {
+    beginLive(project, {id, conversationId = null, model, prompt, document, image}, beforeReserve) {
       if (typeof id !== 'string' || !idPattern.test(id) || typeof model !== 'string' ||
           !chatModelPattern.test(model) || typeof prompt !== 'string' || !prompt.trim() || prompt.length > 12000 ||
           (conversationId !== null && (typeof conversationId !== 'string' ||
@@ -296,14 +312,19 @@ export function createChatStore(directory, {now = Date.now} = {}) {
             prompt.length + documentText(document).length > chatInputLimit))) {
         throw storeError(400, 'INVALID_CHAT_REQUEST', 'チャットの入力が正しくありません。');
       }
-      const savedDocument = document ? JSON.stringify({name: document.name, text: document.text}) : null;
+      if (document && image !== undefined) throw storeError(400, 'INVALID_CHAT_REQUEST', '添付を1件だけ選んでください。');
+      const validated = validatedImage(image);
+      const imageRecord = validated && {...validated.image, size: validated.size, sha256: validated.digest};
+      // Keep legacy text documents in the existing attachment column and reserve images atomically with their turn.
+      const savedAttachment = imageRecord ? JSON.stringify({image: imageRecord}) :
+        document ? JSON.stringify({name: document.name, text: document.text}) : null;
       return inTransaction(() => {
         const time = now();
         expireTurnLeases(project, time);
         const previous = getTurn.get(project, id);
         if (previous) {
           if (previous.requestedConversationId !== conversationId || previous.model !== model || previous.prompt !== prompt ||
-              previous.document !== savedDocument) {
+              previous.document !== savedAttachment) {
             throw storeError(409, 'CHAT_REQUEST_CONFLICT', 'この送信IDは別の入力に使用されています。');
           }
           return {turn: turnView(previous), duplicate: true};
@@ -325,14 +346,14 @@ export function createChatStore(directory, {now = Date.now} = {}) {
           insertLive.run(project, liveId, source?.title ?? title(prompt), createdAt, source?.id ?? null, JSON.stringify(snapshot));
         }
         const recent = recentTurns.all(project, liveId).reverse().flatMap(row => [
-          {role: 'user', text: row.prompt, ...(row.document ? {document: JSON.parse(row.document)} : {})},
+          {role: 'user', text: row.prompt, document: storedAttachment(row.document).document},
           {role: 'assistant', text: row.text},
         ]);
         const history = boundedHistory([...snapshot, ...recent],
           chatInputLimit - prompt.length - (document ? documentText(document).length : 0));
         const messages = history.map(providerMessage);
-        messages.push(providerMessage({role: 'user', text: prompt, document}));
-        addTurn.run(project, id, liveId, conversationId, model, prompt, savedDocument, createdAt, createdAt, time + liveLease);
+        messages.push(providerMessage({role: 'user', text: prompt, document, image: imageRecord}));
+        addTurn.run(project, id, liveId, conversationId, model, prompt, savedAttachment, createdAt, createdAt, time + liveLease);
         touchLive.run(createdAt, project, liveId);
         return {turn: turnView(getTurn.get(project, id)), duplicate: false, messages};
       });
@@ -340,6 +361,19 @@ export function createChatStore(directory, {now = Date.now} = {}) {
     readLive(project, id) {
       expireTurnLeases(project, now());
       return turnView(getTurn.get(project, id));
+    },
+    readLiveImage(project, conversationId, id) {
+      const row = getTurn.get(project, id);
+      if (!row || row.conversationId !== conversationId) return null;
+      const {image} = storedAttachment(row.document);
+      if (!image) return null;
+      const {mime, data, sha256, size} = image;
+      try {
+        const found = validatedImage({mime, data});
+        return found.digest === sha256 && found.size === size ? found.image : null;
+      } catch {
+        return null;
+      }
     },
     persistLiveText: (project, id, text) => updateTurn(project, id, 'in_progress', text),
     finishLive(project, id, {status, text}) {
