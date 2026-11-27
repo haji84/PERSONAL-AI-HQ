@@ -102,12 +102,14 @@ export function readCurrentProject(directory, id) {
   return rows.length === 1 ? normalizeProject(rows[0], date(raw.observedAt)) : null;
 }
 
-export async function readPortfolio(directory) {
+export async function readPortfolio(directory, githubProjects, refreshGithub = false) {
   const raw = readDefinition(directory);
   const observedAt = date(raw.observedAt);
   const projects = raw.projects.map(row => normalizeProject(row, observedAt));
   const byId = new Map(projects.map(row => [row.id, row]));
   if (projects.length !== byId.size) throw new Error('Duplicate project');
+  const github = githubProjects?.view(projects, refreshGithub);
+  const discovered = (github?.projects ?? []).map(row => ({...normalizeProject(row, observedAt), registration: 'github'}));
   const rawArtifacts = Array.isArray(raw.artifacts) ? raw.artifacts.slice(0, 150) : [];
   const artifacts = (await Promise.all(rawArtifacts.map(row => normalizeArtifact(row, byId, observedAt)))).filter(Boolean);
   if (new Set(artifacts.map(row => row.id)).size !== artifacts.length) throw new Error('Duplicate artifact');
@@ -117,9 +119,11 @@ export async function readPortfolio(directory) {
   const scope = strings(raw.limits, 24);
   return {
     projects: byId,
+    discoveredProjects: new Set(discovered.map(row => row.id)),
     artifacts: new Map(artifacts.map(row => [row.id, row])),
     view: {observedAt, limits: scope, devices, apiCreditObservation: apiCreditObservation(raw.apiCreditObservation),
-      projects: projects.map(({cwd, handoverRequirements, nativeHandover, ...project}) => project),
+      ...(github && {githubRegistration: {status:github.status, observedAt:github.observedAt, count:github.count}}),
+      projects: [...projects, ...discovered].map(({cwd, handoverRequirements, nativeHandover, ...project}) => project),
       artifacts: artifacts.map(({file, ...artifact}) => artifact)},
   };
 }

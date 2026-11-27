@@ -18,6 +18,7 @@ import {createChatGPTResponses} from './chatgpt-responses.mjs';
 import {ensurePrivateDirectory, readPrivateRuntimeToken} from './private-directory.mjs';
 import {createApiDevelopment} from './api-development.mjs';
 import {createNativeArtifacts} from './native-artifacts.mjs';
+import {createGithubProjects} from './github-projects.mjs';
 import {createCodexPeerVerifier} from './codex-peer.mjs';
 import {localSpeechAvailable, localSpeechMaxChars, synthesizeLocalSpeech} from './local-speech.mjs';
 import {createTailnetAccess, tailnetCookieName} from './tailnet-access.mjs';
@@ -174,7 +175,7 @@ async function checkedSocket(socket) {
 }
 
 export async function startOwnerApp({directory = defaultRuntime, port = 4328, socket, codex, plan, apiDevelopment = false, speech,
-  loopbackUrl, loopbackTokenFile, tailnet} = {}) {
+  loopbackUrl, loopbackTokenFile, tailnet, githubProjects} = {}) {
   const access = createTailnetAccess(tailnet, sessionAge);
   directory = resolve(directory);
   await ensurePrivateDirectory(directory);
@@ -189,6 +190,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
     loopback = {url: loopbackUrl, token, verifyPeer};
   }
   const native = codex ?? createCodexClient({socket: await checkedSocket(socket), loopback});
+  const github = githubProjects ? createGithubProjects(directory, githubProjects) : undefined;
   const chats = createChatStore(directory);
   const execution = createExecutionAccess(directory, native);
   const operations = createOperations(directory, native, execution, {
@@ -412,18 +414,26 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
         throw error(503, 'このChatGPTプランのモデルを読み取れませんでした。');
       }
     }
-    const portfolio = await readPortfolio(directory);
-    if (get && route === '/api/portfolio') return send(response, 200, portfolio.view);
+    const portfolioRequest = get && route === '/api/portfolio';
+    const portfolio = await readPortfolio(directory, github, portfolioRequest);
+    if (portfolioRequest) {
+      if (!signedIn()) throw error(401, 'サインインが必要です。');
+      return send(response, 200, portfolio.view);
+    }
     if (get && route === '/api/artifacts/file') return download(response, portfolio.artifacts.get(target.searchParams.get('id')));
     if (get && route === '/api/artifacts/work') {
       const offset = Number(target.searchParams.get('offset') ?? 0);
       const scope = target.searchParams.get('project');
       const source = target.searchParams.getAll('source');
       if (!Number.isSafeInteger(offset) || offset < 0) throw error(400, '成果物一覧の位置が正しくありません。');
-      if ((scope !== null && !portfolio.projects.has(scope)) || target.searchParams.getAll('project').length > 1) {
+      if (target.searchParams.getAll('project').length > 1) {
         throw error(404, '案件を見つけられませんでした。');
       }
       if (source.length > 1 || (source.length && source[0] !== 'codex')) throw error(400, '成果物の取得元を確認できません。');
+      if (scope !== null && !portfolio.projects.has(scope)) {
+        if (portfolio.discoveredProjects.has(scope)) return send(response, 200, {artifacts:[], nextOffset:null});
+        throw error(404, '案件を見つけられませんでした。');
+      }
       if (source[0] === 'codex') {
         const projects = scope === null ? [...portfolio.projects.values()] : [portfolio.projects.get(scope)];
         const result = await nativeArtifacts.list(projects, offset);
@@ -433,8 +443,12 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       return send(response, 200, apiWork.listArtifacts(scope === null ? [...portfolio.projects.keys()] : [scope], offset));
     }
 
-    const project = portfolio.projects.get(target.searchParams.get('project'));
-    if (!project) throw error(404, '案件を見つけられませんでした。');
+    const projectId = target.searchParams.get('project');
+    const project = portfolio.projects.get(projectId);
+    if (!project) {
+      if (post && portfolio.discoveredProjects.has(projectId)) throw error(409, '先にこの案件の作業先と実行権限を登録してください。');
+      throw error(404, '案件を見つけられませんでした。');
+    }
     if (get && route === '/api/execution/activity') {
       if (target.searchParams.getAll('project').length !== 1) throw error(404, '案件を見つけられませんでした。');
       const watch = target.searchParams.getAll('native').includes('1') ? activityWatches(target.searchParams) : null;
@@ -615,6 +629,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       await speechTask?.pending.catch(() => {});
       await apiWork.close();
       await Promise.all(servers.map(listener => new Promise(done => listener.close(done))));
+      await github?.close();
       operations.close();
       await native.close?.();
       chats.close();
@@ -639,7 +654,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     ? {origin, login, port: /^[1-9]\d{0,4}$/.test(proxyPort ?? '') ? Number(proxyPort) : NaN} : undefined;
   const app = await startOwnerApp({directory: process.env.HQ_PRIVATE_DIRECTORY, port: Number(process.env.HQ_PORT ?? 4328),
     socket: process.env.HQ_CODEX_SOCKET, plan: process.env.HQ_CHATGPT_PLAN === '1', apiDevelopment: process.env.HQ_API_EXECUTION === '1',
-    loopbackUrl: process.env.HQ_CODEX_LOOPBACK_URL, loopbackTokenFile: process.env.HQ_CODEX_LOOPBACK_TOKEN_FILE, tailnet});
+    loopbackUrl: process.env.HQ_CODEX_LOOPBACK_URL, loopbackTokenFile: process.env.HQ_CODEX_LOOPBACK_TOKEN_FILE, tailnet,
+    githubProjects: process.env.HQ_GITHUB_PORTFOLIO_OWNER && {owner:process.env.HQ_GITHUB_PORTFOLIO_OWNER}});
   console.log(JSON.stringify({url: app.url, signInFile: app.signInFile, ...(app.tailnetTarget && {tailnetTarget: app.tailnetTarget})}));
   if (process.argv.includes('--open') && process.platform === 'darwin') {
     spawn('/usr/bin/open', [app.signInFile], {stdio: 'ignore'}).on('error', () => {});

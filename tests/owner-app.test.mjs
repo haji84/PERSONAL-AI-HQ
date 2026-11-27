@@ -4,6 +4,7 @@ import {tmpdir} from 'node:os';
 import {basename, dirname, join, resolve} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
 import test from 'node:test';
+import {setTimeout as delay} from 'node:timers/promises';
 import {startOwnerApp} from '../app/server.mjs';
 import {ensurePrivateDirectory} from '../app/private-directory.mjs';
 
@@ -86,6 +87,136 @@ test('owner credentials are one-use and private API calls never expose the works
   assert.equal((await fetch(`${app.url}/api/codex/threads?project=other`, {headers: {cookie}})).status, 404);
   assert.equal((await fetch(`${app.url}/api/codex/threads?project=example`, {headers: {cookie}})).status, 200);
   assert.equal(reads(), 1);
+});
+
+test('owned GitHub projects register in the dashboard without overwriting manual projects or granting execution', async t => {
+  const {directory, start} = await runtimeFixture(t);
+  const portfolioPath = join(directory, 'portfolio.json');
+  const bytes = JSON.stringify({...seed, projects: [{...seed.projects[0], state: 'paused',
+    repository: 'https://github.com/Fixture-Owner/Existing.git'}]});
+  await writeFile(portfolioPath, bytes, {mode: 0o600});
+  const owner = {login: 'fixture-owner', id: 41};
+  const repo = (id, name, account = owner) => ({id, name, owner: account, fork: false, archived: false, disabled: false});
+  let repositories = [repo(10, 'existing'), repo(11, 'new-work'), repo(12, 'foreign', {login: 'someone-else', id: 7})];
+  let mode = 'ready', reads = 0, codexCalls = 0;
+  let now = Date.parse('2026-11-27T14:00:00Z');
+  const githubProjects = {owner: owner.login, now: () => now, async read() {
+    reads++;
+    if (mode === 'offline') throw new Error('internal fixture diagnostics');
+    if (mode === 'reused-login') return {account:{login:owner.login, id:42}, repositories:[]};
+    return {account: mode === 'wrong-owner' ? {login: 'different-account', id: 42} : owner, repositories};
+  }};
+  const options = {githubProjects, codex: {canWrite:true, async submit() { codexCalls++; },
+    async listThreads() { return {data:[], nextCursor:null}; }}};
+  let app = await start(options);
+  const request = (route, options = {}) => fetch(app.url + route, options);
+  assert.equal((await request('/api/portfolio')).status, 401);
+  assert.equal(reads, 0);
+  let cookie = await login(app);
+  const get = async () => (await request('/api/portfolio', {headers: {cookie}})).json();
+  async function until(check) {
+    for (let attempt = 0; attempt < 25; attempt++) {
+      const state = await get();
+      if (check(state)) return state;
+      await delay(15);
+    }
+    assert.fail('Automatic registration did not reach the expected state');
+  }
+
+  let state = await until(value => value.githubRegistration?.status === 'ready');
+  assert.deepEqual(state.projects.map(project => [project.id, project.state]), [['example', 'paused'], ['github-11', 'unknown']]);
+  assert.equal(state.projects[1].codexScopes, 0);
+  assert.equal(state.projects[1].codexWrite, false);
+  assert.equal(state.projects[1].repository, 'https://github.com/fixture-owner/new-work');
+  assert.equal(state.projects[1].registration, 'github');
+  assert.equal(reads, 1);
+  assert.equal((await request('/api/codex/run?project=github-11', {method: 'POST',
+    headers: {cookie, Origin: app.url, 'Content-Type': 'application/json'}, body: JSON.stringify({id: 'accepted-id', prompt: 'do not run'})})).status, 409);
+  assert.equal(codexCalls, 0);
+
+  repositories = [repo(10, 'renamed-existing'), repo(11, 'renamed-new'), repo(13, 'existing')];
+  now += 61_000;
+  state = await until(value => value.projects.some(row => row.id === 'github-13'));
+  assert.deepEqual(state.projects.map(row => row.id), ['example', 'github-13', 'github-11']);
+  assert.equal(state.projects.find(row => row.id === 'github-11').name, 'renamed-new');
+  assert.equal(state.projects[0].state, 'paused');
+  assert.equal(await readFile(portfolioPath, 'utf8'), bytes);
+
+  await app.close();
+  mode = 'offline';
+  app = await start(options);
+  cookie = await login(app);
+  state = await until(value => value.githubRegistration?.status === 'stale');
+  assert.deepEqual(state.projects.map(row => row.id), ['example', 'github-13', 'github-11']);
+  assert.ok(!JSON.stringify(state).includes('internal fixture diagnostics'));
+
+  mode = 'wrong-owner';
+  now += 61_000;
+  state = await until(value => value.githubRegistration?.status === 'account-mismatch');
+  assert.deepEqual(state.projects.map(row => row.id), ['example']);
+  assert.equal(state.projects[0].state, 'paused');
+
+  await app.close();
+  mode = 'offline';
+  app = await start(options);
+  cookie = await login(app);
+  state = await until(value => value.githubRegistration?.status === 'account-mismatch');
+  assert.deepEqual(state.projects.map(row => row.id), ['example']);
+  await app.close();
+  const database = join(directory, 'conversations.sqlite');
+  const damaged = new DatabaseSync(database);
+  damaged.prepare('UPDATE github_project_snapshot SET blocked=0,repositories=?').run('[null]');
+  damaged.close();
+  app = await start(options);
+  cookie = await login(app);
+  state = await until(value => value.githubRegistration?.status === 'unavailable');
+  assert.deepEqual(state.projects.map(row => row.id), ['example']);
+  assert.equal((await request('/api/codex/threads?project=example', {headers: {cookie}})).status, 200);
+  await app.close();
+
+  mode = 'reused-login';
+  now += 61_000;
+  app = await start(options);
+  cookie = await login(app);
+  state = await until(value => value.githubRegistration?.status === 'account-mismatch');
+  assert.deepEqual(state.projects.map(row => row.id), ['example']);
+  await app.close();
+  const retained = new DatabaseSync(database);
+  try {
+    const saved = retained.prepare('SELECT account_id,blocked,links FROM github_project_snapshot').get();
+    assert.equal(saved.account_id, 41);
+    assert.equal(saved.blocked, 1);
+    assert.equal(JSON.parse(saved.links)[0].id, 10);
+  } finally {
+    retained.close();
+  }
+  mode = 'ready';
+  now += 61_000;
+  app = await start(options);
+  cookie = await login(app);
+  state = await until(value => value.githubRegistration?.status === 'ready');
+  assert.deepEqual(state.projects.map(row => row.id), ['example', 'github-13', 'github-11']);
+  await app.close();
+
+  const manual = JSON.parse(bytes);
+  manual.projects.push({...manual.projects[0], id:'same-repository'});
+  await writeFile(portfolioPath, JSON.stringify(manual));
+  const isolated = new DatabaseSync(database);
+  isolated.exec('DELETE FROM github_project_snapshot');
+  isolated.close();
+  mode = 'ready';
+  repositories = [repo(15, 'existing')];
+  now += 61_000;
+  app = await start(options);
+  cookie = await login(app);
+  state = await until(value => value.githubRegistration?.status === 'ready');
+  assert.deepEqual(state.projects.map(row => row.id), ['example', 'same-repository']);
+  const snapshot = new DatabaseSync(database, {readOnly:true});
+  try {
+    assert.deepEqual(JSON.parse(snapshot.prepare('SELECT links FROM github_project_snapshot').get().links), []);
+  } finally {
+    snapshot.close();
+  }
 });
 
 test('Codex turn evidence requires an exact authenticated project and rechecks scope after native reading', async t => {

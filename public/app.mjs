@@ -384,7 +384,7 @@ async function pollActivity() {
   activityPollRunning = true;
   const session = activitySession ??= Symbol();
   const currentProject = ui.project;
-  const selected = new Set([currentProject]);
+  const selected = new Set(selectedProject()?.registration === 'github' ? [] : [currentProject]);
   const now = performance.now();
   for (const project of projectList()) {
     const local = activities.get(project.id);
@@ -642,6 +642,13 @@ function projectDetail() {
   if (project.goal) detail.body.append(node('p', 'strong', project.goal));
   if (project.summary) detail.body.append(node('p', 'muted', project.summary));
   const facts = node('dl', 'properties');
+  if (project.registration === 'github') {
+    metric(facts, 'GitHubでの取得時刻', time(project.observedAt));
+    detail.body.append(facts);
+    const source = link('GitHubでリポジトリを開く', project.repository);
+    if (source) detail.body.append(source);
+    return detail.root;
+  }
   const m = project.measurements ?? {};
   metric(facts, '実装完成率', m.implementationCompletion, true);
   metric(facts, '正式な要求達成率', m.formalCompletion, true);
@@ -774,7 +781,17 @@ function dashboard() {
   const search = queryInput('dashboard', 'プロジェクトを検索', 'プロジェクトを検索', filterProjects);
   searchWrap.append(search);
   projects.body.remove();
-  projects.root.append(searchWrap, message, list);
+  projects.root.append(searchWrap);
+  const github = ui.portfolio?.githubRegistration;
+  if (github) {
+    const checked = github.observedAt && `GitHubで${github.count}件確認 · ${time(github.observedAt)}`;
+    const label = {ready: checked, stale: checked && checked + ' · 前回の情報',
+      pending: 'GitHubの案件を確認しています。',
+      unavailable: 'GitHubの案件を取得できません。',
+      'account-mismatch': 'GitHubの認証アカウントが登録先と一致しません。'}[github.status];
+    if (label) projects.root.append(node('p', 'small muted', label));
+  }
+  projects.root.append(message, list);
   filterProjects(search.value);
   left.append(projects.root);
   if (ui.capabilities.tailnetPairing === true || ui.capabilities.tailnetSignIn === true) left.append(tailnetPanel());
@@ -1385,6 +1402,7 @@ function mountChatHandoff(destination, project, conversation, isCurrent) {
 function chat() {
   const project = ui.project;
   if (!project) return emptyProject();
+  if (selectedProject()?.registration === 'github') return projectNeedsWorkspace();
   const layout = node('div', 'split conversation-layout');
   const collection = panel('会話履歴');
   const thread = panel('会話');
@@ -2493,6 +2511,7 @@ function codexTurnEvidence(project, threadId, isCurrent) {
 function codex() {
   const project = ui.project;
   if (!project) return emptyProject();
+  if (selectedProject()?.registration === 'github') return projectNeedsWorkspace();
   const layout = node('div', 'split conversation-layout');
   const collection = panel('スレッド');
   const thread = panel('スレッド詳細');
@@ -2810,6 +2829,9 @@ function artifacts() {
 }
 function emptyProject() {
   dom.content.append(node('p', 'empty panel', '上のプロジェクト欄から対象を選んでください。'));
+}
+function projectNeedsWorkspace() {
+  dom.content.append(node('p', 'empty panel', '作業先と利用権限を登録すると、この案件を開けます。'));
 }
 
 const screens = {dashboard, chat, codex, artifacts};

@@ -8,6 +8,8 @@ Node.js 24とサインイン済みのCodex CLIを利用します。最初に `np
 
 案件の読み取り元は、プライベートな実行ディレクトリの `portfolio.json` です。Macの標準ディレクトリは `~/Library/Application Support/Personal AI HQ/integration` です。`HQ_PRIVATE_DIRECTORY` と `HQ_PORT` で動作確認用ディレクトリとポートを選べます。サインイン用ファイルと会話データは本人の実行ディレクトリに保存されます。
 
+既存のGitHub CLI認証で所有リポジトリを一覧に表示するには、起動時に `HQ_GITHUB_PORTFOLIO_OWNER` にそのアカウント名を設定します。ダッシュボードを表示している間に取得し、取得時刻と通信できない間の最終確認結果を表示します。リポジトリを改名しても登録の照合に安定したIDを使います。既存の案件は `portfolio.json` を優先し、取得した案件の作業先と実行権限も同じファイルで管理します。
+
 ## Windowsで起動
 
 Node.js 24以降とCodex Desktopを使います。`npm ci --ignore-scripts` の後、`start-windows.cmd` を開くと、URLと本人用のサインインファイルが表示されます。ファイルをブラウザーで開いてサインインします。Windowsの標準保存先は `%LOCALAPPDATA%\PersonalAIHQ\integration` です。起動時に既存のWindowsアクセス権を確認し、新しく作った実行ディレクトリだけを本人・SYSTEM・管理者に限定します。変更前後の権限はそのディレクトリに保存します。既存ディレクトリの権限を変更して起動を通すことはありません。
