@@ -2,12 +2,12 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
-import { chmod, link, lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, link, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { prepareApiWorkspace } from '../app/api-workspace.mjs';
+import { prepareApiWorkspace, readCommittedEvidence } from '../app/api-workspace.mjs';
 
 const macTest = process.platform === 'darwin' ? test : test.skip;
 const digest = (text) => createHash('sha256').update(text).digest('hex');
@@ -38,7 +38,7 @@ async function fixture(t, extra = '', expected = 2) {
     files: [{ path: 'value.mjs', writable: true }],
     testPaths: ['test/check.test.mjs'],
   };
-  return { root, checkout, write, options, initial, baseSha: git('rev-parse', 'HEAD') };
+  return { root, checkout, write, options, initial, git, baseSha: git('rev-parse', 'HEAD') };
 }
 
 macTest('tests real candidate edits while preserving the original checkout', async (t) => {
@@ -182,4 +182,55 @@ macTest('bounds test output and rejects artifact changes after verification', as
   const { candidatePath } = await job.finish();
   await writeFile(path.join(candidatePath, 'unapproved.mjs'), 'export {};');
   await assert.rejects(job.finish(), /changed/i);
+});
+
+macTest('committed evidence reports exact HEAD and digests while retaining unrelated edits', async (t) => {
+  const { root, checkout, write, initial, baseSha } = await fixture(t);
+  const enrolledTest = 'test/check.test.mjs';
+  const testBytes = await readFile(path.join(checkout, enrolledTest));
+  await write('.env', 'unrelated, edited bytes');
+  await write('unrelated.txt', 'untracked, edited bytes');
+  const before = { root: await readdir(root), checkout: await readdir(checkout) };
+  assert.deepEqual(await readCommittedEvidence({ checkout, paths: [enrolledTest, 'value.mjs'] }), {
+    head: baseSha,
+    files: [{ path: enrolledTest, sha256: digest(testBytes) }, { path: 'value.mjs', sha256: digest(initial) }],
+  });
+  assert.deepEqual({ root: await readdir(root), checkout: await readdir(checkout) }, before);
+  assert.equal(await readFile(path.join(checkout, 'value.mjs'), 'utf8'), initial);
+  assert.equal(await readFile(path.join(checkout, '.env'), 'utf8'), 'unrelated, edited bytes');
+  assert.equal(await readFile(path.join(checkout, 'unrelated.txt'), 'utf8'), 'untracked, edited bytes');
+});
+
+macTest('committed evidence rejects dirty tracked files, aliases, incomplete scope, and cancellation', async (t) => {
+  const { checkout, write, initial } = await fixture(t);
+  const check = (paths, extras = {}) => readCommittedEvidence({ checkout, paths, ...extras });
+  await write('untracked.mjs', initial);
+  for (const paths of [
+    [], ['value.mjs', 'value.mjs'], ['value.mjs', 'VALUE.mjs'], ['VALUE.mjs'],
+    ['untracked.mjs'], ['.env'], ['../outside.mjs'], Array.from({ length: 25 }, (_, i) => `file-${i}.mjs`),
+  ]) await assert.rejects(check(paths));
+  await assert.rejects(check(['check.test.mjs'], { checkout: path.join(checkout, 'test') }), /worktree root/i);
+  await assert.rejects(check(['value.mjs'], { signal: AbortSignal.abort() }), { name: 'AbortError' });
+  await write('value.mjs', 'dirty working tree');
+  await assert.rejects(check(['value.mjs']), /modified/i);
+  assert.equal(await readFile(path.join(checkout, 'value.mjs'), 'utf8'), 'dirty working tree');
+  await rm(path.join(checkout, 'value.mjs'));
+  await symlink('untracked.mjs', path.join(checkout, 'value.mjs'));
+  await assert.rejects(check(['value.mjs']), /regular unaliased/i);
+  assert.equal((await lstat(path.join(checkout, 'value.mjs'))).isSymbolicLink(), true);
+});
+
+macTest('committed evidence rejects HEAD movement before returning digests', async (t) => {
+  const { checkout, git, baseSha } = await fixture(t);
+  let checkpoints = 0;
+  const signal = {
+    throwIfAborted() {
+      // Move the actual Git ref at the final cooperative checkpoint, without racing a timer.
+      if (++checkpoints === 3) {
+        git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--allow-empty', '-qm', 'concurrent HEAD');
+      }
+    },
+  };
+  await assert.rejects(readCommittedEvidence({ checkout, paths: ['value.mjs'], signal }), /HEAD changed/i);
+  assert.notEqual(git('rev-parse', 'HEAD'), baseSha);
 });

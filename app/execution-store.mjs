@@ -129,7 +129,7 @@ export class ExecutionStore {
       ? operations.find(item => item.checkpointVersion === project.checkpoint.version) ?? null : null;
     const verifiedApiOperations = taskId === undefined ? operations.filter(hasApiArtifact)
       .sort((a, b) => a.checkpointVersion - b.checkpointVersion) : [];
-    return clone({operation, checkpoint: project.checkpoint, checkpointOperation, verifiedApiOperations,
+    return clone({operation, checkpoint: project.checkpoint, checkpointOperation, verifiedApiOperations, settledApiMicros: project.spentMicros,
       busy: operations.some(item => active.has(item.status))});
   }
 
@@ -251,6 +251,10 @@ export class ExecutionStore {
 
   #checkDispatch(data, project, operation, context) {
     if (project.revision !== operation.settingsRevision) return denial('REVISION_CONFLICT');
+    if (operation.handover && (operation.handover.checkpointVersion !== project.checkpoint?.version ||
+        operation.handover.sourceRoute !== project.lastRoute || !verifyHandover(project.checkpoint, context.handoverReadback).ok)) {
+      return denial('HANDOVER_REQUIRED');
+    }
     if (operation.route === 'api' && operation.organizationId !== context.safety?.api?.organizationId) return denial('CREDIT_ORGANIZATION_MISMATCH');
     const decision = this.#resolve(data, project, operation.task, context, operation.executionId);
     if (!decision.allowed) return { ...decision, dispatchable: false };

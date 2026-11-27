@@ -38,6 +38,12 @@ const apiMessages = {
   API_WORKSPACE_NOT_ENROLLED: '通常APIが編集できるこの案件の分離作業先を確認できません。',
   API_TASK_INVALID: '作業番号、指示、工程、モデルの指定を確認してください。',
   HANDOVER_REQUIRED: '前の経路の要求と成果物を照合してから実行してください。',
+  HANDOVER_RECEIPT_STALE: '最新の確定済み作業から引継ぎを照合してください。',
+  HANDOVER_REQUIREMENTS_MISSING: '作業時に記録した要求の正本がありません。',
+  HANDOVER_REQUIREMENTS_CHANGED: '要求の正本を作業時の記録と照合できません。',
+  HANDOVER_CONVERSATION_UNVERIFIED: '保存した作業指示と実行結果を受付記録に照合できません。',
+  API_CANDIDATE_HANDOVER_REQUIRED: '以前の検証済み成果物を現在のGit作業コピーで確認できません。',
+  PROJECT_BUSY: '実行中または結果を照合中の作業があります。',
   PROJECT_BUDGET_REQUIRED: 'この案件のAPI作業上限を設定してください。',
   PROJECT_BUDGET_EXCEEDED: 'この案件のAPI作業上限内に予約できません。',
   SHARED_CREDIT_INSUFFICIENT: '共有のAPI特典残高内に作業費用を予約できません。',
@@ -132,7 +138,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
   const operations = createOperations(directory, native, execution);
   const apiEnabled = Boolean(apiDevelopment);
   const apiWork = createApiDevelopment({...(!apiEnabled || apiDevelopment === true ? {} : apiDevelopment),
-    directory, store: execution.store, conversations: chats, hasNativeWork: operations.hasNativeWork,
+    directory, store: execution.store, conversations: chats, hasNativeWork: operations.hasNativeWork, hasActiveWork: operations.hasActiveWork,
     withProjectWorkLock: (project, act) => operations.updateExecution(project, () => {
       if (chats.hasActiveLive(project.id)) throw error(409, 'ChatGPTの応答が終わるまで開始できません。');
       return act();
@@ -306,6 +312,12 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       const apiActivity = apiWork.activity(project);
       const activity = apiActivity && (!codexActivity || apiActivity.createdAt >= codexActivity.createdAt) ? apiActivity : codexActivity;
       return send(response, 200, {activity});
+    }
+    if (get && route === '/api/execution/handover') {
+      if (target.searchParams.getAll('project').length !== 1 || target.searchParams.getAll('receipt').length !== 1) {
+        throw error(404, '案件と対象の作業を指定してください。');
+      }
+      return send(response, 200, await apiWork.previewHandover(project, target.searchParams.get('receipt')));
     }
     if (route === '/api/execution/settings') {
       if (get) return send(response, 200, {...execution.settings(project), apiAvailable: apiEnabled && apiWork.capabilities(project).available});

@@ -52,6 +52,7 @@ function normalizeProject(row, observedAt) {
   const needsFreshObservation = ['developing', 'researching', 'designing', 'verifying', 'fixing', 'integrating'].includes(row.state);
   return {id, name, goal: text(row.goal, 1500), state: states.has(row.state) && (!needsFreshObservation || live) ? row.state : 'unknown',
     observedAt: observed, summary: text(row.summary, 1200), remaining: strings(row.remaining),
+    handoverRequirements: typeof row.handoverRequirements === 'string' && row.handoverRequirements.length <= 240 ? row.handoverRequirements : null,
     evidence: evidence(row.evidence), repository: https(row.repository), cwd, codexScopes: cwd.length,
     codexWrite: row.enableCodexWrite === true,
     measurements: {formalCompletion: computed?.formalCompletion ?? rate(metrics.formalCompletion), verifiedCompletion: computed?.verifiedCompletion ?? rate(metrics.verifiedCompletion),
@@ -117,7 +118,7 @@ export async function readPortfolio(directory) {
     projects: byId,
     artifacts: new Map(artifacts.map(row => [row.id, row])),
     view: {observedAt, limits: scope, devices, apiCreditObservation: apiCreditObservation(raw.apiCreditObservation),
-      projects: projects.map(({cwd, ...project}) => project),
+      projects: projects.map(({cwd, handoverRequirements, ...project}) => project),
       artifacts: artifacts.map(({file, ...artifact}) => artifact)},
   };
 }

@@ -147,6 +147,7 @@ export function createOperations(directory, native, execution) {
   }
 
   return {
+    hasActiveWork(project) { return Boolean(activeRun.get(project.id)); },
     hasNativeWork(project) {
       const row = latestScoped.get(project.id, JSON.stringify(project.cwd));
       return Boolean(row?.threadId && row?.turnId);

@@ -1035,6 +1035,24 @@ function chat() {
       else messages.append(load);
       updateTransfer();
       destination.append(transfer);
+      if (apiArchive && conversation.outcome === 'completed') {
+        const proof = node('p', 'small muted');
+        proof.setAttribute('role', 'status');
+        proof.hidden = true;
+        const verify = button('Codexへの引継ぎを照合', async () => {
+          verify.disabled = true;
+          proof.hidden = false;
+          proof.textContent = '要求、会話、Git上の成果物を照合しています。';
+          try {
+            const result = await api(apiPath('/api/execution/handover', {project, receipt: conversation.id.slice('api/'.length)}));
+            if (!proof.isConnected) return;
+            proof.textContent = result.verified ? `照合済み ${result.requirements.path} · 成果物 ${result.artifacts.length}件 · Git ${result.checkoutHead.slice(0, 12)}` :
+              '引継ぎの照合結果を確認できませんでした。';
+          } catch (error) { if (proof.isConnected) proof.textContent = error.message; }
+          finally { if (proof.isConnected) verify.disabled = false; }
+        });
+        destination.append(verify, proof);
+      }
     }, () => ui.chatIds.get(project) === id);
   }
   function searchChats(query) {

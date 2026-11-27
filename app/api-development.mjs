@@ -4,12 +4,13 @@ import {open} from 'node:fs/promises';
 import {basename, join, resolve, sep} from 'node:path';
 import {readApiAuthority} from './api-authority.mjs';
 import {apiJobRounds, createApiResponseClient, maximumApiJobUsd} from './api-response.mjs';
-import {prepareApiWorkspace} from './api-workspace.mjs';
+import {prepareApiWorkspace, readCommittedEvidence} from './api-workspace.mjs';
 import {STAGES, moneyMicros} from './execution-policy.mjs';
 import {readCurrentProject} from './portfolio.mjs';
 import {ensurePrivateDirectory} from './private-directory.mjs';
 
 const taskKey = /^[A-Za-z0-9][A-Za-z0-9_-]{7,79}$/;
+const receiptKey = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 const held = new Set(['paused', 'approval', 'limit', 'blocked', 'offline', 'waiting', 'completed']);
 const sha = value => createHash('sha256').update(value).digest('hex');
 const digest = value => sha(JSON.stringify(value));
@@ -34,7 +35,7 @@ function latestApiActivity(store, projectId, localJob) {
     terminal: terminalPhases.has(phase)};
 }
 
-export function createApiDevelopment({directory, store, conversations, withProjectWorkLock, hasNativeWork,
+export function createApiDevelopment({directory, store, conversations, withProjectWorkLock, hasNativeWork, hasActiveWork,
   getKey = () => process.env.OPENAI_API_KEY, fetchImpl, readAuthority = readApiAuthority}) {
   const jobs = new Map();
   const artifacts = join(directory, 'api-work');
@@ -85,7 +86,8 @@ export function createApiDevelopment({directory, store, conversations, withProje
 
   function binding(scope, model) {
     return digest({organization: scope.authority.organization, project: scope.authority.providerProject,
-      ledger: scope.authority.ledgerBinding, checkout: scope.checkout, goal: scope.current.goal, enrollment: scope.enrollment, model});
+      ledger: scope.authority.ledgerBinding, checkout: scope.checkout, goal: scope.current.goal,
+      requirementsSource: scope.current.handoverRequirements, enrollment: scope.enrollment, model});
   }
 
   function resultReport(work) {
@@ -98,6 +100,23 @@ export function createApiDevelopment({directory, store, conversations, withProje
       if (sha(bytes) !== work.artifactsHash) return null;
       return JSON.parse(bytes);
     } catch { return null; }
+  }
+
+  function verifiedReport(projectId, work) {
+    if (work?.status !== 'completed') return null;
+    const report = resultReport(work);
+    return report?.projectId === projectId && report.executionId === work.executionId && report.verification?.passed === true &&
+      Array.isArray(report.changes) && report.changes.length ? report : null;
+  }
+
+  function retainedChanges(projectId, operations) {
+    const changes = new Map();
+    for (const work of operations) {
+      const report = verifiedReport(projectId, work);
+      if (!report) throw problem(409, 'API_CANDIDATE_HANDOVER_REQUIRED');
+      for (const change of report.changes) changes.set(change.path, change);
+    }
+    return [...changes.values()];
   }
 
   function view(project, work) {
@@ -131,6 +150,7 @@ export function createApiDevelopment({directory, store, conversations, withProje
     let baseSha = null;
     let verification = null;
     let finished = null;
+    let requirements = null;
     let summary = '';
     let conversationSaved = false;
     let reason = 'API_VERIFICATION_FAILED';
@@ -147,15 +167,19 @@ export function createApiDevelopment({directory, store, conversations, withProje
       conversationSaved = true;
       await ensurePrivateDirectory(artifacts);
       reauthorize();
-      const previousChanges = new Map();
-      for (const verified of prior.verifiedApiOperations) {
-        const priorResult = resultReport(verified);
-        if (!priorResult?.verification?.passed || !priorResult.changes?.length) throw problem(409, 'API_CANDIDATE_HANDOVER_REQUIRED');
-        for (const change of priorResult.changes) previousChanges.set(change.path, change);
+      const previousChanges = retainedChanges(projectId, prior.verifiedApiOperations);
+      const requirementsPath = scope.current.handoverRequirements;
+      if (requirementsPath && scope.enrollment.files.some(file => file.path === requirementsPath && file.writable)) {
+        throw problem(409, 'HANDOVER_REQUIREMENTS_CHANGED');
       }
       const candidate = await prepareApiWorkspace({checkout: scope.checkout, jobRoot, files: scope.enrollment.files,
-        testPaths: scope.enrollment.testPaths, priorChanges: [...previousChanges.values()], signal});
+        testPaths: scope.enrollment.testPaths, priorChanges: previousChanges, signal});
       baseSha = candidate.context().baseSha;
+      if (requirementsPath) {
+        const source = await checkedEvidence(scope.checkout, [requirementsPath], signal, 'HANDOVER_REQUIREMENTS_CHANGED');
+        if (source.head !== baseSha) throw problem(409, 'HANDOVER_REQUIREMENTS_CHANGED');
+        [requirements] = source.files;
+      }
       const client = createApiResponseClient({key: getKey(), organization: scope.authority.organization,
         project: scope.authority.providerProject, fetchImpl});
       for (let round = 0; round < apiJobRounds; round++) {
@@ -181,6 +205,10 @@ export function createApiDevelopment({directory, store, conversations, withProje
         signal.throwIfAborted();
         if (verification.passed) {
           const result = await candidate.finish();
+          if (requirements) {
+            const source = await checkedEvidence(scope.checkout, [requirements.path], signal, 'HANDOVER_REQUIREMENTS_CHANGED');
+            if (source.head !== baseSha || source.files[0].sha256 !== requirements.sha256) throw problem(409, 'HANDOVER_REQUIREMENTS_CHANGED');
+          }
           if (result.changes.length) { finished = result; summary = answer.proposal.summary; reason = null; }
           else reason = 'API_NO_WORKSPACE_CHANGE';
           break;
@@ -204,13 +232,13 @@ export function createApiDevelopment({directory, store, conversations, withProje
       try { reauthorize(false); }
       catch (cause) { finished = null; reason = signal.aborted ? 'INTERRUPTED' : cause.code ?? 'API_AUTHORITY_CHANGED'; }
     }
-    const report = {executionId, projectId, baseSha, reason, verification, summary: finished ? summary : '',
+    const report = {executionId, projectId, baseSha, reason, verification, summary: finished ? summary : '', requirements,
       candidate: finished ? basename(finished.candidatePath) : null,
       changes: finished?.changes ?? []};
     const bytes = JSON.stringify(report);
     writeFileSync(join(jobRoot, 'result.json'), bytes, {flag: 'wx', mode: 0o600});
     const checkpoint = {id: executionId, version: (prior.checkpoint?.version ?? 0) + 1, goalId: projectId,
-      requirementsHash: digest({goal: scope.current.goal, baseSha, files: scope.enrollment.files}),
+      requirementsHash: digest({goal: scope.current.goal, baseSha, files: scope.enrollment.files, requirements}),
       conversationHash: digest({prior: prior.checkpoint?.conversationHash ?? null, instruction: operation.instructionDigest}),
       stopHash: digest({scope: fingerprint, phase: signal.aborted ? 'interrupted' : 'settled'}),
       budgetHash: digest({organization: scope.authority.organization, reservedMicros: operation.reservedMicros, spentMicros}),
@@ -220,15 +248,75 @@ export function createApiDevelopment({directory, store, conversations, withProje
     archiveOutcome(projectId, saved.operation);
   }
 
+  async function checkedEvidence(checkout, paths, signal, failure) {
+    try { return await readCommittedEvidence({checkout, paths, signal}); }
+    catch { throw problem(409, failure); }
+  }
+
+  function handoverState(project) {
+    const owned = ownedProject(project.id);
+    const work = store.getWork(project.id);
+    const {settings, revision} = store.getSettings(project.id);
+    if (work.busy || hasActiveWork(project) || conversations.hasActiveLive(project.id)) throw problem(409, 'PROJECT_BUSY');
+    if (!settings.allowedRoutes.includes('subscription')) throw problem(409, 'ROUTE_NOT_ALLOWED');
+    const stamp = digest({checkout: owned.checkout, goal: owned.current.goal, requirement: owned.current.handoverRequirements,
+      status: owned.current.state, revision, checkpoint: work.checkpoint, settledApiMicros: work.settledApiMicros,
+      artifactReceipts: work.verifiedApiOperations.map(operation => operation.artifactsHash)});
+    return {owned, work, revision, stamp};
+  }
+
+  async function previewHandover(project, receipt) {
+    if (!receiptKey.test(receipt ?? '')) throw problem(404, 'API_TASK_NOT_FOUND');
+    const {owned, work, revision, stamp} = handoverState(project);
+    const predecessor = work.checkpointOperation;
+    if (predecessor?.executionId !== receipt || predecessor.route !== 'api' || !work.checkpoint ||
+        work.checkpoint.artifactsHash !== predecessor.artifactsHash) throw problem(409, 'HANDOVER_RECEIPT_STALE');
+    const report = verifiedReport(project.id, predecessor);
+    if (!report) throw problem(409, 'API_CANDIDATE_HANDOVER_REQUIRED');
+    if (!owned.current.handoverRequirements || !report.requirements) throw problem(409, 'HANDOVER_REQUIREMENTS_MISSING');
+    if (report.requirements.path !== owned.current.handoverRequirements) throw problem(409, 'HANDOVER_REQUIREMENTS_CHANGED');
+    const archiveId = `api/${receipt}`;
+    const archived = conversations.read(project.id, archiveId, 0)?.conversation;
+    const prompt = archived?.messages[0];
+    const summary = archived?.messages[1];
+    if (archived?.source !== 'api-development' || archived.outcome !== 'completed' || archived.model !== predecessor.model ||
+        prompt?.role !== 'user' || sha(prompt.text) !== predecessor.instructionDigest ||
+        (report.summary ?? '').trim() !== (summary?.role === 'assistant' ? summary.text : '')) {
+      throw problem(409, 'HANDOVER_CONVERSATION_UNVERIFIED');
+    }
+    const signal = AbortSignal.timeout(12000);
+    const changes = retainedChanges(project.id, work.verifiedApiOperations);
+    const current = await checkedEvidence(owned.checkout, [report.requirements.path], signal, 'HANDOVER_REQUIREMENTS_CHANGED');
+    if (current.files[0].sha256 !== report.requirements.sha256) throw problem(409, 'HANDOVER_REQUIREMENTS_CHANGED');
+    const artifacts = [];
+    // Four maximum-size source files fit the evidence reader's per-read limit.
+    const groupSize = 4;
+    for (let index = 0; index < changes.length; index += groupSize) {
+      const group = changes.slice(index, index + groupSize);
+      const readback = await checkedEvidence(owned.checkout, group.map(change => change.path), signal, 'API_CANDIDATE_HANDOVER_REQUIRED');
+      if (readback.head !== current.head || readback.files.some((file, entry) => file.sha256 !== group[entry].sha256)) {
+        throw problem(409, 'API_CANDIDATE_HANDOVER_REQUIRED');
+      }
+      artifacts.push(...readback.files);
+    }
+    const finalRequirements = await checkedEvidence(owned.checkout, [report.requirements.path], signal, 'HANDOVER_REQUIREMENTS_CHANGED');
+    if (finalRequirements.head !== current.head || finalRequirements.files[0].sha256 !== report.requirements.sha256) {
+      throw problem(409, 'HANDOVER_REQUIREMENTS_CHANGED');
+    }
+    if (handoverState(project).stamp !== stamp) throw problem(409, 'API_CANDIDATE_HANDOVER_REQUIRED');
+    return {verified: true, kind: 'rehearsal', source: 'api', destination: 'subscription', receipt, archiveId, revision,
+      checkoutHead: current.head, requirements: finalRequirements.files[0], artifacts, settledApiMicros: work.settledApiMicros};
+  }
+
   return {
+    previewHandover,
     activity(project) { return latestApiActivity(store, project.id, id => jobs.get(id)); },
     listArtifacts(projectIds, offset) {
       const operations = store.listVerifiedApiWork(projectIds);
       const page = operations.slice(offset, offset + 16);
       const files = page.flatMap(({project, operation}) => {
-        const report = resultReport(operation);
-        if (report?.projectId !== project || report.executionId !== operation.executionId || report.verification?.passed !== true ||
-            !Array.isArray(report.changes)) return [];
+        const report = verifiedReport(project, operation);
+        if (!report) return [];
         return report.changes.map((file, index) => ({project, kind: 'file', title: file.path, description: '通常APIで検証済み',
           observedAt: operation.completedAt, sha256: file.sha256,
           href: '/api/artifacts/work/file?' + new URLSearchParams({project, id: operation.taskId, index})}));
@@ -308,10 +396,9 @@ export function createApiDevelopment({directory, store, conversations, withProje
     async artifact(project, taskId, index) {
       if (typeof taskId !== 'string' || !taskKey.test(taskId) || !Number.isSafeInteger(index) || index < 0) throw problem(404, 'API_ARTIFACT_NOT_FOUND');
       const {operation} = store.getWork(project.id, taskId);
-      const result = operation?.status === 'completed' ? resultReport(operation) : null;
+      const result = verifiedReport(project.id, operation);
       const file = result?.changes?.[index];
-      if (!file || result.projectId !== project.id || result.executionId !== operation.executionId || !result.verification?.passed ||
-          !/^candidate-[1-9]\d*$/.test(result.candidate)) throw problem(404, 'API_ARTIFACT_NOT_FOUND');
+      if (!file || !/^candidate-[1-9]\d*$/.test(result.candidate)) throw problem(404, 'API_ARTIFACT_NOT_FOUND');
       const root = join(artifacts, operation.executionId, result.candidate);
       const destination = resolve(root, file.path);
       let handle;

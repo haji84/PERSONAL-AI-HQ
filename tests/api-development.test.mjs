@@ -25,7 +25,7 @@ async function authenticatedRequests(app) {
       ...(data ? {body: JSON.stringify(data)} : {})});
 }
 
-async function fixture(t, fetchImpl) {
+async function fixture(t, fetchImpl, {handover = false, auxiliary = []} = {}) {
   const directory = await realpath(await mkdtemp(join(tmpdir(), 'hq-api-app-')));
   let app, requests;
   const servers = new Set();
@@ -38,6 +38,9 @@ async function fixture(t, fetchImpl) {
   await writeFile(join(checkout, '.hq-owned-workspace'), id, {mode: 0o600});
   const source = join(checkout, 'source.mjs');
   await writeFile(source, 'export const answer = 1;\n');
+  const requirements = join(checkout, 'GOAL.md');
+  if (handover) await writeFile(requirements, '# 受入条件\n既存機能を維持し、答えを2にする。\n');
+  for (const path of auxiliary) await writeFile(join(checkout, path), 'export const testFlag = false;\n');
   await writeFile(join(checkout, 'check.test.mjs'), `import assert from 'node:assert/strict';
 import test from 'node:test';
 import {answer} from './source.mjs';
@@ -46,10 +49,12 @@ test('answer equals the required value', () => assert.equal(answer, 2));\n`);
     GIT_AUTHOR_NAME: 'Fixture', GIT_AUTHOR_EMAIL: 'fixture@example.invalid', GIT_COMMITTER_NAME: 'Fixture',
     GIT_COMMITTER_EMAIL: 'fixture@example.invalid'}, stdio: 'ignore'});
   git('init', '--quiet');
-  git('add', '--', 'source.mjs', 'check.test.mjs');
+  git('add', '--', 'source.mjs', 'check.test.mjs', ...auxiliary);
+  if (handover) git('add', '--', 'GOAL.md');
   git('commit', '--quiet', '-m', 'Fixture initial files');
-  await writeFile(join(directory, 'portfolio.json'), JSON.stringify({projects: [
-    {id, name: 'API fixture', state: 'unknown', cwd: checkout, goal: '答えを2にする'},
+  const portfolio = join(directory, 'portfolio.json');
+  await writeFile(portfolio, JSON.stringify({projects: [
+    {id, name: 'API fixture', state: 'unknown', cwd: checkout, goal: '答えを2にする', ...(handover ? {handoverRequirements: 'GOAL.md'} : {})},
     {id: 'other-fixture', name: 'Another isolated fixture', state: 'unknown'},
   ]}), {mode: 0o600});
   const ledgerFile = join(directory, 'execution-policy.json');
@@ -76,12 +81,13 @@ test('answer equals the required value', () => assert.equal(answer, 2));\n`);
     servers.add(reader);
     return authenticatedRequests(reader);
   }
-  const commitSource = async text => {
-    await writeFile(source, text);
-    git('add', '--', 'source.mjs');
+  const commitFiles = async changes => {
+    for (const change of changes) await writeFile(join(checkout, change.path), change.text);
+    git('add', '--', ...changes.map(change => change.path));
     git('commit', '--quiet', '-m', 'Fixture checkout change');
   };
-  return {call: (...args) => requests(...args), source, directory, store, ledgerFile, commitSource, open, openReader};
+  const commitSource = text => commitFiles([{path: 'source.mjs', text}]);
+  return {call: (...args) => requests(...args), source, requirements, portfolio, directory, store, ledgerFile, commitFiles, commitSource, open, openReader};
 }
 
 async function waitFor(call, target, taskId = instruction.id) {
@@ -161,12 +167,89 @@ test('owner API-only work repairs actual source in an isolated Mac and returns a
   assert.equal(requests, 2);
 });
 
-function providerAnswer(answer) {
+function providerAnswer(answer, changes = [{path: 'source.mjs', text: `export const answer = ${answer};\n`}]) {
   return Response.json({model: modelId, service_tier: 'default', status: 'completed', usage: {input_tokens: 100, output_tokens: 25},
     output: [{type: 'message', role: 'assistant', content: [{type: 'output_text', text: JSON.stringify({
-      summary: '実行確認', changes: [{path: 'source.mjs', text: `export const answer = ${answer};\n`}],
+      summary: '実行確認', changes,
     })}]}]});
 }
+
+test('API-to-Codex rehearsal checks a committed requirement, conversation and applied artifact without enabling execution', {skip: process.platform !== 'darwin'}, async t => {
+  let requests = 0;
+  const {call, store, open, commitSource, requirements, portfolio, ledgerFile} = await fixture(t, async () => {
+    requests++;
+    return providerAnswer(2);
+  }, {handover: true});
+  assert.equal((await call('/api/execution/settings', {data: {revision: 0, settings: {mode: 'api-only', apiBudgetUsd: 1}}})).status, 200);
+  assert.equal((await call('/api/execution/api', {data: instruction})).status, 202);
+  const result = await waitFor(call, 'completed');
+  const query = {receipt: store.getWork(id, instruction.id).operation.executionId};
+  assert.equal((await call('/api/execution/handover', {query})).status, 409);
+  assert.equal((await call('/api/execution/settings', {data: {revision: 1, settings: {mode: 'subscription-only'}}})).status, 200);
+  await open(false);
+  assert.equal((await call('/api/execution/handover', {query, auth: false})).status, 401);
+  const cleanBase = await call('/api/execution/handover', {query});
+  assert.equal(cleanBase.status, 409);
+  assert.match((await cleanBase.json()).error, /検証済み成果物/);
+  await commitSource('export const answer = 2;\n');
+  const before = await readFile(ledgerFile, 'utf8');
+  const readback = await call('/api/execution/handover', {query});
+  assert.equal(readback.status, 200);
+  const proof = await readback.json();
+  assert.equal(proof.kind, 'rehearsal');
+  assert.equal(proof.verified, true);
+  assert.equal(proof.requirements.path, 'GOAL.md');
+  assert.equal(proof.archiveId, `api/${query.receipt}`);
+  assert.equal(proof.checkoutHead.length, 40);
+  assert.equal(proof.artifacts[0].sha256, result.changes[0].sha256);
+  assert.equal(proof.settledApiMicros, 400);
+  assert.equal(await readFile(ledgerFile, 'utf8'), before);
+  assert.equal((await call('/api/execution/handover', {query: {receipt: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'}})).status, 409);
+  assert.equal((await call('/api/execution/handover', {query, project: 'other-fixture'})).status, 409);
+  const original = await readFile(requirements);
+  await writeFile(requirements, '正本を別の指示に変更');
+  assert.match((await (await call('/api/execution/handover', {query})).json()).error, /要求の正本/);
+  await writeFile(requirements, original);
+  const definition = JSON.parse(await readFile(portfolio, 'utf8'));
+  definition.projects[0].state = 'paused';
+  await writeFile(portfolio, JSON.stringify(definition));
+  assert.equal((await call('/api/execution/handover', {query})).status, 409);
+  assert.equal((await call('/api/execution/api', {data: instruction})).status, 409);
+  assert.equal(requests, 1);
+});
+
+test('readback preserves more retained files than a single API enrollment', {skip: process.platform !== 'darwin'}, async t => {
+  const auxiliary = Array.from({length: 25}, (_, index) => `support-${index}.mjs`);
+  const changes = paths => paths.map(path => ({path, text: 'export const testFlag = true;\n'}));
+  const first = [{path: 'source.mjs', text: 'export const answer = 2;\n'}, ...changes(auxiliary.slice(0, 22))];
+  const second = changes(auxiliary.slice(22));
+  let requests = 0;
+  const {call, store, directory, commitFiles} = await fixture(t, async () => providerAnswer(2, requests++ === 0 ? first : second),
+    {handover: true, auxiliary});
+  const authorityPath = join(directory, apiAuthorityFile);
+  const authority = JSON.parse(await readFile(authorityPath, 'utf8'));
+  async function enroll(files) {
+    authority.projects[id].files = files;
+    await writeFile(authorityPath, JSON.stringify(authority));
+  }
+  await enroll(first.map(item => ({path: item.path, writable: true})));
+  assert.equal((await call('/api/execution/settings', {data: {revision: 0, settings: {mode: 'api-only', apiBudgetUsd: 1}}})).status, 200);
+  assert.equal((await call('/api/execution/api', {data: instruction})).status, 202);
+  assert.equal((await waitFor(call, 'completed')).artifactCount, first.length);
+  await commitFiles(first);
+  await enroll([{path: 'source.mjs', writable: false}, ...second.map(item => ({path: item.path, writable: true}))]);
+  const latest = {...instruction, id: 'more-retained-files'};
+  assert.equal((await call('/api/execution/api', {data: latest})).status, 202);
+  assert.equal((await waitFor(call, 'completed', latest.id)).artifactCount, second.length);
+  await commitFiles(second);
+  assert.equal((await call('/api/execution/settings', {data: {revision: 1, settings: {mode: 'subscription-only'}}})).status, 200);
+  const receipt = store.getWork(id, latest.id).operation.executionId;
+  const response = await call('/api/execution/handover', {query: {receipt}});
+  const report = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(report));
+  assert.deepEqual(report.artifacts.map(item => item.path), [...first, ...second].map(item => item.path));
+  assert.equal(requests, 2);
+});
 
 test('a second gateway cannot finalize a still-running archived conversation', {skip: process.platform !== 'darwin'}, async t => {
   let release, reportArrival;

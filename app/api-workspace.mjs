@@ -78,6 +78,7 @@ async function diskBytes({ current, stat }) {
     const observed = await handle.stat();
     if (
       !observed.isFile() || observed.nlink !== 1 || observed.dev !== stat.dev || observed.ino !== stat.ino
+      || observed.uid !== stat.uid
       || observed.size > MAX_FILE_BYTES
     ) throw new Error('API source file changed or exceeds its size limit');
     const buffer = Buffer.alloc(MAX_FILE_BYTES + 1);
@@ -149,14 +150,54 @@ function makeEntries(files, testPaths) {
   return entries;
 }
 
-async function committedFile(checkout, baseSha, name, tree) {
+function checkoutHead(checkout) {
+  if (git(checkout, ['rev-parse', '--show-toplevel']).toString('utf8').replace(/\r?\n$/, '') !== checkout) {
+    throw new Error('API workspace checkout must be the canonical Git worktree root');
+  }
+  const head = git(checkout, ['rev-parse', '--verify', 'HEAD^{commit}']).toString('utf8').trim();
+  if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(head)) throw new Error('Invalid Git HEAD for API workspace');
+  return head;
+}
+
+async function committedFile(checkout, baseSha, name, tree, { ownerUid } = {}) {
   const [mode, actualPath] = tree.split('\t');
   if (!/^100(?:644|755) blob [a-f0-9]{40,64}$/.test(mode) || actualPath !== name + '\0') {
     throw new Error('API source must be a regular Git HEAD file');
   }
+  const file = await exactFile(checkout, name);
+  if (ownerUid !== undefined && file.stat.uid !== ownerUid) throw new Error('API evidence file must belong to the checkout owner');
   const bytes = git(checkout, ['cat-file', 'blob', `${baseSha}:${name}`]);
-  if (!bytes.equals(await diskBytes(await exactFile(checkout, name)))) throw new Error('Approved API source has been modified since Git HEAD');
+  if (!bytes.equals(await diskBytes(file))) throw new Error('Approved API source has been modified since Git HEAD');
   return bytes;
+}
+
+export async function readCommittedEvidence({ checkout, paths, signal }) {
+  signal?.throwIfAborted();
+  if (!Array.isArray(paths) || paths.length === 0 || paths.length > MAX_FILES) {
+    throw new Error('A bounded list of committed API evidence paths is required');
+  }
+  const names = Array.from(paths, sourcePath);
+  if (new Set(names.map((name) => name.toLowerCase())).size !== names.length) {
+    throw new Error('Committed API evidence paths must be distinct and unaliased');
+  }
+  const ownerUid = process.getuid?.();
+  if (ownerUid === undefined || (await canonicalDirectory(checkout)).uid !== ownerUid) {
+    throw new Error('API evidence checkout must belong to the current user');
+  }
+  const head = checkoutHead(checkout);
+  const files = [];
+  let size = 0;
+  for (const name of names) {
+    signal?.throwIfAborted();
+    const tree = git(checkout, ['ls-tree', '-z', head, '--', name]).toString('utf8');
+    const bytes = await committedFile(checkout, head, name, tree, { ownerUid });
+    size += bytes.length;
+    if (size > MAX_WORKSPACE_BYTES) throw new Error('Committed API evidence exceeds its size limit');
+    files.push({ path: name, sha256: hash(bytes) });
+  }
+  signal?.throwIfAborted();
+  if (checkoutHead(checkout) !== head) throw new Error('API evidence Git HEAD changed during readback');
+  return { head, files };
 }
 
 async function snapshot(checkout, baseSha, entries, signal) {
@@ -330,10 +371,7 @@ export async function prepareApiWorkspace({ checkout, jobRoot, files, testPaths,
   if (parent.uid !== process.getuid() || (parent.mode & 0o077) !== 0 || jobRoot === checkout || jobRoot.startsWith(checkout + '/')) {
     throw new Error('API job directory must be outside the checkout with a private owner-only parent');
   }
-  if (git(checkout, ['rev-parse', '--show-toplevel']).toString('utf8').trimEnd() !== checkout) {
-    throw new Error('API workspace checkout must be the canonical Git worktree root');
-  }
-  const baseSha = git(checkout, ['rev-parse', '--verify', 'HEAD^{commit}']).toString('utf8').trim();
+  const baseSha = checkoutHead(checkout);
   const entries = makeEntries(files, testPaths);
   await snapshot(checkout, baseSha, entries, signal);
   for (const {path: relative, sha256} of priorChanges) {

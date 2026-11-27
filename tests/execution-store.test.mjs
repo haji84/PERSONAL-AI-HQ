@@ -146,6 +146,11 @@ test('route handover requires matching destination readback and never resets spe
   const ready = context(); ready.handoverReadback = checkpoint(1);
   const second = store.prepareDispatch(next, ready);
   assert.equal(second.allowed, true);
+  assert.equal(store.markDispatched(next.projectId, next.taskId, second.operation.executionId, context()).code, 'HANDOVER_REQUIRED');
+  const changed = {...ready, handoverReadback: {...checkpoint(1), requirementsHash: 'b'.repeat(64)}};
+  assert.equal(store.markDispatched(next.projectId, next.taskId, second.operation.executionId, changed).code, 'HANDOVER_REQUIRED');
+  assert.equal(store.markDispatched(next.projectId, next.taskId, second.operation.executionId, ready).dispatchable, true);
+  assert.equal(store.recheckDispatched(next.projectId, next.taskId, second.operation.executionId, changed).code, 'HANDOVER_REQUIRED');
   finish(store, next, second, { checkpoint: checkpoint(2) });
   store.updateSettings('project-a', 2, { mode: 'api-only', apiBudgetUsd: 0.25 });
   ready.handoverReadback = checkpoint(2);
