@@ -573,6 +573,18 @@ test('the existing shared observation can carry a local project across devices b
   assert.equal(other.forecast.source,null);
   assert.equal(portfolio.taskProgressSource.unmatched,0);
 
+  const requirement={id:'checked',implemented:true,review:{independent:true,status:'accepted'},
+    validation:{status:'passed',source:'Recorded elsewhere'},artifact:{usable:true}};
+  await commit({[path]:JSON.stringify({taskProgress:{
+    observedAt,projects:[],localProjects:[{...localRecord,
+      delivery:{...localRecord.delivery,requirements:[requirement]},
+      tasks:[{...task,status:'verified',actionable:false,requirementIds:['checked'],requirements:[requirement]}]}]}})});
+  matched=(await view()).projects[0];
+  assert.equal(matched.forecast.progress.formalCompletion,0);
+  assert.equal(matched.tasks[0].status,'unknown');
+  assert.equal(matched.tasks[0].progress,null);
+  assert.equal(matched.tasks[0].remainingMinutes.standard,6);
+
   settings.projects[0].repository='http://github.com/fixture-owner/unrelated';
   await writeFile(portfolioPath,JSON.stringify(settings));
   portfolio=await view();

@@ -170,7 +170,7 @@ function comparableForecast(task, samples) {
     evidence:[...new Set(matches.map(sample=>forecastString(sample.source)))].slice(0,8)}};
 }
 
-function makeForecastTask(task, verifiedIds, now, comparableRuns) {
+function makeForecastTask(task, verifiedIds, now, comparableRuns, allowImplicitReadiness) {
   const verified = verifiedIds instanceof Set ? task.status === 'verified' && verifiedIds.has(task.id) &&
     task.externalWait !== 'unknown' && !taskHasOpenWork(task) : taskIsVerified(task);
   const direct = remainingEstimate(task.remainingMinutes);
@@ -189,7 +189,8 @@ function makeForecastTask(task, verifiedIds, now, comparableRuns) {
     assumptions:forecastList(task.estimate?.assumptions),evidence:forecastList(task.estimate?.evidence,8)};
   return {id:task.id,title:forecastString(task.title,140)??task.id,
     status:verified?'verified':rejectedCompletion?'unknown':forecastString(task.status,30)??'unknown',
-    verified,unconfirmedCompletion:rejectedCompletion,actionable:task.actionable!==false,expired,remainingMinutes,
+    verified,unconfirmedCompletion:rejectedCompletion,
+    actionable:allowImplicitReadiness ? task.actionable!==false : task.actionable===true,expired,remainingMinutes,
     previousMinutes:expired?proposed:null,estimate,
     dependencies:task.dependencies==null?[]:Array.isArray(task.dependencies) &&
       task.dependencies.length<=400 && task.dependencies.every(id=>typeof id==='string' && id.length<=120)
@@ -379,7 +380,7 @@ export function developmentForecast(delivery = {}, {
   const raw = Array.isArray(delivery.tasks) ? delivery.tasks : [];
   const validTasks = raw.length<=400 && new Set(raw.map(task=>task?.id)).size===raw.length &&
     raw.every(task=>typeof task?.id==='string' && task.id.length>0 && task.id.length<=120);
-  const tasks = validTasks ? raw.map(task=>makeForecastTask(task,verifiedTaskIds,now,delivery.comparableRuns)) : [];
+  const tasks = validTasks ? raw.map(task=>makeForecastTask(task,verifiedTaskIds,now,delivery.comparableRuns,status!=='unknown')) : [];
   const scoped = verifiedTaskIds instanceof Set;
   const confirmedRequirements = new Set(tasks.filter(task=>task.verified).flatMap(task=>task.requirements));
   const requirements = scoped && Array.isArray(delivery.requirements) ? delivery.requirements.map(row=>

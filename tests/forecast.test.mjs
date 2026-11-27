@@ -41,6 +41,16 @@ test('unknown waits and pauses preserve conditional effort and prevent a false d
   assert.equal(stopped.nextUpdate.at,null);
 });
 
+test('an unconfirmed project cannot infer readiness from a legacy pending task', () => {
+  const source={observationAt:asOf,tasks:[task('legacy',5),task('explicitly-ready',15,{actionable:true})]};
+  const unconfirmed=forecast(source,{now,status:'unknown'});
+  assert.equal(unconfirmed.tasks[0].status,'pending');
+  assert.equal(unconfirmed.tasks[0].actionable,false);
+  assert.deepEqual(unconfirmed.schedule.workMinutes,range(20));
+  assert.deepEqual(unconfirmed.schedule.readyTaskIds,['explicitly-ready']);
+  assert.deepEqual(forecast(source,{now,status:'developing'}).schedule.readyTaskIds,['legacy','explicitly-ready']);
+});
+
 test('verified lifecycle evidence closes only its scoped task and leaves requirement rates intact', () => {
   const source={observationAt:asOf,scopeComplete:true,capacity:{parallelism:1,calendar:'continuous'},
     requirements:[{id:'whole-feature'}],

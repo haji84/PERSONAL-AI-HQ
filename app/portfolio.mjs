@@ -403,6 +403,7 @@ export async function readPortfolio(directory, githubProjects, refreshGithub = f
         const shared = matched && (!local?.tasks?.length || (isIntake && matched.tasks.length)) ? matched : null;
         const deliveryRecord = deliveryRecords.get(project.id);
         const scoped = scopedStates.get(project.id);
+        const workspaceUnconfirmed = Boolean(shared?.localProjectId && !scoped);
         const projectHeld = ['paused','completed','blocked','approval','limit','offline'].includes(project.state);
         const input = scoped?.delivery ?? forecastInput(project,local,shared,deliveryRecord);
         if (project.scopeRequired) {
@@ -411,12 +412,12 @@ export async function readPortfolio(directory, githubProjects, refreshGithub = f
         }
         const forecast = developmentForecast(input,
           {goal:project.goal,status:projectHeld?project.state:scoped?.status??project.state,
-            nextAction:scoped?.nextAction??input.nextAction??deliveryRecord?.nextAction,verifiedTaskIds:scoped?.verifiedTaskIds,
-            workspaceUnconfirmed:Boolean(shared?.localProjectId && !scoped)});
+            nextAction:scoped?.nextAction??input.nextAction??deliveryRecord?.nextAction,
+            verifiedTaskIds:scoped?.verifiedTaskIds??(workspaceUnconfirmed?new Set():undefined),workspaceUnconfirmed});
         if (isIntake && (scoped || shared)) {
           forecast.baseline.intake = developmentForecast({estimates:local.estimates}).baseline.original;
         }
-        if (scoped) project.tasks = taskProgress(input,forecast);
+        if (scoped || workspaceUnconfirmed) project.tasks = taskProgress(input,forecast);
         else if (shared) project.tasks = taskProgress(input);
         if (scoped || shared) updateForecastOverview(project,input,forecast);
         project.forecast = {...forecast,source:scoped?.source??(shared?taskRecords.source:null)};
