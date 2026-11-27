@@ -13,6 +13,8 @@ chatgpt-plan-auth.json
 .chatgpt-plan-auth*
 portfolio.json
 execution-policy.json*
+api-execution-authority.json
+api-work/
 sign-in-*.html
 .runtime-acl-backup.json
 secrets/

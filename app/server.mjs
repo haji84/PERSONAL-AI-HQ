@@ -16,6 +16,7 @@ import {createExecutionAccess} from './execution-access.mjs';
 import {createPlanAuth, PLAN_AUTH_CALLBACK_PATH} from './chatgpt-plan-auth.mjs';
 import {createChatGPTResponses} from './chatgpt-responses.mjs';
 import {ensurePrivateDirectory} from './private-directory.mjs';
+import {createApiDevelopment} from './api-development.mjs';
 
 const root = fileURLToPath(new URL('../public/', import.meta.url));
 const assets = new Map([['/', ['index.html', 'text/html']], ['/app.mjs', ['app.mjs', 'text/javascript']],
@@ -26,6 +27,25 @@ const defaultRuntime = process.platform === 'win32'
 const browserPolicy = "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 const sessionAge = 8 * 60 * 60;
 const error = (status, message) => Object.assign(new Error(message), {status});
+const apiMessages = {
+  API_AUTHORIZATION_REQUIRED: 'この端末の通常API実行は認証が保留中です。',
+  API_AUTHORITY_MISSING: '本人が確認したAPIの費用・組織設定がありません。',
+  API_AUTHORITY_UNSAFE: 'APIの権限設定ファイルを所有者専用として確認できません。',
+  API_AUTHORITY_INVALID: 'APIの権限設定を照合できません。',
+  API_AUTHORITY_UNBOUND: '通常APIを許可する組織の予算管理先を確認できません。',
+  API_CREDIT_UNVERIFIED: '組織の有効な特典残高と追加費用ゼロの条件を確認してください。',
+  API_WORKSPACE_NOT_ENROLLED: '通常APIが編集できるこの案件の分離作業先を確認できません。',
+  API_TASK_INVALID: '作業番号、指示、工程、モデルの指定を確認してください。',
+  HANDOVER_REQUIRED: '前の経路の要求と成果物を照合してから実行してください。',
+  PROJECT_BUDGET_REQUIRED: 'この案件のAPI作業上限を設定してください。',
+  PROJECT_BUDGET_EXCEEDED: 'この案件のAPI作業上限内に予約できません。',
+  SHARED_CREDIT_INSUFFICIENT: '共有のAPI特典残高内に作業費用を予約できません。',
+  ROUTE_NOT_ALLOWED: 'この案件の実行モードでは通常APIを選択できません。',
+  EXECUTION_HELD: '案件の停止条件または未確定の作業を確認してください。',
+  API_ARTIFACT_NOT_FOUND: '検証済みの成果物を確認できません。',
+  API_ARTIFACT_CHANGED: '成果物が検証記録と一致しません。',
+  API_TASK_NOT_FOUND: '中断するAPI作業を確認できません。',
+};
 
 function send(response, status, payload, extra = {}) {
   response.writeHead(status, {'Content-Type': 'application/json; charset=utf-8', ...extra});
@@ -102,13 +122,19 @@ async function checkedSocket(socket) {
   return target;
 }
 
-export async function startOwnerApp({directory = defaultRuntime, port = 4328, socket, codex, plan} = {}) {
+export async function startOwnerApp({directory = defaultRuntime, port = 4328, socket, codex, plan, apiDevelopment = false} = {}) {
   directory = resolve(directory);
   await ensurePrivateDirectory(directory);
   const native = codex ?? createCodexClient({socket: await checkedSocket(socket)});
   const chats = createChatStore(directory);
   const execution = createExecutionAccess(directory, native);
   const operations = createOperations(directory, native, execution);
+  const apiWork = apiDevelopment ? createApiDevelopment({...(apiDevelopment === true ? {} : apiDevelopment),
+    directory, store: execution.store, hasNativeWork: operations.hasNativeWork,
+    withProjectWorkLock: (project, act) => operations.updateExecution(project, () => {
+      if (chats.hasActiveLive(project.id)) throw error(409, 'ChatGPTの応答が終わるまで開始できません。');
+      return act();
+    })}) : null;
   if (plan === true) {
     const auth = createPlanAuth({directory});
     plan = {auth, responses: createChatGPTResponses({auth})};
@@ -223,7 +249,8 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       const enabled = native.canWrite === true && portfolio?.view.projects.some(project => project.codexWrite) === true &&
         await Promise.resolve(native.subscriptionReady?.()).catch(() => false) === true;
       return send(response, 200, {authenticated, capabilities: {chatImport: true, codexWrite: enabled,
-        executionSettings: authenticated, executionActivity: authenticated, chatgptPlan: authenticated && Boolean(plan)}});
+        executionSettings: authenticated, executionActivity: authenticated, chatgptPlan: authenticated && Boolean(plan),
+        apiDevelopment: authenticated && Boolean(apiWork)}});
     }
     if (post && route === '/api/session') {
       if (!['null', url].includes(request.headers.origin)) throw error(403, 'ログイン元を確認できません。');
@@ -267,13 +294,34 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       return send(response, 200, await operations.readActivity(project));
     }
     if (route === '/api/execution/settings') {
-      if (get) return send(response, 200, execution.settings(project));
+      if (get) return send(response, 200, {...execution.settings(project), apiAvailable: apiWork?.capabilities(project).available === true});
       if (post) {
         const input = await jsonBody(request, 8192);
         return send(response, 200, operations.updateExecution(project, () => {
           if (chats.hasActiveLive(project.id)) throw error(409, 'ChatGPTの応答が終わってから設定を変更してください。');
           return execution.update(project, input);
         }));
+      }
+    }
+    if (route.startsWith('/api/execution/api')) {
+      if (!apiWork) throw error(409, apiMessages.API_AUTHORIZATION_REQUIRED);
+      if (target.searchParams.getAll('project').length !== 1) throw error(404, '案件を見つけられませんでした。');
+      if (get && route === '/api/execution/api/capabilities') return send(response, 200, apiWork.capabilities(project));
+      if (get && route === '/api/execution/api') return send(response, 200, apiWork.read(project, target.searchParams.get('id') ?? undefined));
+      if (post && route === '/api/execution/api') return send(response, 202, apiWork.start(project, await jsonBody(request, 64000)));
+      if (post && route === '/api/execution/api/interrupt') {
+        const input = await jsonBody(request, 4096);
+        return send(response, 202, apiWork.interrupt(project, input?.id));
+      }
+      if (get && route === '/api/execution/api/artifact') {
+        const value = target.searchParams.get('index');
+        if (!value || !/^\d{1,2}$/.test(value)) throw error(404, apiMessages.API_ARTIFACT_NOT_FOUND);
+        const {bytes, name} = await apiWork.artifact(project, target.searchParams.get('id'), Number(value));
+        const encoded = encodeURIComponent(name).replace(/[!'()*]/g, char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
+        response.writeHead(200, {'Content-Type': 'application/octet-stream', 'Content-Length': bytes.length,
+          'Content-Disposition': `attachment; filename*=UTF-8''${encoded}`});
+        response.end(bytes);
+        return;
       }
     }
     if (route === '/api/codex/run') {
@@ -321,12 +369,13 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
     respond(request, response).catch(problem => {
       if (response.headersSent) { response.destroy(); return; }
       const status = typeof problem?.status === 'number' ? problem.status : 500;
-      send(response, status, {error: status === 500 ? '状態を読み取れませんでした。' : problem.message});
+      send(response, status, {error: status === 500 ? '状態を読み取れませんでした。' : apiMessages[problem.code] ?? problem.message});
     });
   });
   async function close() {
     closing ??= (async () => {
       for (const controller of liveRequests) controller.abort();
+      if (apiWork) await apiWork.close();
       await new Promise(done => server.close(done));
       operations.close();
       await native.close?.();
@@ -349,7 +398,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   const app = await startOwnerApp({directory: process.env.HQ_PRIVATE_DIRECTORY, port: Number(process.env.HQ_PORT ?? 4328),
-    socket: process.env.HQ_CODEX_SOCKET, plan: process.env.HQ_CHATGPT_PLAN === '1'});
+    socket: process.env.HQ_CODEX_SOCKET, plan: process.env.HQ_CHATGPT_PLAN === '1', apiDevelopment: process.env.HQ_API_EXECUTION === '1'});
   console.log(JSON.stringify({url: app.url, signInFile: app.signInFile}));
   if (process.argv.includes('--open') && process.platform === 'darwin') {
     spawn('/usr/bin/open', [app.signInFile], {stdio: 'ignore'}).on('error', () => {});

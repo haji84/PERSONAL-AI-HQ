@@ -117,6 +117,24 @@ test('dispatch rechecks a new pause before any external launch', t => {
   assert.equal(result.allowed, false);
 });
 
+test('an unstarted reservation can be cancelled, while each follow-up must recheck the same paid receipt', t => {
+  const {store} = fixture(t);
+  store.updateSettings('project-a', 0, {mode: 'api-only', apiBudgetUsd: 1});
+  const reserved = store.prepareDispatch(request(), context()).operation;
+  assert.equal(store.cancelReserved('project-a', 'task-1', reserved.executionId, now).cancelled, true);
+  assert.equal(store.markDispatched('project-a', 'task-1', reserved.executionId, context()).allowed, false);
+  assert.equal(store.getWork('project-a', 'task-1').operation.status, 'cancelled');
+  assert.equal(store.getWork('project-a').busy, false);
+  const current = store.prepareDispatch(request('project-a', 'task-2'), context()).operation;
+  assert.equal(store.markDispatched('project-a', 'task-2', current.executionId, context()).allowed, true);
+  assert.equal(store.cancelReserved('project-a', 'task-2', current.executionId, now).cancelled, false);
+  const exhausted = context();
+  exhausted.safety.api.availableCreditUsd = 0.01;
+  assert.equal(store.recheckDispatched('project-a', 'task-2', current.executionId, exhausted).code, 'SHARED_CREDIT_INSUFFICIENT');
+  assert.equal(store.recheckDispatched('project-a', 'task-2', current.executionId, context()).dispatchable, true);
+  assert.equal(store.getWork('project-a').busy, true);
+});
+
 test('route handover requires matching destination readback and never resets spending', t => {
   const { store } = fixture(t);
   store.updateSettings('project-a', 0, { mode: 'api-only', apiBudgetUsd: 0.25 });

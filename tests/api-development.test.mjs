@@ -1,0 +1,188 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import {execFileSync} from 'node:child_process';
+import {copyFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile} from 'node:fs/promises';
+import {join} from 'node:path';
+import {tmpdir} from 'node:os';
+import {setTimeout as wait} from 'node:timers/promises';
+import {startOwnerApp} from '../app/server.mjs';
+import {apiAuthorityFile} from '../app/api-authority.mjs';
+import {ExecutionStore} from '../app/execution-store.mjs';
+
+const instruction = {id: 'api-fixture-task', prompt: '答えを2にする', stage: 'implementation'};
+const id = 'api-fixture';
+const modelId = 'fixture-model-2026-11-27';
+
+async function fixture(t, fetchImpl) {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), 'hq-api-app-')));
+  let app;
+  t.after(async () => {
+    await app?.close();
+    await rm(directory, {recursive: true, force: true});
+  });
+  const checkout = join(directory, 'workspaces', id);
+  await mkdir(checkout, {recursive: true, mode: 0o700});
+  await writeFile(join(checkout, '.hq-owned-workspace'), id, {mode: 0o600});
+  const source = join(checkout, 'source.mjs');
+  await writeFile(source, 'export const answer = 1;\n');
+  await writeFile(join(checkout, 'check.test.mjs'), `import assert from 'node:assert/strict';
+import test from 'node:test';
+import {answer} from './source.mjs';
+test('answer equals the required value', () => assert.equal(answer, 2));\n`);
+  const git = (...args) => execFileSync('/usr/bin/git', ['-C', checkout, ...args], {env: {...process.env,
+    GIT_AUTHOR_NAME: 'Fixture', GIT_AUTHOR_EMAIL: 'fixture@example.invalid', GIT_COMMITTER_NAME: 'Fixture',
+    GIT_COMMITTER_EMAIL: 'fixture@example.invalid'}, stdio: 'ignore'});
+  git('init', '--quiet');
+  git('add', '--', 'source.mjs', 'check.test.mjs');
+  git('commit', '--quiet', '-m', 'Fixture initial files');
+  await writeFile(join(directory, 'portfolio.json'), JSON.stringify({projects: [
+    {id, name: 'API fixture', state: 'unknown', cwd: checkout, goal: '答えを2にする'},
+    {id: 'other-fixture', name: 'Another isolated fixture', state: 'unknown'},
+  ]}), {mode: 0o600});
+  const ledgerFile = join(directory, 'execution-policy.json');
+  const store = new ExecutionStore(ledgerFile, {authorityId: 'personal-ai-hq-local'});
+  const ledgerBinding = store.initializeReservationAuthority();
+  const observedAt = new Date().toISOString();
+  await writeFile(join(directory, apiAuthorityFile), JSON.stringify({version: 1, organization: 'org-fixture', providerProject: 'proj_fixture',
+    reservationAuthorityId: store.authorityId, ledgerBinding,
+    defaultModel: modelId, credit: {organization: 'org-fixture', observedAt, safeUntil: new Date(Date.now() + 300000).toISOString(),
+      availableCreditUsd: 2, checkoutConfirmed: true, purchasedCreditUsd: 0, paidBillingEnabled: false, autoRechargeEnabled: false},
+    models: [{id: modelId, contextTokens: 16000, outputTokens: 2000, inputUsdPerMillion: 2, outputUsdPerMillion: 8, reasoningEfforts: []}],
+    projects: {[id]: {files: [{path: 'source.mjs', writable: true}], testPaths: ['check.test.mjs']}},
+  }), {mode: 0o600});
+  app = await startOwnerApp({directory, port: 0, codex: {}, apiDevelopment: {getKey: () => 'fixture-only', fetchImpl}});
+  const signIn = await readFile(app.signInFile, 'utf8');
+  const login = await fetch(app.url + '/api/session', {method: 'POST', redirect: 'manual', headers: {Origin: 'null'},
+    body: new URLSearchParams({key: /name="key" value="([a-f0-9]+)"/.exec(signIn)[1]})});
+  const cookie = login.headers.get('set-cookie').split(';')[0];
+  function call(path, {data, project = id, query = {}, auth = true, origin = app.url} = {}) {
+    return fetch(app.url + path + '?' + new URLSearchParams({project, ...query}), {method: data ? 'POST' : 'GET',
+      headers: {...(auth ? {cookie} : {}), ...(data ? {Origin: origin, 'Content-Type': 'application/json'} : {})},
+      ...(data ? {body: JSON.stringify(data)} : {})});
+  }
+  const commitSource = async text => {
+    await writeFile(source, text);
+    git('add', '--', 'source.mjs');
+    git('commit', '--quiet', '-m', 'Fixture checkout change');
+  };
+  return {call, source, directory, store, ledgerFile, commitSource};
+}
+
+async function waitFor(call, target, taskId = instruction.id) {
+  const end = Date.now() + 15000;
+  while (Date.now() < end) {
+    const {operation} = await (await call('/api/execution/api', {query: {id: taskId}})).json();
+    if (operation?.phase === target) return operation;
+    if (['completed', 'failed', 'interrupted', 'unconfirmed'].includes(operation?.phase)) assert.equal(operation.phase, target, JSON.stringify(operation));
+    await wait(40);
+  }
+  assert.fail('Timed out waiting for API job');
+}
+
+test('owner API-only work repairs actual source in an isolated Mac and returns a verified artifact', {skip: process.platform !== 'darwin'}, async t => {
+  let requests = 0;
+  const {call, source} = await fixture(t, async (_url, request) => {
+    requests++;
+    const body = JSON.parse(request.body);
+    const input = JSON.parse(body.input[1].content);
+    assert.equal(input.candidate.files.length, 1);
+    assert.equal(input.candidate.files[0].path, 'source.mjs');
+    if (requests === 2) assert.match(input.previousVerification, /1 failed/);
+    const answer = requests === 1 ? 3 : 2;
+    return Response.json({model: modelId, service_tier: 'default', status: 'completed', usage: {input_tokens: 100, output_tokens: 25},
+      output: [{type: 'message', role: 'assistant', content: [{type: 'output_text', text: JSON.stringify({
+        summary: '定数を修正', changes: [{path: 'source.mjs', text: `export const answer = ${answer};\n`}],
+      })}]}]});
+  });
+  assert.equal((await call('/api/execution/api', {auth: false})).status, 401);
+  assert.equal((await call('/api/execution/api', {data: instruction, origin: 'https://untrusted.invalid'})).status, 403);
+  assert.equal((await call('/api/execution/api', {data: instruction})).status, 409);
+  assert.equal(requests, 0);
+  assert.equal((await call('/api/execution/settings', {data: {revision: 0, settings: {mode: 'api-only', apiBudgetUsd: 1}}})).status, 200);
+  const [first, duplicate] = await Promise.all([call('/api/execution/api', {data: instruction}), call('/api/execution/api', {data: instruction})]);
+  assert.equal(first.status, 202);
+  assert.equal(duplicate.status, 202);
+  assert.equal((await first.json()).operation.id, (await duplicate.json()).operation.id);
+  const operation = await waitFor(call, 'completed');
+  assert.equal(requests, 2);
+  assert.equal(operation.route, 'api');
+  assert.equal(operation.verification.passed, true);
+  assert.equal(operation.artifactCount, 1);
+  const query = {id: instruction.id, index: '0'};
+  assert.equal((await call('/api/execution/api/artifact', {query, project: 'other-fixture'})).status, 404);
+  assert.equal(await (await call('/api/execution/api/artifact', {query})).text(), 'export const answer = 2;\n');
+  assert.equal(await readFile(source, 'utf8'), 'export const answer = 1;\n');
+  assert.equal((await call('/api/execution/api', {data: {...instruction, prompt: '別の指示'}})).status, 409);
+});
+
+function providerAnswer(answer) {
+  return Response.json({model: modelId, service_tier: 'default', status: 'completed', usage: {input_tokens: 100, output_tokens: 25},
+    output: [{type: 'message', role: 'assistant', content: [{type: 'output_text', text: JSON.stringify({
+      summary: '実行確認', changes: [{path: 'source.mjs', text: `export const answer = ${answer};\n`}],
+    })}]}]});
+}
+
+test('copying a credit observation and ledger to another runtime does not create another reservation authority', {skip: process.platform !== 'darwin'}, async t => {
+  let requests = 0;
+  const fetchImpl = async () => { requests++; return providerAnswer(2); };
+  const original = await fixture(t, fetchImpl);
+  const copy = await fixture(t, fetchImpl);
+  assert.equal((await original.call('/api/execution/settings', {data: {revision: 0, settings: {mode: 'api-only', apiBudgetUsd: 1}}})).status, 200);
+  await copyFile(original.ledgerFile, copy.ledgerFile);
+  await copyFile(join(original.directory, apiAuthorityFile), join(copy.directory, apiAuthorityFile));
+  const capability = await (await copy.call('/api/execution/api/capabilities')).json();
+  assert.equal(capability.available, false);
+  assert.equal(capability.reason, 'API_AUTHORITY_UNBOUND');
+  assert.equal((await copy.call('/api/execution/api', {data: instruction})).status, 409);
+  assert.equal(requests, 0);
+});
+
+test('a settled failure cannot erase the earlier verified artifact handover', {skip: process.platform !== 'darwin'}, async t => {
+  let requests = 0;
+  const {call, store, commitSource} = await fixture(t, async () => providerAnswer(++requests === 1 ? 2 : 3));
+  assert.equal((await call('/api/execution/settings', {data: {revision: 0, settings: {mode: 'api-only', apiBudgetUsd: 1}}})).status, 200);
+  assert.equal((await call('/api/execution/api', {data: instruction})).status, 202);
+  await waitFor(call, 'completed');
+  await commitSource('export const answer = 2;\n');
+  const fails = {...instruction, id: 'fails-after-pass'};
+  assert.equal((await call('/api/execution/api', {data: fails})).status, 202);
+  assert.equal((await waitFor(call, 'failed', fails.id)).result, 'API_VERIFICATION_FAILED');
+  assert.equal(store.getWork(id).checkpointOperation.taskId, fails.id);
+  assert.deepEqual(store.getWork(id).verifiedApiOperations.map(item => item.taskId), [instruction.id]);
+  await commitSource('export const answer = 1;\n');
+  const resume = {...instruction, id: 'handover-check'};
+  assert.equal((await call('/api/execution/api', {data: resume})).status, 202);
+  assert.equal((await waitFor(call, 'interrupted', resume.id)).result, 'API_CANDIDATE_HANDOVER_REQUIRED');
+  assert.equal(requests, 3);
+});
+
+test('revocation during the provider response records known usage and withholds the verified candidate', {skip: process.platform !== 'darwin'}, async t => {
+  let path, requests = 0;
+  const {call, directory, store} = await fixture(t, async () => {
+    requests++;
+    await rm(path);
+    return providerAnswer(2);
+  });
+  path = join(directory, apiAuthorityFile);
+  assert.equal((await call('/api/execution/settings', {data: {revision: 0, settings: {mode: 'api-only', apiBudgetUsd: 1}}})).status, 200);
+  assert.equal((await call('/api/execution/api', {data: instruction})).status, 202);
+  const operation = await waitFor(call, 'failed');
+  assert.equal(operation.result, 'API_AUTHORITY_MISSING');
+  assert.equal(operation.artifactCount, 0);
+  assert.equal(store.getWork(id, instruction.id).operation.costMicros, 400);
+  assert.equal(store.getWork(id).busy, false);
+  assert.equal((await call('/api/execution/api/artifact', {query: {id: instruction.id, index: '0'}})).status, 404);
+  assert.equal(requests, 1);
+});
+
+test('lost API settlement holds the project across repeated requests', {skip: process.platform !== 'darwin'}, async t => {
+  let requests = 0;
+  const {call} = await fixture(t, async () => { requests++; throw new Error('fixture transport break'); });
+  await call('/api/execution/settings', {data: {revision: 0, settings: {mode: 'api-only', apiBudgetUsd: 1}}});
+  assert.equal((await call('/api/execution/api', {data: instruction})).status, 202);
+  const result = await waitFor(call, 'unconfirmed');
+  assert.equal(result.result, 'API_SETTLEMENT_UNKNOWN');
+  assert.equal((await call('/api/execution/api', {data: instruction})).status, 202);
+  assert.equal((await call('/api/execution/api', {data: {...instruction, id: 'another-task'}})).status, 409);
+  assert.equal(requests, 1);
+});

@@ -57,6 +57,7 @@ const ui = {
 };
 const resources = new Map();
 const runStates = new Map();
+const runViewCleanups = new Set();
 const chatStreams = new Map();
 const activities = new Map();
 const activityLabels = {
@@ -66,7 +67,6 @@ const activityLabels = {
 let requestSequence = 0;
 let mounted = 0;
 let pendingScroll;
-let stopRunView;
 let activityTimer;
 let activityPollRunning = false;
 let activitySession;
@@ -225,7 +225,7 @@ function gate(title, description, canRetry) {
   dom['gate-retry'].hidden = !canRetry;
 }
 function endSession() {
-  stopRunView?.();
+  for (const stop of runViewCleanups) stop();
   clearTimeout(activityTimer);
   activities.clear();
   activitySession = undefined;
@@ -1071,11 +1071,34 @@ const runPhases = {
 const pollingPhases = new Set(['reserved', 'sending', 'running', 'interrupting', 'unconfirmed']);
 const finishedPhases = new Set(['completed', 'interrupted', 'failed']);
 
-function mountCodexRun(area, project, draft, draftKey, choices) {
-  const run = runStates.get(project) ?? {operation: null, known: false, busy: false, checking: false, message: ''};
-  runStates.set(project, run);
+const apiWorkMessages = {
+  API_AUTHORIZATION_REQUIRED: 'この端末の通常API認証を確認できません。',
+  API_AUTHORITY_MISSING: '本人が確認したAPIの組織・費用設定がありません。',
+  API_AUTHORITY_UNSAFE: '通常APIの設定ファイルの所有権とアクセス権を確認してください。',
+  API_AUTHORITY_UNBOUND: '通常APIを許可する組織の予算管理先を確認できません。',
+  API_AUTHORITY_CHANGED: 'この作業の実行許可または対象ファイルの設定が変わりました。',
+  API_CREDIT_UNVERIFIED: '追加費用ゼロの条件と有効な組織残高の確認が必要です。',
+  API_WORKSPACE_NOT_ENROLLED: 'この案件のAPI用分離作業先を確認できません。',
+  ROUTE_NOT_ALLOWED: '案件設定で通常APIを選択できる状態にしてください。',
+  EXECUTION_HELD: '案件の停止条件を確認してください。',
+  API_CANDIDATE_HANDOVER_REQUIRED: '前回の検証済み成果物と今回の作業先を照合してください。',
+  API_SETTLEMENT_UNKNOWN: 'API応答と費用が未確認です。同じ作業の追加実行は保留中です。',
+  API_VERIFICATION_FAILED: '隔離環境の検証を通過しませんでした。',
+  API_WORKSPACE_FAILED: '分離作業先または検証条件を確認してください。',
+  API_OUTPUT_UNUSABLE: 'API応答から適用可能な変更を確認できませんでした。',
+  API_NO_WORKSPACE_CHANGE: '検証対象に変更がありませんでした。',
+  INTERRUPTED: 'API作業を中断しました。',
+};
+
+function mountCodexRun(area, project, draft, draftKey, choices, apiReady) {
+  const apiMode = Boolean(apiReady);
+  const runKey = apiMode ? memoryKey('api-work', project) : project;
+  const path = apiMode ? '/api/execution/api' : '/api/codex/run';
+  const run = runStates.get(runKey) ?? {operation: null, known: false, busy: false, checking: false, message: ''};
+  runStates.set(runKey, run);
   const section = node('section', 'run-control');
-  const caption = node('p', 'muted small', '指示は、このプロジェクト専用の分離作業先で実行されます。');
+  const caption = node('p', 'muted small', apiMode ? '許可済みのファイルを分離作業先で編集し、テストを実行します。'
+    : '指示は、このプロジェクト専用の分離作業先で実行されます。');
   const status = node('p', 'strong');
   status.setAttribute('role', 'status');
   const details = node('p', 'muted small');
@@ -1083,15 +1106,16 @@ function mountCodexRun(area, project, draft, draftKey, choices) {
   const steeringStatus = node('p', 'muted small');
   steeringStatus.setAttribute('role', 'status');
   const output = node('pre', 'run-output');
-  output.setAttribute('aria-label', 'Codexの実行中の出力');
+  output.setAttribute('aria-label', apiMode ? 'API作業の検証結果' : 'Codexの実行中の出力');
   output.tabIndex = 0;
+  const artifacts = node('ul', 'marked-list');
   const actions = node('div', 'run-actions');
-  const send = button('分離作業先に送信', () => submitNew(), false);
+  const send = button(apiMode ? '通常APIで開発を開始' : '分離作業先に送信', () => submitNew(), false);
   const resume = button('同じスレッドへ追加指示', () => submitNew(run.operation), true);
   const interrupt = button('中断を要求', async () => {
     if (run.busy || run.checking || !canInterrupt()) return;
     const id = run.operation.id;
-    await mutate('/api/codex/interrupt', {id});
+    await mutate(apiMode ? `${path}/interrupt` : '/api/codex/interrupt', {id});
   }, true);
   const steer = button('実行中のターンに追加指示', () => sendSteering(), true);
   const checkSteer = button('追加指示の状態を照合', () => requestSteering(false), true);
@@ -1102,31 +1126,34 @@ function mountCodexRun(area, project, draft, draftKey, choices) {
     paint();
   });
   const recover = button('同じ受付番号で再送', async () => {
-    const intent = ui.runIntents.get(project);
-    if (!run.busy && !run.checking && intent) await mutate('/api/codex/run', intent);
+    const intent = ui.runIntents.get(runKey);
+    if (!run.busy && !run.checking && intent) await mutate(path, intent);
   }, true);
   const check = button('作業状態を確認', () => lookup(), true);
   actions.append(send, resume, steer, interrupt, recover, check, checkSteer, closeSteer);
-  section.append(node('h3', '', 'Codex操作'), caption, status, details, warning, steeringStatus, actions, output);
+  section.append(node('h3', '', apiMode ? '通常APIの開発操作' : 'Codex操作'), caption, status, details, warning,
+    steeringStatus, actions, output, artifacts);
   area.body.append(section);
 
   let timer;
   let disposed = false;
   function canInterrupt() {
+    if (apiMode) return run.known && ['reserved', 'running', 'interrupting'].includes(run.operation?.phase);
     return run.known && ['running', 'interrupting', 'unconfirmed'].includes(run.operation?.phase) &&
       Boolean(run.operation.threadId && run.operation.turnId);
   }
   function hasRoom() {
-    return run.known && !ui.runIntents.has(project) &&
+    return run.known && (!apiMode || apiReady()?.available === true) && !ui.runIntents.has(runKey) &&
       (!run.operation || finishedPhases.has(run.operation.phase));
   }
   function paint() {
     if (disposed || !section.isConnected) return;
     clearTimeout(timer);
     const phase = run.operation?.phase;
-    const intention = ui.runIntents.get(project);
+    const intention = ui.runIntents.get(runKey);
     status.textContent = run.busy && intention ? '受付を確認中…' :
-      run.known ? runPhases[phase] ?? '実行記録なし' : run.checking ? '照合中…' : '実行状態未確認';
+      run.known ? apiMode && phase === 'completed' ? '成果物の検証完了' : runPhases[phase] ?? '実行記録なし'
+        : run.checking ? '照合中…' : '実行状態未確認';
     const relevantOperation = !intention || intention.id === run.operation?.id ? run.operation : null;
     const timestamps = relevantOperation ? [
       '受付 ' + time(run.operation.createdAt),
@@ -1135,33 +1162,43 @@ function mountCodexRun(area, project, draft, draftKey, choices) {
     ].filter(Boolean) : [];
     details.textContent = timestamps.join(' · ');
     details.hidden = !timestamps.length;
-    warning.textContent = run.message;
-    warning.hidden = !run.message;
-    const pendingSteering = ui.steerIntents.get(project);
+    const apiNotice = apiMode && (apiWorkMessages[relevantOperation?.result] ||
+      (apiReady() && !apiReady().available && (apiWorkMessages[apiReady().reason] || '通常APIの実行条件を確認できません。')));
+    warning.textContent = run.message || apiNotice || '';
+    warning.hidden = !warning.textContent;
+    const pendingSteering = apiMode ? null : ui.steerIntents.get(project);
     steeringStatus.textContent = run.steerMessage || (pendingSteering ? '追加指示の受付を照合できます。' : '');
-    steeringStatus.hidden = !steeringStatus.textContent;
+    steeringStatus.hidden = apiMode || !steeringStatus.textContent;
     send.hidden = !hasRoom();
-    resume.hidden = !hasRoom() || !run.operation?.threadId || !run.operation?.turnId;
+    resume.hidden = apiMode || !hasRoom() || !run.operation?.threadId || !run.operation?.turnId;
     resume.textContent = phase === 'interrupted' ? '中断した作業を再開' : '同じスレッドへ追加指示';
     interrupt.hidden = !canInterrupt();
-    interrupt.textContent = phase === 'interrupting' ? '同じターンの中断を再要求' : '中断を要求';
-    steer.hidden = !run.known || phase !== 'running' || !run.operation?.turnId || Boolean(pendingSteering);
+    interrupt.textContent = !apiMode && phase === 'interrupting' ? '同じターンの中断を再要求' : '中断を要求';
+    steer.hidden = apiMode || !run.known || phase !== 'running' || !run.operation?.turnId || Boolean(pendingSteering);
     checkSteer.hidden = !pendingSteering;
     closeSteer.hidden = !pendingSteering || !run.known || !finishedPhases.has(phase);
     recover.hidden = !intention;
     for (const action of [send, resume, steer, interrupt, recover, check, checkSteer, closeSteer]) {
       action.disabled = run.busy || run.checking;
     }
-    const body = text(relevantOperation?.output, '');
+    const body = text(apiMode ? relevantOperation?.verification?.output : relevantOperation?.output, '');
     if (output.textContent !== body) {
       const atEnd = output.scrollHeight - output.scrollTop - output.clientHeight < 20;
       output.textContent = body;
       if (atEnd) output.scrollTop = output.scrollHeight;
     }
     output.hidden = !body;
+    const changes = apiMode && phase === 'completed' ? asArray(relevantOperation?.changes) : [];
+    artifacts.replaceChildren(...changes.map((change, index) => {
+      const anchor = node('a', '', `検証済み ${text(change.path, '成果物')}`);
+      anchor.href = apiPath(`${path}/artifact`, {project, id: relevantOperation.id, index});
+      anchor.download = '';
+      return listItem(anchor);
+    }));
+    artifacts.hidden = !changes.length;
     if (run.clearDraft && draft.value.trim() === run.clearDraft) draft.value = '';
     run.clearDraft = '';
-    if (run.known && pollingPhases.has(phase) && !run.busy && !run.checking) {
+    if (run.known && pollingPhases.has(phase) && !(apiMode && phase === 'unconfirmed') && !run.busy && !run.checking) {
       timer = setTimeout(() => { if (section.isConnected) void lookup(); }, 1750);
     }
   }
@@ -1174,9 +1211,9 @@ function mountCodexRun(area, project, draft, draftKey, choices) {
       throw new Error('対象の作業状態を照合できませんでした。');
     }
     if (operation) {
-      const intent = ui.runIntents.get(project);
+      const intent = ui.runIntents.get(runKey);
       if (intent?.id === operation.id) {
-        ui.runIntents.delete(project);
+        ui.runIntents.delete(runKey);
         if (text(ui.drafts.get(draftKey), '').trim() === intent.prompt) {
           ui.drafts.delete(draftKey);
           run.clearDraft = intent.prompt;
@@ -1185,7 +1222,7 @@ function mountCodexRun(area, project, draft, draftKey, choices) {
       }
     }
     run.operation = operation ?? run.operation;
-    run.known = Boolean(operation) || (!expected && !ui.runIntents.has(project));
+    run.known = Boolean(operation) || (!expected && !ui.runIntents.has(runKey));
     run.message = run.known ? '' : '受付を確認できません。再送する場合は同じ受付番号が使われます。';
   }
 
@@ -1193,10 +1230,10 @@ function mountCodexRun(area, project, draft, draftKey, choices) {
     if (run.busy || run.checking || disposed) return;
     run.checking = true;
     run.onChange?.();
-    const id = ui.runIntents.get(project)?.id ??
+    const id = ui.runIntents.get(runKey)?.id ??
       (run.operation && !finishedPhases.has(run.operation.phase) ? run.operation.id : undefined);
     try {
-      const response = await api(apiPath('/api/codex/run', {project, id}), {signal: AbortSignal.timeout(9000)});
+      const response = await api(apiPath(path, {project, id}), {signal: AbortSignal.timeout(9000)});
       accept(response, id);
     } catch (error) {
       run.known = false;
@@ -1207,25 +1244,25 @@ function mountCodexRun(area, project, draft, draftKey, choices) {
     }
   }
 
-  async function mutate(path, payload) {
+  async function mutate(endpoint, payload) {
     if (run.busy || run.checking || disposed) return;
     run.busy = true;
     run.message = '';
     run.onChange?.();
     try {
-      const result = await api(apiPath(path, {project}), {
+      const result = await api(apiPath(endpoint, {project}), {
         method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload),
         signal: AbortSignal.timeout(12000),
       });
-      if (!result?.operation) throw new Error('Codexの受付結果を照合できませんでした。');
+      if (!result?.operation) throw new Error('作業の受付結果を照合できませんでした。');
       accept(result, payload.id);
     } catch (error) {
-      if (path === '/api/codex/run' && [400, 403, 413].includes(error.status) &&
-          ui.runIntents.get(project)?.id === payload.id) {
-        ui.runIntents.delete(project);
+      const confirmedRejection = [400, 403, 413].includes(error.status) || apiMode && error.status === 409;
+      if (endpoint === path && confirmedRejection && ui.runIntents.get(runKey)?.id === payload.id) {
+        ui.runIntents.delete(runKey);
         storeTab();
       }
-      run.known = false;
+      run.known = apiMode && confirmedRejection;
       run.message = error.message + ' 作業状態を確認してください。';
     } finally {
       run.busy = false;
@@ -1295,24 +1332,26 @@ function mountCodexRun(area, project, draft, draftKey, choices) {
     }
     const intent = {id: crypto.randomUUID(), prompt, ...choices()};
     if (previous) intent.resume = previous.id;
-    ui.runIntents.set(project, intent);
+    ui.runIntents.set(runKey, intent);
     storeTab();
-    void mutate('/api/codex/run', intent);
+    void mutate(path, intent);
   }
 
   run.onChange = paint;
-  stopRunView = () => {
+  const cleanup = () => {
     disposed = true;
     clearTimeout(timer);
     if (run.onChange === paint) run.onChange = null;
-    stopRunView = null;
+    runViewCleanups.delete(cleanup);
   };
+  runViewCleanups.add(cleanup);
   queueMicrotask(() => {
     if (section.isConnected) {
       paint();
       void lookup();
     }
   });
+  return paint;
 }
 
 function modelSettings() {
@@ -1337,7 +1376,8 @@ function modelSettings() {
   if (canWrite) {
     const details = node('details', 'scope-info');
     const fields = node('div', 'stack');
-    const route = labeledSelect('作業別の利用経路', {'': '案件設定を使う', subscription: 'サブスク', api: 'API'});
+    const route = labeledSelect('作業別の利用経路', {'': '案件設定を使う', subscription: 'サブスク',
+      ...(ui.capabilities.apiDevelopment !== true ? {api: 'API'} : {})});
     const stage = labeledSelect('作業の工程', {'': '標準設定を使う', ...workStageLabels});
     fields.append(route.field, stage.field);
     details.append(node('summary', '', 'この作業の経路を指定'), fields);
@@ -1345,8 +1385,46 @@ function modelSettings() {
     mountCodexRun(area, project, draft, draftKey, () => ({...runChoices,
       ...(route.input.value ? {route: route.input.value} : {}), ...(stage.input.value ? {stage: stage.input.value} : {})}));
   }
-  else {
+  else if (ui.capabilities.apiDevelopment !== true) {
     area.body.append(node('p', 'small muted draft-hint', '現在の接続では履歴を閲覧できます。下書きはこのタブに保存されます。'));
+  }
+  if (ui.capabilities.apiDevelopment === true) {
+    const options = node('fieldset', 'model-pickers');
+    const stage = labeledSelect('通常APIの工程', {implementation: '実装', ...workStageLabels});
+    const model = labeledSelect('通常APIのモデル', {'': '案件設定を使う'});
+    const effort = labeledSelect('通常APIの推論レベル', {'': '案件設定を使う'});
+    options.append(stage.field, model.field, effort.field);
+    area.body.append(options);
+    let capability;
+    const paint = mountCodexRun(area, project, draft, draftKey, () => ({stage: stage.input.value,
+      ...(model.input.value ? {model: model.input.value} : {}), ...(effort.input.value ? {effort: effort.input.value} : {})}), () => capability);
+    options.hidden = true;
+    void api(apiPath('/api/execution/api/capabilities', {project})).then(value => {
+      if (!area.root.isConnected) return;
+      capability = value;
+      options.hidden = !value.available;
+      for (const item of asArray(value.models)) {
+        const option = node('option', '', item.id);
+        option.value = item.id;
+        model.input.append(option);
+      }
+      function populate() {
+        effort.input.replaceChildren(node('option', '', '案件設定を使う'));
+        effort.input.firstChild.value = '';
+        const entry = asArray(value.models).find(item => item.id === (model.input.value || value.defaultModel));
+        for (const code of asArray(entry?.reasoningEfforts)) {
+          const option = node('option', '', effortLabels[code] ?? code);
+          option.value = code;
+          effort.input.append(option);
+        }
+      }
+      model.input.addEventListener('change', populate);
+      populate();
+      paint();
+    }).catch(() => {
+      capability = {available: false, reason: 'API_AUTHORIZATION_REQUIRED'};
+      paint();
+    });
   }
   fetchView(memoryKey('models'), '/api/codex/models', form, (data, destination) => {
     const models = asArray(data?.data);
@@ -1596,7 +1674,7 @@ function emptyProject() {
 const screens = {dashboard, chat, codex, artifacts};
 function render(restore = true) {
   if (dom.shell.hidden) return;
-  stopRunView?.();
+  for (const stop of runViewCleanups) stop();
   mounted++;
   const intended = ui.scroll.get(routeKey());
   pendingScroll = restore ? {epoch: mounted, y: Number.isFinite(intended) ? intended : 0} : null;

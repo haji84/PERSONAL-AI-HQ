@@ -147,10 +147,14 @@ export function createOperations(directory, native, execution) {
   }
 
   return {
+    hasNativeWork(project) {
+      const row = latestScoped.get(project.id, JSON.stringify(project.cwd));
+      return Boolean(row?.threadId && row?.turnId);
+    },
     updateExecution(project, update) {
       db.exec('BEGIN IMMEDIATE');
       try {
-        if (activeRun.get(project.id)) throw problem(409, 'Codexの実行または照合が終わってから設定を変更してください。');
+        if (activeRun.get(project.id)) throw problem(409, 'Codexの実行または照合が終わるまで操作を開始できません。');
         const result = update();
         db.exec('COMMIT');
         return result;

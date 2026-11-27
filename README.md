@@ -39,6 +39,12 @@ Codexの書き込みは指定作業先のワークスペースに制限されま
 
 ダッシュボードは、このアプリから開始した最新のCodex実行と確認時刻を表示します。ブラウザーを表示している間、対象案件の新しい完了、中断、失敗が確認できると画面上に表示します。
 
+### 通常APIの隔離開発
+
+MacとNode.js 24の検証版です。Codex画面で通常APIの工程を選び、検証が通った変更ファイルを同じ受付番号から取得できます。登録済みのGitファイルとNodeテストを専用候補に複製して検証します。検証済みの変更を次の作業につなげるには、対象作業先で変更を確認してコミットします。応答や消費の確定が取れない場合は、同じ案件の再実行を保留します。
+
+通常起動ではAPI実行は無効です。試験起動は `HQ_API_EXECUTION=1`、サーバープロセスの認証情報、所有者専用の `api-execution-authority.json` を使います。登録には、単一の組織予約先に対する照合値、公式の最新付与残高と有効期限、支払・自動チャージ状況、検証済みモデル単価、案件ごとの送信・編集範囲と保護したテストを指定します。本人確認と追加費用ゼロの条件が揃い、組織予約先が一致した場合にのみAPIを呼びます。現在の実行試験は模擬プロバイダーを使い、Mac上の実編集とテストを検証しています。 [Responses API](https://developers.openai.com/api/reference/resources/responses/methods/create)
+
 ## 検証
 
 `npm test` で本人認証、案件別の履歴保存と再起動、時間・進捗計算、送信の重複防止を検証します。ChatGPTプランの自動テストは合成応答で行います。Macの既存サインインで分離した作業先の実行、追加指示、中断、再開を確認する場合は `node verification/native-codex.mjs` を使います。このコマンドは実際にCodexの利用枠を消費します。 [ChatGPTデータ書き出し](https://help.openai.com/en/articles/7260999-exporting-your-chatgpt-history-and-data) · [Codex App Server](https://learn.chatgpt.com/docs/app-server)

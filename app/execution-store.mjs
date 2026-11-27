@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { moneyMicros, normalizeSettings, resolveExecution, verifyHandover } from './execution-policy.mjs';
@@ -31,9 +32,9 @@ export class ExecutionStore {
   }
 
   #read() {
-    let text;
+    let text, info;
     try {
-      const info = fs.lstatSync(this.file);
+      info = fs.lstatSync(this.file);
       if (!info.isFile() || info.isSymbolicLink() || info.nlink > 1 || info.size > 64 * 1024 * 1024) error('STATE_INVALID');
       text = fs.readFileSync(this.file, 'utf8');
     } catch (cause) {
@@ -44,6 +45,8 @@ export class ExecutionStore {
     try { data = JSON.parse(text); } catch { error('STATE_INVALID'); }
     if (data?.version !== 1 || !data.projects || typeof data.projects !== 'object' || Array.isArray(data.projects) || !data.organizations || typeof data.organizations !== 'object' || Array.isArray(data.organizations)) error('STATE_INVALID');
     if (data.authorityId !== this.authorityId) error('AUTHORITY_MISMATCH');
+    if (data.reservationAuthority !== undefined && (typeof data.reservationAuthority !== 'string' ||
+      !hashPattern.test(data.reservationAuthority) || info.uid !== process.getuid?.() || (info.mode & 0o077))) error('STATE_INVALID');
     return data;
   }
 
@@ -94,6 +97,40 @@ export class ExecutionStore {
     return clone({ revision: project.revision, settings: project.settings, updatedAt: project.updatedAt ?? null, history: project.history });
   }
 
+  #reservationBinding(instance) {
+    if (instance === undefined) return null;
+    const directory = path.dirname(this.file);
+    const location = fs.lstatSync(directory, {bigint: true});
+    const uid = process.getuid?.();
+    if (!location.isDirectory() || uid === undefined || location.uid !== BigInt(uid) || (location.mode & 0o077n)) error('RESERVATION_AUTHORITY_UNSAFE');
+    return digest({authorityId: this.authorityId, instance, host: os.hostname(), directory: fs.realpathSync(directory),
+      file: path.basename(this.file), dev: String(location.dev), ino: String(location.ino)});
+  }
+
+  reservationBinding() {
+    return this.#reservationBinding(this.#read().reservationAuthority);
+  }
+
+  initializeReservationAuthority() {
+    return this.#change(data => {
+      data.reservationAuthority ??= digest(randomUUID());
+      return this.#reservationBinding(data.reservationAuthority);
+    });
+  }
+
+  getWork(projectId, taskId) {
+    const project = this.#project(this.#read(), projectId);
+    const operations = Object.values(project.operations);
+    const operation = taskId === undefined ? operations.at(-1) ?? null
+      : Object.hasOwn(project.operations, id(taskId)) ? project.operations[taskId] : null;
+    const checkpointOperation = project.checkpoint
+      ? operations.find(item => item.checkpointVersion === project.checkpoint.version) ?? null : null;
+    const verifiedApiOperations = taskId === undefined ? operations.filter(item => item.route === 'api' && item.status === 'completed' && item.artifactsHash)
+      .sort((a, b) => a.checkpointVersion - b.checkpointVersion) : [];
+    return clone({operation, checkpoint: project.checkpoint, checkpointOperation, verifiedApiOperations,
+      busy: operations.some(item => active.has(item.status))});
+  }
+
   updateSettings(projectId, expectedRevision, input) {
     return this.#change(data => {
       const project = this.#project(data, projectId, true);
@@ -135,7 +172,12 @@ export class ExecutionStore {
     if (typeof api.availableCreditUsd === 'number' && Number.isFinite(api.availableCreditUsd) && api.availableCreditUsd >= 0) api.availableCreditUsd = Math.max(0, moneyMicros(api.availableCreditUsd) - withheld) / 1_000_000;
     if (api.organizationId && data.organizations[api.organizationId]?.hold) api.budgetHold = true;
     const decision = resolveExecution({ settings: project.settings, task, capabilities: context.capabilities, safety, now: context.now });
-    if (decision.allowed && decision.route === 'api' && api.reservationAuthorityId !== this.authorityId) return denial('RESERVATION_AUTHORITY_MISMATCH');
+    if (decision.allowed && decision.route === 'api') {
+      const binding = this.#reservationBinding(data.reservationAuthority);
+      if (api.reservationAuthorityId !== this.authorityId || (binding !== null && api.ledgerBinding !== binding)) {
+        return denial('RESERVATION_AUTHORITY_MISMATCH');
+      }
+    }
     return decision;
   }
 
@@ -183,14 +225,45 @@ export class ExecutionStore {
       const operation = project.operations[id(taskId)];
       if (!operation || operation.executionId !== executionId) error('EXECUTION_ID_MISMATCH');
       if (operation.status !== 'reserved') return { ...denial('ALREADY_DISPATCHED'), operation };
-      if (project.revision !== operation.settingsRevision) return denial('REVISION_CONFLICT');
-      if (operation.route === 'api' && operation.organizationId !== context.safety?.api?.organizationId) return denial('CREDIT_ORGANIZATION_MISMATCH');
-      const decision = this.#resolve(data, project, operation.task, context, executionId);
-      if (!decision.allowed) return { ...decision, dispatchable: false };
-      if (decision.route !== operation.route || decision.model !== operation.model || decision.reasoningEffort !== operation.reasoningEffort || context.capabilities?.[decision.route]?.executorId !== operation.executorId || moneyMicros(decision.maxCostUsd, 'ceil') > operation.reservedMicros) return denial('DISPATCH_CONTEXT_CHANGED');
+      const decision = this.#checkDispatch(data, project, operation, context);
+      if (!decision.allowed) return decision;
       operation.status = 'running';
       operation.dispatchedAt = new Date(context.now ?? Date.now()).toISOString();
       return { allowed: true, dispatchable: true, operation };
+    });
+  }
+
+  #checkDispatch(data, project, operation, context) {
+    if (project.revision !== operation.settingsRevision) return denial('REVISION_CONFLICT');
+    if (operation.route === 'api' && operation.organizationId !== context.safety?.api?.organizationId) return denial('CREDIT_ORGANIZATION_MISMATCH');
+    const decision = this.#resolve(data, project, operation.task, context, operation.executionId);
+    if (!decision.allowed) return { ...decision, dispatchable: false };
+    if (decision.route !== operation.route || decision.model !== operation.model || decision.reasoningEffort !== operation.reasoningEffort ||
+        context.capabilities?.[decision.route]?.executorId !== operation.executorId || moneyMicros(decision.maxCostUsd, 'ceil') > operation.reservedMicros) {
+      return denial('DISPATCH_CONTEXT_CHANGED');
+    }
+    return {allowed: true, dispatchable: true};
+  }
+
+  recheckDispatched(projectId, taskId, executionId, context) {
+    const data = this.#read();
+    const project = this.#project(data, projectId);
+    const operation = project.operations[id(taskId)];
+    if (!operation || operation.executionId !== executionId) error('EXECUTION_ID_MISMATCH');
+    if (operation.status !== 'running') return denial('EXECUTION_HELD');
+    return this.#checkDispatch(data, project, operation, context);
+  }
+
+  cancelReserved(projectId, taskId, executionId, now = Date.now(), reason = 'INTERRUPTED') {
+    return this.#change(data => {
+      const project = this.#project(data, projectId);
+      const operation = project.operations[id(taskId)];
+      if (!operation || operation.executionId !== executionId) error('EXECUTION_ID_MISMATCH');
+      if (operation.status !== 'reserved') return {cancelled: false, operation};
+      operation.status = 'cancelled';
+      operation.reason = typeof reason === 'string' && /^[A-Z_]{1,64}$/.test(reason) ? reason : 'API_WORKSPACE_FAILED';
+      operation.completedAt = new Date(now).toISOString();
+      return {cancelled: true, operation};
     });
   }
 
@@ -222,6 +295,7 @@ export class ExecutionStore {
       operation.status = result.outcome;
       operation.completedAt = new Date().toISOString();
       operation.checkpointVersion = result.checkpoint.version;
+      operation.artifactsHash = result.checkpoint.artifactsHash;
       return { replayed: false, operation };
     });
   }

@@ -15,6 +15,9 @@ export function createExecutionAccess(directory, native) {
     if (workspace && (!latest.codexWrite || !latest.cwd.includes(workspace))) {
       throw problem(409, 'この案件の実行先の設定が変わりました。');
     }
+    const work = store.getWork(project.id);
+    if (work.busy) throw problem(409, '実行中または照合待ちのAPI作業があります。');
+    if (work.checkpointOperation?.route === 'api') throw problem(409, 'API作業のチェックポイントの照合が必要です。');
     const snapshot = store.getSettings(project.id);
     const {settings} = snapshot;
     if (route && !settings.allowedRoutes.includes(route)) throw problem(409, 'この作業の指定経路は案件設定で許可されていません。');
@@ -27,7 +30,7 @@ export function createExecutionAccess(directory, native) {
   }
 
   return {
-    preflight,
+    preflight, store,
     settings(project) {
       const {revision, updatedAt, settings} = store.getSettings(project.id);
       return {revision, updatedAt, settings, apiAvailable: false};
