@@ -1,4 +1,4 @@
-import {randomUUID} from 'node:crypto';
+import {createHash, randomUUID} from 'node:crypto';
 import assert from 'node:assert/strict';
 import {mkdir, mkdtemp, readFile, realpath, rm, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
@@ -7,6 +7,7 @@ import {DatabaseSync} from 'node:sqlite';
 import test from 'node:test';
 import {setTimeout as delay} from 'node:timers/promises';
 import {startOwnerApp} from '../app/server.mjs';
+import {createChatStore} from '../app/chat-store.mjs';
 import {ExecutionStore} from '../app/execution-store.mjs';
 import {ensurePrivateDirectory} from '../app/private-directory.mjs';
 
@@ -1125,4 +1126,94 @@ test('ChatGPT image send keeps the actual bytes behind the owner and conversatio
   const saved = await history.json();
   assert.deepEqual(saved.conversation.messages[0].image,turn.image);
   assert.ok(!JSON.stringify(saved).includes(image.data));
+});
+
+test('chat handoff preserves a bounded, displayed message range of a same-project export', async t => {
+  const {directory, start} = await runtimeFixture(t);
+  const projects = [{...seed.projects[0], repository: 'https://github.com/fixture-owner/known'}, {id:'other', name:'Other'}];
+  await writeFile(join(directory, 'portfolio.json'), JSON.stringify({...seed, projects}), {mode: 0o600});
+  const app = await start({codex: {async models() { assert.fail('must not start or inspect Codex'); }}});
+  const cookie = await login(app);
+  const records = Array.from({length: 44}, (_, index) => index === 41 ? '幅'.repeat(7000) : '原文-' + index);
+  const id = 'export-handoff';
+  const exportRecord = {id, title:'引き継ぎ対象', update_time:1795799000, current_node:'43',
+    mapping: Object.fromEntries(records.map((text, index) => [String(index), {
+      parent:index === 0 ? null : String(index - 1),
+      message:{author:{role:index % 2 ? 'assistant' : 'user'}, content:{parts:[text]}, create_time:1795799000 + index},
+    }]))};
+  assert.equal((await fetch(app.url + '/api/chat/import?project=example', {method:'POST',
+    headers:{cookie, Origin:app.url, 'Content-Type':'application/json'}, body:JSON.stringify([exportRecord])})).status, 200);
+  const storedReply = await fetch(app.url + '/api/chat?project=example&id=' + id, {headers:{cookie}});
+  const {conversation} = await storedReply.json();
+  const later = await (await fetch(app.url + '/api/chat?project=example&id=' + id + '&offset=40', {headers:{cookie}})).json();
+  const displayed = [...conversation.messages, ...later.conversation.messages];
+  const viewHash = through => createHash('sha256').update(JSON.stringify(displayed.slice(
+    Math.max(0, Number(through) - 40), Number(through)))).digest('hex');
+  const params = {project:'example', id, through:'2', observedAt:conversation.importedAt, viewSha256:viewHash(2)};
+  const read = (query={}, authentication=cookie) => fetch(app.url + '/api/chat/handoff?' +
+    new URLSearchParams({...params, viewSha256:viewHash(query.through ?? params.through), ...query}), {headers:{cookie:authentication}});
+  assert.equal((await read({}, '')).status, 401);
+  assert.equal((await read({project:'other'})).status, 404);
+  assert.equal((await read({observedAt:'2026-11-01T00:00:00.000Z'})).status, 409);
+  assert.equal((await read({viewSha256:'0'.repeat(64)})).status, 409);
+  for (const through of ['0','45','2.5','01','50000']) assert.equal((await read({through})).status, 400);
+  assert.equal((await fetch(app.url + '/api/chat/handoff?' + new URLSearchParams(params) + '&project=other',
+    {headers:{cookie}})).status, 400);
+  const full = await read();
+  assert.equal(full.status, 200);
+  assert.equal(full.headers.get('cache-control'), 'no-store');
+  const handoff = await full.json();
+  assert.equal(handoff.document.name, 'chatgpt-handoff.json');
+  assert.equal(handoff.sha256, createHash('sha256').update(handoff.document.text).digest('hex'));
+  assert.deepEqual(handoff.range, {start:0, end:2, hasEarlier:false, hasLater:true});
+  assert.equal(handoff.imageCount, 0);
+  const packet = JSON.parse(handoff.document.text);
+  assert.equal(packet.schemaVersion, 1);
+  assert.deepEqual(packet.project, {id:'example', goal:projects[0].goal, repository:projects[0].repository});
+  assert.deepEqual(packet.source, {id, kind:'chatgpt-export', title:conversation.title, observedAt:conversation.importedAt, viewSha256:params.viewSha256});
+  assert.deepEqual(packet.range, handoff.range);
+  assert.deepEqual(packet.messages, conversation.messages.slice(0,2));
+  const suffixReply = await read({through:'44'});
+  assert.equal(suffixReply.status, 200);
+  const suffix = await suffixReply.json();
+  assert.deepEqual(suffix.range, {start:42, end:44, hasEarlier:true, hasLater:false});
+  assert.deepEqual(JSON.parse(suffix.document.text).messages.map(message => message.text), records.slice(-2));
+  assert.equal((await read({through:'42'})).status, 413);
+});
+
+test('chat handoff preserves complete live text attachments and only includes image references', async t => {
+  const {directory, start} = await runtimeFixture(t);
+  await writeFile(join(directory, 'portfolio.json'), JSON.stringify(seed), {mode: 0o600});
+  const store = createChatStore(directory);
+  const document = {name:'要件.json', text:'原文\r\n資料'};
+  const image = {mime:'image/png', data:'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aF0kAAAAASUVORK5CYII='};
+  const model = 'fixture-model';
+  const project = 'example';
+  const {turn} = store.beginLive(project, {id:'document-turn', model, prompt:'指示', document});
+  const conversationId = turn.conversationId;
+  store.finishLive(project, turn.id, {status:'completed', text:'検証済み'});
+  const {turn: withImage} = store.beginLive(project, {id:'image-turn', conversationId, model, prompt:'画像の説明', image});
+  store.finishLive(project, withImage.id, {status:'completed', text:'確認済み'});
+  store.beginLive(project, {id:'active-turn', conversationId, model, prompt:'まだ応答中'});
+  const {conversation: displayed} = store.read(project, conversationId, 0);
+  store.close();
+  const app = await start({codex:{}});
+  const cookie = await login(app);
+  const call = through => fetch(app.url + '/api/chat/handoff?' +
+    new URLSearchParams({project, id:conversationId, through, observedAt:displayed.importedAt,
+      viewSha256:createHash('sha256').update(JSON.stringify(displayed.messages.slice(0, Number(through)))).digest('hex')}),
+    {headers:{cookie}});
+  assert.equal((await call('5')).status, 409);
+  const reply = await call('4');
+  assert.equal(reply.status, 200);
+  const handoff = await reply.json();
+  assert.deepEqual(handoff.range, {start:0, end:4, hasEarlier:false, hasLater:true});
+  assert.equal(handoff.imageCount, 1);
+  assert.equal(handoff.document.text.includes(image.data), false);
+  const packet = JSON.parse(handoff.document.text);
+  assert.equal(packet.source.kind, 'chatgpt-live');
+  assert.deepEqual(packet.messages[0].document, document);
+  assert.deepEqual(packet.messages[2].image, withImage.image);
+  assert.equal(packet.messages[2].turnId, withImage.id);
+  assert.equal(packet.messages[3].text, '確認済み');
 });

@@ -239,12 +239,12 @@ export function createChatStore(directory, {now = Date.now} = {}) {
 
   return {
     list: (project, query = '') => ({conversations: list.all({1: project, 2: query})}),
-    read(project, id, offset) {
+    read(project, id, offset, {reconcile = true} = {}) {
       const row = get.get(project, id);
       if (row) return archiveView(row, offset);
       const live = getLive.get(project, id);
       if (!live) return null;
-      expireTurnLeases(project, now());
+      if (reconcile) expireTurnLeases(project, now());
       const {history, ...details} = live;
       const snapshot = JSON.parse(history);
       const messages = snapshot.slice(offset, offset + 41);

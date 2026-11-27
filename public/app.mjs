@@ -1740,6 +1740,113 @@ function moveToDraft(project, kind, item, description) {
   location.hash = kind;
 }
 
+function chatCodexHandoff(project, conversation, isCurrent) {
+  const details = node('details', 'scope-info');
+  details.append(node('summary', '', '会話と資料をCodexへ'));
+  const status = node('p', 'small muted');
+  status.setAttribute('role', 'status');
+  const preview = node('pre', 'run-output');
+  preview.tabIndex = 0;
+  preview.hidden = true;
+  const endPicker = node('input');
+  endPicker.type = 'number';
+  endPicker.min = '1';
+  endPicker.step = '1';
+  const label = node('label', 'picker');
+  label.append(node('span', '', '最後に含める発言番号'), endPicker);
+  const refresh = button('収録範囲を確認', () => void prepare());
+  const attach = button('Codexの下書きに添付', stage);
+  attach.disabled = true;
+  let prepared;
+  let loading = false;
+  const draftKey = memoryKey('codex-draft', project);
+
+  async function prepare() {
+    if (loading || !details.open || !isCurrent()) return;
+    prepared = undefined;
+    preview.hidden = true;
+    attach.disabled = true;
+    const displayed = asArray(conversation.messages).length;
+    const through = Number(endPicker.value);
+    endPicker.max = String(displayed);
+    if (!Number.isSafeInteger(through) || through < 1 || through > displayed) {
+      status.textContent = '表示した発言の番号を指定してください。';
+      return;
+    }
+    loading = true;
+    refresh.disabled = true;
+    status.textContent = '会話と資料を照合しています…';
+    try {
+      const viewed = asArray(conversation.messages).slice(Math.max(0, through - 40), through);
+      const viewSha256 = await attachmentDigest(new TextEncoder().encode(JSON.stringify(viewed)));
+      if (!isCurrent() || !details.open || Number(endPicker.value) !== through) return;
+      const result = await api(apiPath('/api/chat/handoff',
+        {project, id: conversation.id, through, observedAt: conversation.importedAt, viewSha256}),
+        {signal: AbortSignal.timeout(8000)});
+      const {document, range, sha256, imageCount} = result ?? {};
+      if (document?.name !== 'chatgpt-handoff.json' || typeof document.text !== 'string' ||
+          !Number.isSafeInteger(range?.start) || range.start < 0 || range.start >= through || range.end !== through ||
+          !Number.isSafeInteger(imageCount) || imageCount < 0 || imageCount > range.end - range.start) {
+        throw new Error('収録範囲を確認できませんでした。');
+      }
+      const bytes = new TextEncoder().encode(document.text);
+      if (bytes.length > textDocumentLimit || await attachmentDigest(bytes) !== sha256) {
+        throw new Error('添付資料が照合結果と一致しません。');
+      }
+      const packet = JSON.parse(document.text);
+      if (packet.project?.id !== project || packet.source?.id !== conversation.id ||
+          packet.source?.observedAt !== conversation.importedAt || packet.source?.viewSha256 !== viewSha256 ||
+          packet.range?.start !== range.start || packet.range?.end !== through ||
+          asArray(packet.messages).length !== range.end - range.start) {
+        throw new Error('対象の会話と収録範囲を確認できませんでした。');
+      }
+      const digest = await attachmentDigest(bytes, document.name);
+      if (!isCurrent() || !details.open || Number(endPicker.value) !== through) return;
+      const rangeLabel = '発言 ' + (range.start + 1) + '〜' + range.end + ' を収録';
+      status.textContent = [rangeLabel, (range.hasEarlier || range.hasLater) && 'ほかの発言は会話履歴で確認',
+        imageCount && '画像' + imageCount + '件の参照を収録'].filter(Boolean).join(' · ');
+      preview.textContent = document.text;
+      preview.hidden = false;
+      prepared = {file: new File([bytes], document.name, {type: 'application/json'}), digest, rangeLabel};
+      attach.disabled = false;
+    } catch (error) {
+      if (isCurrent() && details.open) status.textContent = error.message;
+    } finally {
+      loading = false;
+      refresh.disabled = false;
+    }
+  }
+
+  function stage() {
+    if (!prepared || !details.open || !isCurrent() || selectedProject()?.codexWrite !== true ||
+        ui.capabilities.codexWrite !== true) return;
+    if (ui.runIntents.has(project) || ui.steerIntents.has(project)) {
+      status.textContent = 'Codexで保留中の受付を照合してから添付してください。';
+      return;
+    }
+    if (ui.attachmentDrafts.has(draftKey)) {
+      status.textContent = 'Codexの下書きで現在の添付を確認してください。';
+      return;
+    }
+    ui.attachmentDrafts.set(draftKey, {kind: 'document', file: prepared.file, digest: prepared.digest,
+      chatHandoffLabel: prepared.rangeLabel});
+    location.hash = 'codex';
+  }
+
+  endPicker.addEventListener('input', () => {
+    prepared = undefined;
+    attach.disabled = true;
+    preview.hidden = true;
+  });
+  details.addEventListener('toggle', () => {
+    if (!details.open) return;
+    endPicker.value = String(asArray(conversation.messages).length);
+    void prepare();
+  });
+  details.append(label, refresh, status, preview, attach);
+  return details;
+}
+
 async function chatEvents(response, visit) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -2407,6 +2514,10 @@ function chat() {
       else messages.append(load);
       updateTransfer();
       destination.append(transfer);
+      if (['chatgpt-export', 'chatgpt-live'].includes(conversation.source) && asArray(conversation.messages).length &&
+          selectedProject()?.codexWrite === true && ui.capabilities.codexWrite === true) {
+        destination.append(chatCodexHandoff(project, conversation, detailIsCurrent));
+      }
       if (apiArchive && conversation.outcome === 'completed') {
         cleanupHandoff = mountChatHandoff(destination, project, conversation, detailIsCurrent);
       }
@@ -2786,7 +2897,8 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
       const retryMessage = intention?.imageSha256 ? '再送する場合は、同じ画像を選んでください。' :
         intention?.documentSha256 ? '再送する場合は、同じファイルを選んでください。' : defaultMessage;
       attachmentInfo.textContent = attachmentMessage || (attachment ?
-        `${attachment.file.name} · ${Math.ceil(attachment.file.size / 1024)} KiB` : retryMessage);
+        [attachment.chatHandoffLabel, attachment.file.name,
+          Math.ceil(attachment.file.size / 1024) + ' KiB'].filter(Boolean).join(' · ') : retryMessage);
       removeAttachment.hidden = !attachment;
       syncCamera();
     }
@@ -3517,7 +3629,8 @@ function codex() {
     const id = ui.threadIds.get(project);
     if (displayedThread !== id) {
       displayedThread = id;
-      showControls(id ? null : undefined);
+      const handoff = ui.attachmentDrafts.get(memoryKey('codex-draft', project))?.chatHandoffLabel;
+      showControls(id && !handoff ? null : undefined);
     }
     if (!id) {
       thread.header.replaceChildren(node('h2', '', 'スレッド詳細'));

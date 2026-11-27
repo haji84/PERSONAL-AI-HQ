@@ -1,3 +1,4 @@
+import {createHash} from 'node:crypto';
 import assert from 'node:assert/strict';
 import {mkdtemp, realpath, rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
@@ -6,6 +7,7 @@ import {DatabaseSync} from 'node:sqlite';
 import test from 'node:test';
 import {createChatStore} from '../app/chat-store.mjs';
 import {chatInputLimit} from '../app/chatgpt-responses.mjs';
+import {readChatHandoff} from '../app/chat-handoff.mjs';
 
 const request = {id: 'request-1', model: 'fixture-model', prompt: '新しい質問'};
 
@@ -251,4 +253,30 @@ test('preserves an image after restart and forwards bytes only when explicitly a
   const continued = reopened.beginLive('example', {...next, id:'request-later', image});
   assert.ok(continued.messages.slice(0,-1).every(message => typeof message.content === 'string'));
   assert.deepEqual(continued.messages.at(-1).content[1], inputImage);
+});
+
+test('preparing a handoff does not reconcile expired turns or modify account history', async t => {
+  const unit = await fixture(t);
+  let now = Date.parse('2026-11-27T18:00:00.000Z');
+  const chats = unit.store({now: () => now});
+  const project = {id:'example', goal:'Prepare a bounded handoff', repository:null};
+  const finished = chats.beginLive(project.id, request).turn;
+  chats.finishLive(project.id, finished.id, {status:'completed', text:'完了'});
+  const waiting = chats.beginLive(project.id, {...request,id:'waiting-turn'}).turn;
+  const previous = new Map([finished, waiting].map(turn =>
+    [turn.id, chats.read(project.id,turn.conversationId,0).conversation]));
+  now += 11 * 60_000;
+  const db = unit.database();
+  const status = db.prepare('SELECT status FROM live_turns WHERE project=? AND id=?');
+  const params = (turn, through) => new URLSearchParams({
+    project:project.id, id:turn.conversationId, through,
+    observedAt:previous.get(turn.id).importedAt,
+    viewSha256:createHash('sha256').update(JSON.stringify(previous.get(turn.id).messages.slice(0,through))).digest('hex'),
+  });
+  assert.equal(readChatHandoff(chats,project,params(finished,2)).range.end,2);
+  assert.equal(status.get(project.id,waiting.id).status,'in_progress');
+  assert.throws(()=>readChatHandoff(chats,project,params(waiting,1)),{status:409});
+  assert.equal(status.get(project.id,waiting.id).status,'in_progress');
+  assert.equal(chats.read(project.id,waiting.conversationId,0).conversation.messages[0].status,'interrupted');
+  assert.throws(()=>readChatHandoff(chats,project,params(waiting,1)),{status:409,message:/表示中の発言が更新/});
 });

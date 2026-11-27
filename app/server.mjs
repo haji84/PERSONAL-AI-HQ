@@ -27,6 +27,7 @@ import {createCodexPeerVerifier} from './codex-peer.mjs';
 import {localSpeechAvailable, localSpeechMaxChars, synthesizeLocalSpeech} from './local-speech.mjs';
 import {createTailnetAccess, tailnetCookieName} from './tailnet-access.mjs';
 import {validatedDocument} from './text-attachment.mjs';
+import {readChatHandoff} from './chat-handoff.mjs';
 
 const root = fileURLToPath(new URL('../public/', import.meta.url));
 const assets = new Map([['/', ['index.html', 'text/html']], ['/app.mjs', ['app.mjs', 'text/javascript']],
@@ -608,6 +609,9 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       const result = id ? chats.read(project.id, id, offset) : chats.list(project.id, (target.searchParams.get('q') ?? '').slice(0, 200));
       if (!result) throw error(404, '会話を見つけられませんでした。');
       return send(response, 200, id ? apiWork.conversationView(project, result, offset) : result);
+    }
+    if (get && route === '/api/chat/handoff') {
+      return send(response, 200, readChatHandoff(chats, project, target.searchParams));
     }
     if (route === '/api/chat/live') {
       if (get) return send(response, 200, {turn: chats.readLive(project.id, target.searchParams.get('id'))});
