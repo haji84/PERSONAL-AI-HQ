@@ -93,9 +93,9 @@ async function fixture(t, onWire) {
       onWire?.(socket, event, {writeAuthority, authority, writePortfolio});
     });
   });
-  async function open() {
+  async function open(enabled = true) {
     await app?.close();
-    app = await startOwnerApp({directory, port: 0, codex: {}, apiDevelopment: {getKey: () => 'fixture-only',
+    app = await startOwnerApp({directory, port: 0, codex: {}, apiDevelopment: enabled && {getKey: () => 'fixture-only',
       realtimeConnect(url, options) {
         connections.push(url.href);
         assert.equal(url.href, 'wss://api.openai.com/v1/realtime?model=' + model);
@@ -111,8 +111,8 @@ async function fixture(t, onWire) {
   }
   await open();
   return {connections, wire, store, authority, writeAuthority, writePortfolio, ledger, open,
-    call(path = route, {id, data, auth = true, origin, forProject = project} = {}) {
-      return fetch(app.url + path + '?' + new URLSearchParams({project: forProject, ...(id ? {id} : {})}),
+    call(path = route, {id, data, auth = true, origin, forProject = project, query = {}} = {}) {
+      return fetch(app.url + path + '?' + new URLSearchParams({project: forProject, ...(id ? {id} : {}), ...query}),
         {method: data ? 'POST' : 'GET', headers: {...(auth ? {cookie} : {}),
           ...(data ? {Origin: origin ?? app.url, 'Content-Type': 'application/json'} : {})},
         ...(data ? {body: JSON.stringify(data)} : {})});
@@ -130,7 +130,7 @@ test('signed Realtime readiness and mutations respect project mode, revision, pa
   assert.equal((await f.call(route, {auth: false})).status, 401);
   assert.equal((await f.call(route, {data: request, origin: 'http://other.invalid'})).status, 403);
   const ready = await (await f.call()).json();
-  assert.deepEqual(ready, {available: true, route: 'api', model, maxInputSeconds: 10, revision: 1});
+  assert.deepEqual(ready, {available: true, route: 'api', model, maxInputSeconds: 10, reservedMicros: 1034900, revision: 1});
   assert.equal((await f.call(route, {data: {...request, revision: 0}})).status, 409);
   assert.equal((await f.call(route, {data: {...request, pcm: pcm + ' '}})).status, 400);
   assert.equal((await f.call(route, {data: {...request, pcm: Buffer.alloc(480002).toString('base64')}})).status, 400);
@@ -187,6 +187,7 @@ test('signed HTTP streams non-silent PCM and saves both receipts without re-disp
   assert.deepEqual([stored.turn.phase, stored.turn.accountedMicros, stored.turn.response.accountedMicros,
     stored.turn.transcription.accountedMicros], ['completed', 4761, 261, 4500]);
   assert.deepEqual([stored.inputTranscript, stored.outputTranscript], ['予算を確認してください', '使用量を確認しました']);
+  assert.match(stored.turn.conversationId ?? '', /^realtime\/[a-f0-9-]{36}$/);
   const wireAudio = f.wire.filter(event => event.type === 'input_audio_buffer.append');
   assert.deepEqual(wireAudio.map(event => audioDigest(event.audio)), [audioDigest(pcm)]);
   assert.equal(f.connections.length, 1);
@@ -194,11 +195,23 @@ test('signed HTTP streams non-silent PCM and saves both receipts without re-disp
   assert.ok(!saved.includes(pcm) && !saved.includes(stored.inputTranscript) && !saved.includes('fixture-only'));
   await f.open();
   assert.deepEqual(await (await f.call(route, {id: task})).json(), {turn: stored.turn});
+  const archive = await (await f.call('/api/chat', {id: stored.turn.conversationId})).json();
+  assert.equal(archive.conversation.source, 'openai-realtime');
+  assert.deepEqual(archive.conversation.messages.map(({role, text}) => [role, text]),
+    [['user', stored.inputTranscript], ['assistant', stored.outputTranscript]]);
+  const search = await (await f.call('/api/chat', {query: {q: '使用量を確認しました'}})).json();
+  assert.equal(search.conversations[0].id, stored.turn.conversationId);
+  assert.equal((await f.call('/api/chat', {id: stored.turn.conversationId, forProject: second})).status, 404);
   assert.equal((await f.call(route, {id: task, forProject: second})).status, 404);
   const replay = await events(await f.call(route, {data: request}));
   assert.deepEqual(replay, [{type: 'done', replayed: true, turn: stored.turn}]);
   assert.equal((await f.call(route, {data: {...request, pcm: Buffer.alloc(4800).toString('base64')}})).status, 409);
   assert.deepEqual(await (await f.call('/api/execution/api')).json(), {operation: null});
+  await f.open(false);
+  assert.deepEqual(await (await f.call(route, {id: task})).json(), {turn: stored.turn});
+  assert.equal((await f.call(route, {id: task, auth: false})).status, 401);
+  assert.equal((await f.call(route, {data: request})).status, 409);
+  assert.equal((await f.call('/api/chat', {id: stored.turn.conversationId})).status, 200);
   assert.equal(f.connections.length, 1);
 });
 

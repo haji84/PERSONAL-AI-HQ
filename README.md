@@ -66,6 +66,8 @@ Macの日本語システム音声が利用できる場合は、チャットに�
 
 対応ブラウザーでは、チャットとCodexの下書きに端末内で認識した日本語を入力できます。「日本語音声認識を準備」が表示されたら、選ぶとブラウザーの言語パックを準備します。「音声入力」を選んでマイクを許可すると、認識した文が下書きに加わります。編集してから通常のボタンで送信します。音声認識はブラウザー内で実行します。 [Web Speech API](https://webaudio.github.io/web-speech-api/#speechrecognition)
 
+音声APIの条件が揃った案件では、チャットの「音声会話（API）」で、予約上限を確認してから録音・送信し、応答をストリーミング再生できます。「文字のみ」を選ぶと応答音声の再生を省けます。音声を中断でき、完了した入力・応答の文字起こしは案件の履歴に保存されます。音声APIを無効にした後も、保存済みの受付番号から使用量を確認できます。録音データは履歴に保存しません。
+
 検証用のChatGPTテキスト機能は、FileVaultで保護されたMacの非公開実行ディレクトリを使い、`HQ_CHATGPT_PLAN=1 npm start` で有効にします。本人サインイン後のチャット画面からOpenAIの認証画面を開き、利用するChatGPTプランを承認できます。取得できたモデルだけを表示し、明示的に選んだ同一案件の会話を引き継げます。応答の途中で通信が切れた場合は、画面の受付番号で保存済みの応答を確認できます。 [Sign in with ChatGPT](https://developers.openai.com/siwc/token-sharing-open-source/sign-in)
 
 ChatGPTプランで相談するときは、UTF-8のテキスト、Markdown、CSV、JSONの資料を16 KiBまで1件添付できます。画像入力を確認したモデルでは、PNG、JPEG、WebPを512 KiBまで1枚添付できます。対応ブラウザーのカメラでも撮影でき、撮った画像は送信するまで下書きにあります。画像と資料の原本は同じ案件の会話履歴で開けます。前の画像をもう一度使うときは「この画像を下書きに添付」を選びます。再読込後に未受付の送信を再開するときは、元の画像、または同じ名前と内容の資料を選び直し、元の受付番号を使います。 [画像入力の対応範囲](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations)
@@ -105,6 +107,8 @@ Macの成果物画面に載せるファイルは、同じ完了記録に `shareA
 案件で契約内のCodexを許可し、照合が通った会話から、次の指示を入力して「引継いでCodexを開始」を選べます。送信直前に要求正本と作業結果、設定、契約内利用枠を再確認します。開始後は同じ会話画面で実行状態を確認し、元のCodexスレッドで続きを実行できます。
 
 通常起動ではAPI実行は無効です。試験起動は `HQ_API_EXECUTION=1`、サーバープロセスの認証情報、所有者専用の `api-execution-authority.json` を使います。登録には、単一の組織予約先に対する照合値、公式の最新付与残高と有効期限、支払・自動チャージ状況、検証済みモデル単価、案件ごとの送信・編集範囲と保護したテストを指定します。本人確認と追加費用ゼロの条件が揃い、組織予約先が一致した場合にのみAPIを呼びます。現在の実行試験は模擬プロバイダーを使い、Mac上の実編集とテストを検証しています。 [Responses API](https://developers.openai.com/api/reference/resources/responses/methods/create)
+
+音声APIの登録には同じ設定内の `realtimeVoice` を使います。`projects` に許可した案件IDを指定し、`model`、`voice`、`transcriptionModel`、`contextTokens`、`maxInputSeconds`、`maxOutputTokens`、`rates`、`transcription` を設定します。現候補は GPT‑Realtime‑1.5 と GPT‑Transcribe の組み合わせを照合します。音声応答と入力文字起こしの使用量を別々に受け取り、案件予算と組織の予約先を通常APIと共有します。時間課金の文字起こしは保守的に1分単位で予算へ計上します。請求の確定にはプロバイダー側の記録を使います。既存開発経路の照合が必要な案件は音声の開始を保留します。 [GPT‑Realtime‑1.5](https://developers.openai.com/api/docs/models/gpt-realtime-1.5) [GPT‑Transcribe](https://developers.openai.com/api/docs/models/gpt-transcribe)
 
 ## 検証
 

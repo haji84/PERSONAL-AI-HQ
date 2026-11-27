@@ -27,7 +27,7 @@ function decodeInput(input) {
   return audio;
 }
 
-export function createRealtimeExecution({directory, store, withProjectWorkLock, hasNativeWork,
+export function createRealtimeExecution({directory, store, conversations, withProjectWorkLock, hasNativeWork,
   getKey = () => process.env.OPENAI_API_KEY, readAuthority, connect}) {
   const jobs = new Map();
   let closing = false;
@@ -56,18 +56,25 @@ export function createRealtimeExecution({directory, store, withProjectWorkLock, 
     return {key, authority, config, task, context};
   }
 
-  function view(operation) {
+  function view(operation, projectId) {
     if (operation?.kind !== kind) return null;
     const job = jobs.get(operation.executionId);
     const phase = ['reserved', 'running'].includes(operation.status) ?
       (job ? job.stopping ? 'interrupting' : operation.status : 'unconfirmed') :
       ['uncertain', 'awaiting_settlement'].includes(operation.status) ? 'unconfirmed' : operation.status;
     const billing = operation.voiceSettlement;
+    let conversationId = null;
+    if (operation.status === 'completed') {
+      const archive = `realtime/${operation.executionId}`;
+      try {
+        if (conversations.read(projectId, archive, 0)?.conversation.source === 'openai-realtime') conversationId = archive;
+      } catch { /* The usage receipt remains usable when the transcript store is unavailable. */ }
+    }
     return {id: operation.taskId, route: 'api', model: operation.model, phase, startedAt: operation.dispatchedAt ?? null,
       updatedAt: operation.completedAt ?? operation.settlementObservedAt ?? operation.createdAt,
       reason: operation.reason ?? (phase === 'unconfirmed' ? 'REALTIME_VOICE_SETTLEMENT_UNKNOWN' : null),
       accountedMicros: operation.completedAt ? operation.costMicros : null,
-      response: billing?.response ?? null, transcription: billing?.transcription ?? null};
+      response: billing?.response ?? null, transcription: billing?.transcription ?? null, conversationId};
   }
 
   async function run(project, job, operation, initial, audio, signedIn, emit) {
@@ -141,10 +148,17 @@ export function createRealtimeExecution({directory, store, withProjectWorkLock, 
     if (!marked) {
       const {operation: cancelled} = store.cancelReserved(project.id, operation.taskId, operation.executionId,
         Date.now(), outcome.reason);
-      return {turn: view(cancelled)};
+      return {turn: view(cancelled, project.id)};
     }
     const settled = store.recordRealtimeOutcome({...identifiers, ...outcome}).operation;
-    return {turn: view(settled), ...(result && settled.status === 'completed' ?
+    const completed = result && settled.status === 'completed';
+    if (completed) {
+      try {
+        conversations.saveRealtime(project.id, {id: settled.executionId, model: settled.model, inputTranscript: result.inputTranscript,
+          outputTranscript: result.outputTranscript, startedAt: settled.dispatchedAt, completedAt: settled.completedAt});
+      } catch { /* A transcript failure does not settle or dispatch the usage a second time. */ }
+    }
+    return {turn: view(settled, project.id), ...(completed ?
       {inputTranscript: result.inputTranscript, outputTranscript: result.outputTranscript} : {})};
   }
 
@@ -162,10 +176,11 @@ export function createRealtimeExecution({directory, store, withProjectWorkLock, 
         const result = store.previewRealtime(project.id, task, context);
         if (!result.allowed) throw problem(409, result.code);
         return {available: true, route: 'api', model: config.model, maxInputSeconds: config.maxInputSeconds,
+          reservedMicros: result.reservedMicros,
           revision: store.getSettings(project.id).revision};
       } catch (cause) { return {available: false, reason: safeReason(cause)}; }
     },
-    read(project, id) { return {turn: view(read(project, id))}; },
+    read(project, id) { return {turn: view(read(project, id), project.id)}; },
     start(project, input, {signedIn, emit}) {
       if (!signedIn()) throw problem(401, 'REALTIME_VOICE_SIGN_IN_REQUIRED');
       const audio = decodeInput(input);
@@ -176,7 +191,7 @@ export function createRealtimeExecution({directory, store, withProjectWorkLock, 
           if (previous.kind !== kind || previous.instructionDigest !== instructionDigest || previous.settingsRevision !== input.revision) {
             throw problem(409, 'TASK_ID_CONFLICT');
           }
-          return {replayed: true, turn: view(previous)};
+          return {replayed: true, turn: view(previous, project.id)};
         }
         const current = scope(project, signedIn);
         if (audio.length > current.config.maxInputSeconds * bytesPerSecond) throw problem(400, 'REALTIME_VOICE_INVALID_AUDIO');
@@ -193,14 +208,14 @@ export function createRealtimeExecution({directory, store, withProjectWorkLock, 
       jobs.set(operation.executionId, job);
       job.done = Promise.resolve().then(() => run(project, job, operation, current, audio, signedIn, emit))
         .finally(() => jobs.delete(operation.executionId));
-      return {replayed: false, turn: view(operation), done: job.done, disconnect: () => job.stop()};
+      return {replayed: false, turn: view(operation, project.id), done: job.done, disconnect: () => job.stop()};
     },
     interrupt(project, input) {
       if (!Number.isSafeInteger(input?.heardMs) || input.heardMs < 0 || input.heardMs > 120000 ||
           Object.keys(input).length !== 2) throw problem(400, 'REALTIME_VOICE_TASK_INVALID');
       const operation = read(project, input.id);
       jobs.get(operation.executionId)?.stop(input.heardMs);
-      return {turn: view(operation)};
+      return {turn: view(operation, project.id)};
     },
     async close() {
       closing = true;

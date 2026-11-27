@@ -36,6 +36,8 @@ const root = fileURLToPath(new URL('../public/', import.meta.url));
 const assets = new Map([['/', ['index.html', 'text/html']], ['/app.mjs', ['app.mjs', 'text/javascript']],
   ['/dictation.mjs', ['dictation.mjs', 'text/javascript']],
   ['/codex-camera.mjs', ['codex-camera.mjs', 'text/javascript']],
+  ['/realtime-audio.mjs', ['realtime-audio.mjs', 'text/javascript']],
+  ['/realtime-capture-worklet.mjs', ['realtime-capture-worklet.mjs', 'text/javascript']],
   ['/app.css', ['app.css', 'text/css']]]);
 const defaultRuntime = process.platform === 'win32'
   ? join(process.env.LOCALAPPDATA ?? join(homedir(), 'AppData', 'Local'), 'PersonalAIHQ', 'integration')
@@ -225,7 +227,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
     directory, store: execution.store, conversations: chats, hasNativeWork: operations.hasNativeWork, hasActiveWork: operations.hasActiveWork,
     completedNativeSource: operations.completedSource, readHandoverTurn: (...args) => native.readHandoverTurn?.(...args),
     withProjectWorkLock});
-  const realtime = createRealtimeExecution({directory, store: execution.store, withProjectWorkLock,
+  const realtime = createRealtimeExecution({directory, store: execution.store, conversations: chats, withProjectWorkLock,
     hasNativeWork: operations.hasNativeWork, getKey: apiOptions.getKey, readAuthority: apiOptions.readAuthority,
     connect: apiOptions.realtimeConnect});
   const portfolioExecution = createPortfolioExecution(directory,execution.store,operations,apiWork,apiEnabled);
@@ -667,13 +669,15 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       if (post) return liveChat(project, await jsonBody(request, 768 * 1024), response);
     }
     if (route === '/api/chat/realtime' || route === '/api/chat/realtime/interrupt') {
-      if (!apiEnabled) throw error(409, apiMessages.API_AUTHORIZATION_REQUIRED);
       if (target.searchParams.getAll('project').length !== 1 || target.searchParams.getAll('id').length > 1) {
         throw error(400, '対象の音声操作を一件指定してください。');
       }
       if (!signedIn()) throw error(401, 'サインインが必要です。');
-      if (get && route === '/api/chat/realtime') return send(response, 200, target.searchParams.has('id')
-        ? realtime.read(project, target.searchParams.get('id')) : realtime.available(project, signedIn));
+      if (get && route === '/api/chat/realtime' && target.searchParams.has('id')) {
+        return send(response, 200, realtime.read(project, target.searchParams.get('id')));
+      }
+      if (!apiEnabled) throw error(409, apiMessages.API_AUTHORIZATION_REQUIRED);
+      if (get && route === '/api/chat/realtime') return send(response, 200, realtime.available(project, signedIn));
       if (post && route === '/api/chat/realtime' && !target.searchParams.has('id')) {
         return realtimeChat(project, await jsonBody(request, realtimeBodyLimit), response, signedIn);
       }

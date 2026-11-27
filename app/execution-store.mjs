@@ -362,7 +362,7 @@ export class ExecutionStore {
     const project = this.#project(data, projectId, {includeInitial: true});
     if (Object.values(project.operations).some(operation => active.has(operation.status))) return denial('PROJECT_BUSY');
     const result = this.#prepareAdmission(data, project, task, context, true);
-    return result.allowed ? {allowed: true} : result;
+    return result.allowed ? {allowed: true, reservedMicros: moneyMicros(result.decision.maxCostUsd, 'ceil')} : result;
   }
 
   prepareDispatch(request, context) {

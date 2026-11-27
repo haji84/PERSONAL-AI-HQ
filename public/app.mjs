@@ -1,5 +1,6 @@
 import {abortLocalDictation, createLocalDictation} from './dictation.mjs';
 import {createCodexCamera} from './codex-camera.mjs';
+import {openRealtimeAudio} from './realtime-audio.mjs';
 
 const pages = {
   dashboard: 'ダッシュボード',
@@ -60,6 +61,7 @@ const ui = {
   runIntents: new Map(Object.entries(savedTab.runIntents ?? {})),
   steerIntents: new Map(Object.entries(savedTab.steerIntents ?? {})),
   chatTurns: new Map(Object.entries(savedTab.chatTurns ?? {})),
+  realtimeTurns: new Map(Object.entries(savedTab.realtimeTurns ?? {})),
   chatIntents: new Map(Object.entries(savedTab.chatIntents ?? {})),
   registrationIntents: new Map(Object.entries(savedTab.registrationIntents ?? {})),
 };
@@ -84,7 +86,7 @@ const codexRecordId = /^[a-z0-9_-]{1,160}$/i;
 const nativeWatchLimit = 3;
 const nativeWatchAge = 60000;
 const chatSourceLabels = {'chatgpt-export': 'ChatGPTの書き出し', 'chatgpt-live': 'ChatGPTプラン',
-  'api-development': '通常APIの開発', 'codex-history': 'Codex'};
+  'api-development': '通常APIの開発', 'openai-realtime': '音声会話（通常API）', 'codex-history': 'Codex'};
 let requestSequence = 0;
 let portfolioPollRunning = false;
 let dashboardExecutionVersion = 0;
@@ -111,6 +113,7 @@ function storeTab() {
     runIntents: Object.fromEntries(ui.runIntents),
     steerIntents: Object.fromEntries(ui.steerIntents),
     chatTurns: Object.fromEntries(ui.chatTurns),
+    realtimeTurns: Object.fromEntries(ui.realtimeTurns),
     chatIntents: Object.fromEntries(ui.chatIntents),
     registrationIntents: Object.fromEntries(ui.registrationIntents),
   });
@@ -2130,6 +2133,289 @@ async function chatEvents(response, visit) {
   } finally { reader.releaseLock(); }
 }
 
+function realtimeComposer(project, onConversation) {
+  const area = panel('音声会話（API）');
+  const readOnly = ui.capabilities.realtimeVoice !== true;
+  const status = node('p', 'small muted', readOnly ? '保存済みの音声受付を確認できます。' : '音声APIの利用条件を確認しています。');
+  status.setAttribute('role', 'status');
+  const actions = node('div', 'run-actions');
+  const record = button('録音を開始', () => void (phase === 'recording' ? finish() : start()));
+  const discard = button('録音を破棄', () => {
+    discardAudio();
+    phase = 'idle';
+    status.textContent = '録音を破棄しました。';
+    paint();
+  });
+  const submit = button('音声をAPIに送る', () => void send(), false);
+  const stop = button('音声応答を中断', () => void interrupt());
+  const refresh = button('利用条件を確認', () => void sync());
+  const check = button('前の音声の受付を確認', () => void checkReceipt());
+  const openHistory = button('音声の履歴を開く', () => { if (archive) onConversation(archive); });
+  const outputMode = node('select');
+  for (const [value, label] of [['audio', '音声と文字'], ['text', '文字のみ']]) {
+    const option = node('option', '', label);
+    option.value = value;
+    outputMode.append(option);
+  }
+  const mode = node('label', 'picker');
+  mode.append(node('span', '', '応答の表示'), outputMode);
+  const inputText = node('pre', 'run-output');
+  inputText.setAttribute('aria-label', '入力の文字起こし');
+  const answer = node('pre', 'run-output');
+  answer.setAttribute('aria-label', '音声応答の文字起こし');
+  actions.append(record, submit, stop, discard, check, openHistory, refresh);
+  area.body.append(status, mode, actions, inputText, answer);
+
+  const base = '/api/chat/realtime';
+  const lifetime = new AbortController();
+  const usd = new Intl.NumberFormat('ja-JP', {style: 'currency', currency: 'USD', maximumFractionDigits: 6});
+  const active = () => !lifetime.signal.aborted && area.root.isConnected && ui.project === project && ui.view === 'chat';
+  let permission;
+  let phase = 'idle';
+  let audio;
+  let mic;
+  let upload;
+  let pcm;
+  let turnId;
+  let archive;
+  let checking = false;
+  let interrupting = false;
+  const reasons = {
+    REALTIME_VOICE_AUTHORITY_REQUIRED: 'この案件の音声APIの利用条件を確認してください。',
+    REALTIME_VOICE_TARIFF_UNVERIFIED: '公式モデルと料金の上限を確認できません。',
+    API_CREDIT_UNVERIFIED: '追加費用ゼロの条件と有効な組織残高を確認できません。',
+    HANDOVER_REQUIRED: '前の開発経路の記録を照合する必要があります。',
+    ROUTE_NOT_ALLOWED: 'この案件の実行設定では、音声APIを利用できません。',
+    PROJECT_BUSY: '進行中の作業または確認待ちの使用量があります。',
+    PROJECT_BUDGET_REQUIRED: 'この案件のAPI上限を設定してください。',
+    PROJECT_BUDGET_EXCEEDED: 'この案件の予算内に音声を予約できません。',
+    SHARED_CREDIT_INSUFFICIENT: '組織のAPI特典残高内に音声を予約できません。',
+    BUDGET_RECONCILIATION_REQUIRED: '組織のAPI使用量の照合が必要です。',
+    EXECUTION_HELD: 'この案件の実行は保留中です。',
+  };
+
+  function paint() {
+    const preparing = ['opening', 'recording', 'finishing', 'prepared'].includes(phase);
+    const receiving = ['sending', 'playing'].includes(phase);
+    record.textContent = phase === 'recording' ? '録音を止める' : '録音を開始';
+    record.hidden = !permission?.available || (!['idle', 'recording'].includes(phase));
+    record.disabled = checking;
+    discard.hidden = !preparing;
+    submit.hidden = phase !== 'prepared';
+    submit.disabled = !pcm?.byteLength;
+    stop.hidden = !receiving;
+    stop.disabled = interrupting;
+    mode.hidden = !permission?.available;
+    outputMode.disabled = receiving;
+    refresh.hidden = readOnly || phase !== 'idle';
+    refresh.disabled = checking;
+    check.hidden = !ui.realtimeTurns.has(project) || phase !== 'idle';
+    check.disabled = checking;
+    openHistory.hidden = !archive || receiving;
+    inputText.hidden = !inputText.textContent;
+    answer.hidden = !answer.textContent;
+  }
+
+  function discardAudio() {
+    mic?.abort();
+    audio?.close();
+    mic = undefined;
+    audio = undefined;
+    pcm = undefined;
+  }
+
+  function allowedText() {
+    if (!permission?.available) return reasons[permission?.reason] ?? apiWorkMessages[permission?.reason] ?? '音声APIを利用できません。';
+    return `${permission.model} · 最大${permission.maxInputSeconds}秒 · 1回の予約上限 ${usd.format(permission.reservedMicros / 1e6)}`;
+  }
+
+  async function sync(report = true) {
+    if (readOnly || checking || phase !== 'idle') return;
+    checking = true;
+    paint();
+    try {
+      const next = await api(apiPath(base, {project}), {signal: lifetime.signal});
+      if (!active()) return;
+      permission = next;
+      if (report) status.textContent = allowedText();
+    } catch (error) {
+      permission = undefined;
+      if (active() && report) status.textContent = error.message;
+    } finally { checking = false; if (active()) paint(); }
+  }
+
+  async function start() {
+    if (!active() || phase !== 'idle' || !permission?.available || document.hidden) return;
+    const controller = new AbortController();
+    mic = controller;
+    phase = 'opening';
+    status.textContent = 'マイクの利用を確認しています。';
+    inputText.textContent = '';
+    answer.textContent = '';
+    archive = undefined;
+    stopSpeech();
+    abortLocalDictation();
+    paint();
+    try {
+      const opened = await openRealtimeAudio({maxSeconds: permission.maxInputSeconds, signal: controller.signal,
+        onLimit: () => { if (mic === controller) void finish(); }});
+      if (!active() || mic !== controller || document.hidden) { opened.close(); return; }
+      audio = opened;
+      phase = 'recording';
+      status.textContent = '録音中です。話し終えたら録音を止めてください。';
+    } catch (error) {
+      if (!active() || mic !== controller) return;
+      discardAudio();
+      phase = 'idle';
+      status.textContent = error.message;
+    }
+    paint();
+  }
+
+  async function finish() {
+    if (!active() || phase !== 'recording' || !audio) return;
+    const recording = audio;
+    phase = 'finishing';
+    paint();
+    try {
+      const captured = await recording.finish();
+      if (!active() || audio !== recording) return;
+      pcm = captured;
+      phase = 'prepared';
+      status.textContent = `${(captured.byteLength / 48000).toFixed(1)}秒の音声を録音しました。送信を押すと音声APIに渡します。`;
+    } catch (error) {
+      if (!active() || audio !== recording) return;
+      discardAudio();
+      phase = 'idle';
+      status.textContent = error.message;
+    }
+    paint();
+  }
+
+  function showTurn(turn) {
+    archive = /^realtime\/[a-f0-9-]{36}$/.test(turn?.conversationId ?? '') ? turn.conversationId : undefined;
+    const reason = reasons[turn?.reason] ?? apiWorkMessages[turn?.reason];
+    const notes = {completed: archive ? '文字起こしをこの案件の履歴に保存しました。' : '音声応答が完了しました。文字履歴の保存は確認できません。',
+      cancelled: '開始前に中止しました。', interrupted: '音声応答を中断しました。', failed: '音声応答を確認できませんでした。',
+      unconfirmed: '使用量の確認待ちです。同じ音声の再送は行いません。', running: '音声APIが応答中です。',
+      interrupting: '音声APIに中断を要求しました。'};
+    status.textContent = (notes[turn?.phase] ?? '音声の状態を確認できません。') + (reason ? ' ' + reason : '');
+    if (Number.isSafeInteger(turn?.accountedMicros)) status.textContent += ` 予算への計上 ${usd.format(turn.accountedMicros / 1e6)}`;
+  }
+
+  async function checkReceipt() {
+    const id = ui.realtimeTurns.get(project);
+    if (!active() || !id || phase !== 'idle' || checking) return;
+    checking = true;
+    paint();
+    try {
+      const {turn} = await api(apiPath(base, {project, id}), {signal: lifetime.signal});
+      if (active()) showTurn(turn);
+    } catch (error) { if (active()) status.textContent = error.message; }
+    finally { checking = false; if (active()) paint(); }
+  }
+
+  async function send() {
+    if (!active() || phase !== 'prepared' || !pcm || document.hidden) return;
+    const controller = new AbortController();
+    upload = controller;
+    const playback = audio;
+    const withAudio = outputMode.value === 'audio';
+    phase = 'sending';
+    turnId = crypto.randomUUID();
+    ui.realtimeTurns.set(project, turnId);
+    storeTab();
+    const payload = JSON.stringify({id: turnId, revision: permission.revision, pcm: bytesBase64(pcm)});
+    pcm = undefined;
+    status.textContent = '音声APIの受付を確認しています。';
+    paint();
+    try {
+      const response = await requestOwner(apiPath(base, {project}), {method: 'POST', signal: controller.signal,
+        headers: {'Content-Type': 'application/json'}, body: payload, cache: 'no-store'});
+      if (response.status === 401) endSession();
+      if (!response.ok) throw new Error((await response.json().catch(() => null))?.error ?? '音声応答を開始できませんでした。');
+      let done = false;
+      await chatEvents(response, event => {
+        if (!active() || upload !== controller) return;
+        if (event.type === 'started') status.textContent = '音声APIが応答中です。';
+        if (event.type === 'audio' && withAudio && !interrupting) playback.play(event.pcm);
+        if (event.type === 'transcript' && !interrupting && typeof event.text === 'string') answer.textContent += event.text;
+        if (event.type === 'done') {
+          done = true;
+          if (typeof event.inputTranscript === 'string') inputText.textContent = event.inputTranscript;
+          if (typeof event.outputTranscript === 'string') answer.textContent = event.outputTranscript;
+          showTurn(event.turn);
+          if (event.turn?.phase !== 'completed') playback.stopPlayback();
+        }
+        paint();
+      });
+      if (!active() || upload !== controller) return;
+      if (!done) throw new Error('音声の接続が途切れました。前の受付から使用量を確認できます。');
+      phase = 'playing';
+      paint();
+      if (withAudio) await playback.waitForPlayback();
+    } catch (error) {
+      if (active() && upload === controller) status.textContent = controller.signal.aborted ?
+        '音声の受信を終了しました。前の受付から状態を確認できます。' : error.message;
+    } finally {
+      controller.abort();
+      if (upload === controller) {
+        upload = undefined;
+        interrupting = false;
+        discardAudio();
+        phase = 'idle';
+        if (active()) { paint(); void sync(false); }
+      }
+    }
+  }
+
+  async function interrupt() {
+    if (!active() || interrupting || !['sending', 'playing'].includes(phase)) return;
+    interrupting = true;
+    const heardMs = audio?.stopPlayback() ?? 0;
+    if (phase === 'playing') return;
+    const controller = upload;
+    status.textContent = '音声APIに中断を要求しています。';
+    paint();
+    try {
+      const {turn} = await api(apiPath(base + '/interrupt', {project}), {method: 'POST', signal: lifetime.signal,
+        headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id: turnId, heardMs})});
+      if (active() && upload === controller) showTurn(turn);
+    } catch {
+      controller?.abort();
+    }
+  }
+
+  function leaveAudio() {
+    if (phase === 'idle') return;
+    if (upload) {
+      upload.abort();
+      discardAudio();
+    }
+    else {
+      discardAudio();
+      phase = 'idle';
+      status.textContent = '画面を離れたため、録音を破棄しました。';
+      paint();
+    }
+  }
+  function visibility() { if (document.hidden) leaveAudio(); }
+  function cleanup() {
+    lifetime.abort();
+    upload?.abort();
+    discardAudio();
+    document.removeEventListener('visibilitychange', visibility);
+    window.removeEventListener('pagehide', leaveAudio);
+    runViewCleanups.delete(cleanup);
+  }
+  document.addEventListener('visibilitychange', visibility);
+  window.addEventListener('pagehide', leaveAudio);
+  runViewCleanups.add(cleanup);
+  paint();
+  void sync();
+  return area.root;
+}
+
 function planComposer(project, onConversation) {
   const area = panel('ChatGPTに相談');
   const status = node('p', 'muted small', 'ChatGPTプランの状態を確認中…');
@@ -2395,7 +2681,7 @@ function planComposer(project, onConversation) {
       return;
     }
     const conversationId = draftConversationId() ?? undefined;
-    if (conversationId && /^(?:api|codex)\//.test(conversationId)) {
+    if (conversationId && /^(?:api|codex|realtime)\//.test(conversationId)) {
       status.textContent = '別の経路の記録をChatGPTプランに引き継ぐには、作業の照合が必要です。';
       return;
     }
@@ -2440,7 +2726,7 @@ function planComposer(project, onConversation) {
           status.textContent = '画像の送信を保留しました。相談先を確認して同じ受付番号を使えます。';
           return;
         }
-        payload.image = {mime: attachment.file.type, data: imageBase64(bytes)};
+        payload.image = {mime: attachment.file.type, data: bytesBase64(bytes)};
       }
       const response = await requestOwner(apiPath('/api/chat/live', {project}), {method: 'POST',
         headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload),
@@ -2849,18 +3135,20 @@ function chat() {
   if (ui.capabilities.chatImport === true) collection.root.append(importSection(project));
   const current = node('div', 'stack');
   current.append(thread.root);
+  function selectConversation(id) {
+    if (ui.view !== 'chat' || ui.project !== project || !layout.isConnected) return;
+    explicitSelection = true;
+    ui.chatIds.set(project, id);
+    storeTab();
+    evictChats(project);
+    showChatDetails();
+    searchChats(search.value);
+  }
   if (ui.capabilities.chatgptPlan === true) {
-    plan = planComposer(project, id => {
-      if (ui.view !== 'chat' || ui.project !== project || !layout.isConnected) return;
-      explicitSelection = true;
-      ui.chatIds.set(project, id);
-      storeTab();
-      evictChats(project);
-      showChatDetails();
-      searchChats(search.value);
-    });
+    plan = planComposer(project, selectConversation);
     current.append(plan.root);
   }
+  if (ui.capabilities.realtimeVoice === true || ui.realtimeTurns.has(project)) current.append(realtimeComposer(project, selectConversation));
   if (ui.capabilities.apiDevelopment === true) current.append(adviceHost);
   layout.append(collection.root, current, chatDevelopmentPanel(details));
   dom.content.append(layout);
@@ -2929,7 +3217,7 @@ async function attachmentDigest(bytes, filename = '') {
   return Array.from(new Uint8Array(hash), byte => byte.toString(16).padStart(2, '0')).join('');
 }
 
-function imageBase64(bytes) {
+function bytesBase64(bytes) {
   const characters = [];
   for (let offset = 0; offset < bytes.length; offset += 16384) {
     characters.push(String.fromCharCode(...bytes.subarray(offset, offset + 16384)));
@@ -3301,7 +3589,7 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
         const bytes = new Uint8Array(await file.arrayBuffer());
         if (await attachmentDigest(bytes, documentSha256 ? file.name : '') !== digest) throw new Error('送信する添付の内容が変わりました。');
         if (!isCurrent()) return;
-        if (imageSha256) request.image = {mime: file.type, data: imageBase64(bytes)};
+        if (imageSha256) request.image = {mime: file.type, data: bytesBase64(bytes)};
         else request.document = {name: file.name, text: documentDecoder.decode(bytes)};
       }
       const result = await api(apiPath(endpoint, {project}), {

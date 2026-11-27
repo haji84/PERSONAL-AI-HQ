@@ -39,10 +39,12 @@ const liveLease = 10 * 60 * 1000;
 const liveStatuses = new Set(['completed', 'failed', 'incomplete', 'aborted', 'interrupted']);
 const storeError = (status, code, message) => Object.assign(new Error(message), {status, code});
 const developmentSource = 'api-development';
+const voiceSource = 'openai-realtime';
+const receiptIdPattern = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const developmentStatuses = new Set(['completed', 'failed', 'interrupted', 'unconfirmed']);
 
 function developmentId(id) {
-  if (typeof id !== 'string' || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(id)) {
+  if (typeof id !== 'string' || !receiptIdPattern.test(id)) {
     throw storeError(400, 'INVALID_DEVELOPMENT_RECEIPT', 'API作業の受付番号を確認できません。');
   }
   return `api/${id}`;
@@ -59,8 +61,9 @@ function isoTime(value) {
 function archiveView(row, offset = 0) {
   const {messages: saved, ...details} = row;
   const parsed = JSON.parse(saved);
-  const {model, outcome, messages} = row.source === developmentSource ? parsed : {messages: parsed};
-  return {conversation: {...details, ...(row.source === developmentSource ? {model, outcome} : {}), messages: messages.slice(offset, offset + 40)},
+  const structured = row.source === developmentSource || row.source === voiceSource;
+  const {model, outcome, messages} = structured ? parsed : {messages: parsed};
+  return {conversation: {...details, ...(structured ? {model, outcome} : {}), messages: messages.slice(offset, offset + 40)},
     nextOffset: offset + 40 < messages.length ? offset + 40 : null};
 }
 
@@ -146,6 +149,8 @@ export function createChatStore(directory, {now = Date.now} = {}) {
     WHERE conversations.source='chatgpt-export' AND excluded.modified > conversations.modified`);
   const insertDevelopment = db.prepare(`INSERT INTO conversations (project,id,title,imported_at,modified,messages,source)
     VALUES (?,?,?,?,?,?,'api-development')`);
+  const insertVoice = db.prepare(`INSERT INTO conversations (project,id,title,imported_at,modified,messages,source)
+    VALUES (?,?,?,?,?,?,'openai-realtime')`);
   const finalizeDevelopment = db.prepare(`UPDATE conversations SET imported_at=?,modified=?,messages=?
     WHERE project=? AND id=? AND source='api-development'`);
   const list = db.prepare(`SELECT id,title,importedAt,source FROM (
@@ -300,6 +305,26 @@ export function createChatStore(directory, {now = Date.now} = {}) {
         if (text) messages.push({role: 'assistant', text, createdAt: updatedAt});
         finalizeDevelopment.run(updatedAt, time, JSON.stringify({model, outcome, messages}), project, archive);
         return archiveView(get.get(project, archive));
+      });
+    },
+    saveRealtime(project, {id, model, inputTranscript, outputTranscript, startedAt, completedAt}) {
+      const time = isoTime(completedAt);
+      if (typeof id !== 'string' || !receiptIdPattern.test(id) || typeof model !== 'string' || !chatModelPattern.test(model) ||
+          ![inputTranscript, outputTranscript].every(value => typeof value === 'string' && value.length <= 12000) ||
+          isoTime(startedAt) > time) throw storeError(400, 'INVALID_REALTIME_VOICE_ARCHIVE', '音声の文字起こしを確認できません。');
+      const messages = [{role: 'user', text: inputTranscript, createdAt: startedAt},
+        {role: 'assistant', text: outputTranscript, createdAt: completedAt}].filter(message => message.text.trim());
+      if (!messages.length) return null;
+      const archive = `realtime/${id}`;
+      const encoded = JSON.stringify({model, outcome: 'completed', messages});
+      return inTransaction(() => {
+        const previous = get.get(project, archive);
+        if (previous) {
+          if (previous.source !== voiceSource || previous.messages !== encoded || previous.importedAt !== completedAt) {
+            throw storeError(409, 'REALTIME_VOICE_ARCHIVE_CONFLICT', '保存済みの音声履歴を照合できません。');
+          }
+        } else insertVoice.run(project, archive, title(messages[0].text), completedAt, time, encoded);
+        return archive;
       });
     },
     hasActiveLive: project => Boolean(activeProject.get(project, now())),
