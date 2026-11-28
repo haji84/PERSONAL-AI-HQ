@@ -130,7 +130,7 @@ test('the checked Codex result anchors a Realtime conversation without changing 
   let beforeHistoryAck;
   const codex = {canWrite: true, subscriptionReady: async () => true, onEvent: () => () => {},
     models: async () => ({accountType: 'chatgpt', data: [{id: 'fixture-codex', isDefault: true, reasoningEfforts: []}]}),
-    usage: async () => ({ordinaryUsageAllowed: true, windows: [{usedPercent: 20}]}),
+    usage: async () => ({observedAt: new Date().toISOString(), ordinaryUsageAllowed: true, windows: [{usedPercent: 20}]}),
     async submit(options) {
       assert.equal(options.beforeThread(), true);
       await options.beforeTurn?.();
@@ -552,7 +552,7 @@ test('a verified API receipt starts one linked Codex thread and fences stale evi
       const change = mutateAtUsage;
       mutateAtUsage = undefined;
       await change?.();
-      return {ordinaryUsageAllowed: allowedUsage, windows: [{usedPercent: 20}]};
+      return {observedAt: new Date().toISOString(), ordinaryUsageAllowed: allowedUsage, windows: [{usedPercent: 20}]};
     },
     onEvent(listener) { event = listener; return () => { event = null; }; },
     async steer({turnId, beforeSteer, beforeSend}) {
@@ -668,7 +668,7 @@ test('Codex-to-API handover verifies an approved checkpoint, then sends exact co
   const providerInputs = [];
   const codex = {canWrite: true, subscriptionReady: async () => true, onEvent: () => () => {},
     models: async () => ({accountType: 'chatgpt', data: [{id: 'fixture-native', isDefault: true, reasoningEfforts: []}]}),
-    usage: async () => ({ordinaryUsageAllowed: true, windows: [{usedPercent: 20}]}),
+    usage: async () => ({observedAt: new Date().toISOString(), ordinaryUsageAllowed: true, windows: [{usedPercent: 20}]}),
     async submit(options) {
       assert.equal(options.beforeThread(), true);
       await options.beforeTurn?.();

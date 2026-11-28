@@ -371,18 +371,22 @@ async function handoverMessages(rpc, threadId, turnId, clientId) {
 
 function usageView(result) {
   const historical = result?.rateLimits;
-  const bucket = result?.rateLimitsByLimitId?.codex ??
+  const buckets = result?.rateLimitsByLimitId;
+  const bucket = buckets && Object.hasOwn(buckets, 'codex') ? buckets.codex :
     (historical?.limitId == null || historical.limitId === 'codex' ? historical : null);
-  const windows = ['primary', 'secondary'].flatMap(label => {
+  const labels = ['primary', 'secondary'];
+  const validPercent = value => Number.isInteger(value) && value >= 0 && value <= 100;
+  const incomplete = labels.some(label => bucket?.[label] != null && !validPercent(bucket[label].usedPercent));
+  const windows = labels.flatMap(label => {
     const window = bucket?.[label];
-    if (!Number.isInteger(window?.usedPercent) || window.usedPercent < 0 || window.usedPercent > 100) return [];
+    if (!validPercent(window?.usedPercent)) return [];
     const minutes = window.windowDurationMins;
     return [{label, usedPercent: window.usedPercent,
       durationMinutes: Number.isSafeInteger(minutes) && minutes > 0 ? minutes : null,
       resetsAt: Number.isSafeInteger(window.resetsAt) ? iso(window.resetsAt) : null}];
   });
   const permission = result?.ordinaryUsageAllowed;
-  const ordinaryUsageAllowed = typeof permission === 'boolean' ? permission : null;
+  const ordinaryUsageAllowed = permission === false ? false : permission === true && !incomplete ? true : null;
   return {observedAt: windows.length || ordinaryUsageAllowed !== null ? new Date().toISOString() : null,
     windows, ordinaryUsageAllowed};
 }

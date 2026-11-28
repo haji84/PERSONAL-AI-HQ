@@ -804,7 +804,8 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       if (response.headersSent) { response.destroy(); return; }
       const status = typeof problem?.status === 'number' ? problem.status : 500;
       send(response, status, {error: status === 500 ? '状態を読み取れませんでした。' : apiMessages[problem.code] ?? problem.message,
-        ...(['CODEX_IMAGE_MODEL_UNAVAILABLE', 'CODEX_RESUME_TARGET_UNAVAILABLE'].includes(problem.code) ||
+        ...(['CODEX_IMAGE_MODEL_UNAVAILABLE', 'CODEX_RESUME_TARGET_UNAVAILABLE', 'CODEX_SUBSCRIPTION_LIMIT_REACHED',
+          'CODEX_SUBSCRIPTION_USAGE_UNCONFIRMED'].includes(problem.code) ||
           problem.code?.startsWith('REALTIME_VOICE_') ? {code: problem.code} : {})});
     });
   });

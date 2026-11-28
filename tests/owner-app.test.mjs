@@ -21,6 +21,9 @@ const seed = {
   artifacts: [],
 };
 
+const ordinaryUsage = (overrides = {}) => ({observedAt: new Date().toISOString(),
+  ordinaryUsageAllowed: true, windows: [{usedPercent: 20}], ...overrides});
+
 async function runtimeFixture(t) {
   const temp = await realpath(tmpdir());
   const fixtureRoot = await mkdtemp(join(temp, 'hq-owner-test-'));
@@ -300,6 +303,7 @@ test('registration saves the initial execution policy before any work and preser
   let nativeStarts = 0, modelReads = 0;
   const codex = {
     canWrite:true, subscriptionReady:async () => true,
+    usage: async () => ordinaryUsage(),
     models:async () => {
       modelReads++;
       return {accountType:'chatgpt', data:[{id:'current', isDefault:true, defaultReasoningEffort:'low',
@@ -307,6 +311,7 @@ test('registration saves the initial execution policy before any work and preser
     },
     async submit(input) {
       nativeStarts++;
+      await input.beforeTurn?.();
       assert.ok(input.onThread('registration-thread'));
       return {turn:{id:'registration-turn', status:'inProgress'}};
     },
@@ -503,14 +508,17 @@ test('portfolio separates saved modes, accepted route evidence and authoritative
   let providerCalls = 0, observerCalls = 0, listener;
   const app = await start({codex:{
     canWrite:true, subscriptionReady:async()=>true,
+    usage: async () => ordinaryUsage(),
     models:async()=>({accountType:'chatgpt',data:[{id:'current',isDefault:true,reasoningEfforts:[]}]}),
     onEvent(fn) { listener=fn; return ()=>{}; },
     async submit(input) {
       providerCalls++;
       if (input.workspace === checkout('uncertain-status')) {
+        await input.beforeTurn?.();
         assert.ok(input.onThread('unknown-thread'));
         return {turn:{id:'unknown-turn',status:'unrecognized'}};
       }
+      await input.beforeTurn?.();
       assert.ok(input.onThread('managed-thread'));
       return {turn:{id:'managed-turn',status:'inProgress'}};
     },
@@ -1026,12 +1034,14 @@ test('project execution settings block native dispatch in API-only mode and stay
   let steers = 0;
   const native = {
     canWrite: true, subscriptionReady: async () => true,
+    usage: async () => ordinaryUsage(),
     models: async () => ({accountType: 'chatgpt', data: [{id: 'current', isDefault: true,
       defaultReasoningEffort: 'low', reasoningEfforts: [{reasoningEffort: 'low'}]}]}),
     async submit(input) {
       submits++;
       assert.equal(input.model, 'current');
       assert.equal(input.effort, 'low');
+      await input.beforeTurn?.();
       assert.equal(input.onThread('fixture-thread'), true);
       return {turn: {id: 'fixture-turn', status: 'inProgress'}};
     },
@@ -1075,6 +1085,7 @@ test('Codex cancellation is owner-scoped and closes the exact pre-send receipt w
   let canSubmit;
   const app = await start({codex: {
     canWrite: true, subscriptionReady: async () => true,
+    usage: async () => ordinaryUsage(),
     models: async () => ({accountType: 'chatgpt', data: [{id: 'current', isDefault: true,
       defaultReasoningEffort: 'low', reasoningEfforts: [{reasoningEffort: 'low'}]}]}),
     async submit(input) { canSubmit = input.onThread; return new Promise(() => {}); },
@@ -1414,10 +1425,12 @@ test('Codex chat context pins only exact existing conversation handoffs and pres
   let submits = 0;
   const app = await start({codex:{
     canWrite:true, subscriptionReady:async()=>true,
+    usage: async () => ordinaryUsage(),
     models:async()=>({accountType:'chatgpt',data:[{id:'current',isDefault:true,
       defaultReasoningEffort:'low',reasoningEfforts:[{reasoningEffort:'low'}]}]}),
     async submit(input) {
       submits++;
+      await input.beforeTurn?.();
       assert.equal(input.onThread('thread-'+input.requestId),true);
       return {turn:{id:'turn-'+input.requestId,status:'completed'}};
     },

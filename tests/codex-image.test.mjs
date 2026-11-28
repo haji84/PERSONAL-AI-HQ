@@ -21,7 +21,8 @@ const fixtureModel = (model, isDefault, inputModalities) => ({model, isDefault, 
   defaultReasoningEffort: 'low', supportedReasoningEfforts: [{reasoningEffort: 'low'}]});
 
 async function fixture(t, {catalog = [fixtureModel('image-model', true, ['text', 'image', 'internal', 'image']),
-  fixtureModel('text-model', false, ['text']), fixtureModel('unknown-model', false, null)]} = {}) {
+  fixtureModel('text-model', false, ['text']), fixtureModel('unknown-model', false, null)],
+  usage = () => ({ordinaryUsageAllowed: true, rateLimits: {limitId: 'codex', primary: {usedPercent: 20}}})} = {}) {
   const directory = await realpath(await mkdtemp(join(tmpdir(), 'hq-codex-image-')));
   const socket = join(directory, 'rpc.sock');
   const workspace = join(directory, 'workspaces', 'fixture');
@@ -55,7 +56,8 @@ async function fixture(t, {catalog = [fixtureModel('image-model', true, ['text',
         'thread/items/list': {data: [{turnId: params?.turnId, item: {type: 'userMessage', clientId: firstUserId}}]},
         'thread/turns/list': {data: turn ? [{id: `exact-turn-${turn}`, status: 'completed'}] : []}};
       if (method === 'turn/start') firstUserId = params.clientUserMessageId;
-      const result = method === 'turn/start' ? {turn: {id: `exact-turn-${++turn}`, status: 'completed'}} : results[method];
+      const result = method === 'turn/start' ? {turn: {id: `exact-turn-${++turn}`, status: 'completed'}} :
+        method === 'account/rateLimits/read' ? usage() : results[method];
       connection.send(JSON.stringify({id, ...(result ? {result} : {error: {code: -32601}})}));
     });
   });
@@ -86,7 +88,7 @@ test('one validated image is sent on the pinned Codex turn and replay never repe
   const start = await run(first);
   assert.equal(start.status, 202);
   assert.equal((await start.json()).operation.image, undefined);
-  const terminal = await readCompleted(call, first.id);
+  const terminal = await readOperation(call, first.id);
   assert.equal(terminal.threadId, 'exact-thread');
   const wrongThread = await run({...task, id: 'fixture-image-mismatch', resume: first.id, expectedThreadId: 'another-thread'});
   assert.equal(wrongThread.status, 409);
@@ -108,13 +110,13 @@ test('one validated image is sent on the pinned Codex turn and replay never repe
 
   const resumed = {...task, id: 'fixture-image-next', resume: task.id, image: image('image/webp', webp)};
   assert.equal((await run(resumed)).status, 202);
-  await readCompleted(call, resumed.id);
+  await readOperation(call, resumed.id);
   assert.deepEqual(writeCalls().slice(2).map(([method]) => method), ['thread/resume', 'turn/start']);
   assert.equal(writeCalls()[3][1].input[1].url, `data:image/webp;base64,${webp}`);
 
   const text = {...task, id: 'fixture-text-only', model: 'text-model'};
   assert.equal((await run(text)).status, 202);
-  await readCompleted(call, text.id);
+  await readOperation(call, text.id);
   assert.deepEqual(writeCalls()[5][1].input, [{type: 'text', text: text.prompt, text_elements: []}]);
   const db = new DatabaseSync(join(directory, 'conversations.sqlite'), {readOnly: true});
   try {
@@ -125,15 +127,39 @@ test('one validated image is sent on the pinned Codex turn and replay never repe
   } finally { db.close(); }
 });
 
-async function readCompleted(call, id) {
+async function readOperation(call, id, phase = 'completed') {
   for (let i = 0; i < 20; i++) {
     const read = await call(`/api/codex/run?project=fixture&id=${id}`);
     const {operation} = await read.json();
-    if (operation?.phase === 'completed') return operation;
+    if (operation?.phase === phase) return operation;
     await new Promise(resolve => setTimeout(resolve, 5));
   }
-  assert.fail('fixture turn never completed');
+  assert.fail(`fixture turn never reached ${phase}`);
 }
+
+test('owner HTTP and native wire hold ordinary Codex sends when allowance is revoked', {skip: process.platform === 'win32'}, async t => {
+  let permissions = [false];
+  const {call, run, writeCalls} = await fixture(t, {
+    usage: () => ({ordinaryUsageAllowed: permissions.shift(), rateLimits: {limitId: 'codex', primary: {usedPercent: 20}}}),
+  });
+  const denied = await run(task);
+  assert.equal(denied.status, 409);
+  assert.equal((await denied.json()).code, 'CODEX_SUBSCRIPTION_LIMIT_REACHED');
+  assert.equal((await (await call('/api/codex/run?project=fixture&id=' + task.id)).json()).operation, null);
+  assert.deepEqual(writeCalls(), []);
+
+  permissions = [true, false];
+  assert.equal((await run(task)).status, 202);
+  const receipt = await readOperation(call, task.id, 'failed');
+  assert.equal(receipt.threadId, null);
+  assert.equal(receipt.turnId, null);
+  assert.match(receipt.output, /指示を送信しませんでした/u);
+  assert.deepEqual(writeCalls().map(([method]) => method), ['thread/start']);
+  const replay = await run(task);
+  assert.equal(replay.status, 202);
+  assert.equal((await replay.json()).operation.phase, 'failed');
+  assert.deepEqual(writeCalls().map(([method]) => method), ['thread/start']);
+});
 
 test('validation rejects paths, noncanonical data, type mismatches and oversized data before dispatch', {skip: process.platform === 'win32'}, async t => {
   const {call, run, writeCalls} = await fixture(t);
@@ -149,7 +175,7 @@ test('validation rejects paths, noncanonical data, type mismatches and oversized
   assert.equal(writeCalls().length, 0);
   const atLimit = image('image/png', paddedImage(limit));
   assert.equal((await run({...task, image: atLimit})).status, 202);
-  await readCompleted(call, task.id);
+  await readOperation(call, task.id);
   assert.equal(writeCalls()[1][1].input[1].url.length, 'data:image/png;base64,'.length + atLimit.data.length);
 });
 
@@ -169,7 +195,7 @@ test('image dispatch does not select another model or bypass project state', {sk
   assert.equal(writeCalls().length, 0);
   await writePortfolio('ready');
   assert.equal((await run({...withImage, model: 'image-model'})).status, 202);
-  await readCompleted(call, task.id);
+  await readOperation(call, task.id);
   assert.equal(writeCalls()[1][1].model, 'image-model');
   assert.equal(writeCalls()[1][1].input[1].url, `data:image/jpeg;base64,${jpeg}`);
 });
@@ -180,7 +206,7 @@ test('document dispatch preserves UTF-8 prompt and reference text and binds both
   const prompt = '\n資料を確認してください。 \t';
   const request = {id: 'fixture-document', prompt, model: 'text-model', document};
   assert.equal((await run(request)).status, 202);
-  const terminal = await readCompleted(call, request.id);
+  const terminal = await readOperation(call, request.id);
   assert.equal(terminal.document, undefined);
   assert.equal(JSON.stringify(terminal).includes(document.name), false);
   assert.equal((await run({...request, document: {...document}})).status, 202);
@@ -223,7 +249,7 @@ test('document uploads reject path, suffix, binary data, dual attach and steerin
   assert.equal((await call('/api/codex/steer?project=fixture', {...request, operationId: 'active-native-turn'})).status, 400);
   assert.equal(writeCalls().length, 0);
   assert.equal((await run({...request, document: {...document, text: atLimit}})).status, 202);
-  await readCompleted(call, request.id);
+  await readOperation(call, request.id);
   const reference = writeCalls()[1][1].input[1].text;
   assert.equal(JSON.parse(reference.split('\n', 2)[1]).text, atLimit);
 });

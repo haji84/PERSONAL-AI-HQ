@@ -20,7 +20,7 @@ test('native usage reads only the Codex windows and explicit permission', {skip:
     await rm(directory, {recursive: true, force: true});
   });
   const reads = [];
-  const accountTypes = ['apiKey', 'chatgpt', 'chatgpt', 'chatgpt'];
+  const accountTypes = ['apiKey', 'chatgpt', 'chatgpt', 'chatgpt', 'chatgpt'];
   const limit = {usedPercent: 24, windowDurationMins: 300, resetsAt: 1893456000};
   const snapshots = [{
     accountId: 'private-account',
@@ -32,6 +32,9 @@ test('native usage reads only the Codex windows and explicit permission', {skip:
   }, {
     ordinaryUsageAllowed: 'true',
     rateLimits: {primary: limit, secondary: {usedPercent: '100'}},
+  }, {
+    ordinaryUsageAllowed: true,
+    rateLimitsByLimitId: {codex: {primary: limit, secondary: {usedPercent: '100'}}},
   }];
   websocket.on('connection', connection => {
     connection.on('message', bytes => {
@@ -57,8 +60,10 @@ test('native usage reads only the Codex windows and explicit permission', {skip:
   ]});
   const legacy = await native.usage();
   assert.deepEqual(legacy, {observedAt: legacy.observedAt, ordinaryUsageAllowed: null, windows: [primary]});
+  const malformed = await native.usage();
+  assert.deepEqual(malformed, {observedAt: malformed.observedAt, ordinaryUsageAllowed: null, windows: [primary]});
   assert.deepEqual(await native.usage(), {observedAt: null, ordinaryUsageAllowed: null, windows: []});
   const accountRead = ['account/read', {refreshToken: false}];
   const usageRead = ['account/rateLimits/read', {excludeResetCreditDetails: true}];
-  assert.deepEqual(reads, [accountRead, accountRead, usageRead, accountRead, usageRead, accountRead, usageRead]);
+  assert.deepEqual(reads, [accountRead, accountRead, usageRead, accountRead, usageRead, accountRead, usageRead, accountRead, usageRead]);
 });

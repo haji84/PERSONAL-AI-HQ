@@ -12,6 +12,10 @@ const active = new Set(['reserved', 'sending', 'running', 'interrupting', 'uncon
 const nativeTerminal = new Set(['completed', 'interrupted', 'failed']);
 const terminal = new Set([...nativeTerminal, 'cancelled']);
 const observationWindowMs = 15000;
+const subscriptionUsageMessages = {
+  CODEX_SUBSCRIPTION_LIMIT_REACHED: 'Codexの契約内利用が許可されていないため、指示を送信しませんでした。',
+  CODEX_SUBSCRIPTION_USAGE_UNCONFIRMED: 'Codexの契約内利用枠を確認できず、指示を送信しませんでした。',
+};
 const allowedId = /^[a-z0-9_-]{8,80}$/i;
 const nativeThreadId = /^[a-z0-9_-]{1,160}$/i;
 const receiptId = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
@@ -19,6 +23,11 @@ const reviewHash = /^[a-f0-9]{64}$/;
 const steerClientId = id => `hq:steer:${id}`;
 const timestamp = () => new Date().toISOString();
 const problem = (status, message, code) => Object.assign(new Error(message), {status, code});
+const usageProblem = code => problem(409, subscriptionUsageMessages[code], code);
+const freshUsage = observedAt => {
+  const age = Date.now() - observedAt;
+  return age >= 0 && age <= observationWindowMs;
+};
 const resumeUnavailable = () => problem(409, 'このスレッドの最新の作業を照合できません。', 'CODEX_RESUME_TARGET_UNAVAILABLE');
 const phase = value => nativeTerminal.has(value) ? value : value === 'inProgress' ? 'running' : null;
 const visiblePhase = row => row.cancellationRequestedAt && active.has(row.phase) ? 'cancelling' : row.phase;
@@ -255,12 +264,20 @@ export function createOperations(directory, native, execution, {prepareHandover,
     return selected;
   }
 
-  async function checkHandoverUsage() {
-    const usage = await native.usage?.();
-    if (usage?.ordinaryUsageAllowed !== true || !Array.isArray(usage.windows) || !usage.windows.length ||
-        usage.windows.some(window => !Number.isInteger(window.usedPercent) || window.usedPercent < 0 || window.usedPercent >= 100)) {
-      throw problem(409, '現在のCodex契約内の利用枠を確認できません。');
+  async function checkSubscriptionUsage() {
+    let usage;
+    try { usage = await native.usage?.(); } catch {}
+    const observedAt = Date.parse(usage?.observedAt);
+    if (!freshUsage(observedAt)) throw usageProblem('CODEX_SUBSCRIPTION_USAGE_UNCONFIRMED');
+    const windows = usage.windows;
+    if (usage.ordinaryUsageAllowed === false || (Array.isArray(windows) && windows.some(window => window?.usedPercent === 100))) {
+      throw usageProblem('CODEX_SUBSCRIPTION_LIMIT_REACHED');
     }
+    if (usage.ordinaryUsageAllowed !== true || !Array.isArray(windows) || !windows.length ||
+        windows.some(window => !Number.isInteger(window?.usedPercent) || window.usedPercent < 0 || window.usedPercent > 100)) {
+      throw usageProblem('CODEX_SUBSCRIPTION_USAGE_UNCONFIRMED');
+    }
+    return observedAt;
   }
 
   async function runtimeResult(row) {
@@ -463,6 +480,7 @@ export function createOperations(directory, native, execution, {prepareHandover,
       const handoverReceipt = handover?.receipt ?? previous?.handoverReceipt ?? null;
       const alreadyLaunched = () => beginsHandover && Boolean(launchedHandover.get(project.id, handoverReceipt));
       let selection;
+      let admissionObservedAt;
       let submittedPrompt = input.prompt;
       try {
         if (alreadyLaunched()) throw problem(409, 'この受付は引継ぎ済みです。元のCodexスレッドで続きを実行してください。');
@@ -472,7 +490,6 @@ export function createOperations(directory, native, execution, {prepareHandover,
         selection = execution ? await execution.authorize(project, {stage, route, model: input.model, effort: input.effort, handoverReceipt,
           ...(attachment ? {imageRequired: true} : {})})
           : {model: input.model, effort: input.effort};
-        if (handoverReceipt) await checkHandoverUsage();
         if (!execution) {
           const selected = await configureModel(selection.model, selection.effort, Boolean(attachment));
           if (attachment) {
@@ -489,6 +506,7 @@ export function createOperations(directory, native, execution, {prepareHandover,
             JSON.stringify(checked.context, null, 2) + '\n\n今回の依頼\n' + input.prompt;
           if (Buffer.byteLength(submittedPrompt, 'utf8') > 96000) throw problem(409, '引継ぎに必要な内容が送信上限を超えています。');
         }
+        admissionObservedAt = await checkSubscriptionUsage();
       } catch (error) {
         row = duplicate();
         if (row) return {operation: response(row)};
@@ -497,6 +515,7 @@ export function createOperations(directory, native, execution, {prepareHandover,
       try {
         if (!resumeIsCurrent()) throw resumeUnavailable();
         const chatConversationId = reference ? chatConversationForHandoff?.(project, reference) ?? null : null;
+        if (!freshUsage(admissionObservedAt)) throw usageProblem('CODEX_SUBSCRIPTION_USAGE_UNCONFIRMED');
         if (!insert.run(project.id, input.id, expected, digest, timestamp(), timestamp(), stage, route, handoverReceipt,
           handover?.review ?? null, input.resume ?? null, previous?.threadId ?? null, chatConversationId).changes) {
           throw resumeUnavailable();
@@ -511,24 +530,29 @@ export function createOperations(directory, native, execution, {prepareHandover,
       row = byId.get(project.id, input.id);
       const maySubmit = () => !closed && byId.get(project.id, input.id)?.phase === 'reserved' && resumeIsCurrent() && !alreadyLaunched() &&
         (!execution || execution.isCurrent(project, selection.revision, stage, expected, route, handoverReceipt));
-      let readyForTurn = !handoverReceipt;
+      let usageObservedAt;
       let stillCurrent;
-      const beforeTurn = handoverReceipt ? async () => {
+      const beforeTurn = async () => {
         if (beginsHandover) {
           const checked = await prepareHandover(project, handover, expected, input.id);
           if (checked.revision !== selection.revision) throw problem(409, '実行設定が変わりました。');
           stillCurrent = checked.stillCurrent;
         }
-        await checkHandoverUsage();
-        readyForTurn = true;
-      } : undefined;
+        usageObservedAt = await checkSubscriptionUsage();
+      };
       void native.submit({workspace: expected, prompt: submittedPrompt, knownId: previous?.threadId, previousTurnId: previous?.turnId,
         model: selection.model, effort: selection.effort, requestId: input.id, ...(attachment ? {image: attachment.image} : {}),
         ...(reference ? {document: reference.document} : {}),
-        beforeThread: maySubmit, ...(beforeTurn ? {beforeTurn} : {}),
-        onThread: id => (!previous || id === previous.threadId) &&
-          readyForTurn && maySubmit() && (!beginsHandover || stillCurrent?.() === true) &&
-          setThread.run(id, timestamp(), project.id, input.id).changes === 1,
+        beforeThread: () => {
+          if (!maySubmit()) return false;
+          if (!freshUsage(admissionObservedAt)) throw usageProblem('CODEX_SUBSCRIPTION_USAGE_UNCONFIRMED');
+          return true;
+        }, beforeTurn,
+        onThread: id => {
+          if ((previous && id !== previous.threadId) || !maySubmit() || (beginsHandover && stillCurrent?.() !== true)) return false;
+          if (!freshUsage(usageObservedAt)) throw usageProblem('CODEX_SUBSCRIPTION_USAGE_UNCONFIRMED');
+          return setThread.run(id, timestamp(), project.id, input.id).changes === 1;
+        },
       }).then(result => {
         const observed = phase(result.turn.status);
         advance(row, observed ?? 'running', result.turn.id, timestamp(), observed === 'running');
@@ -536,8 +560,9 @@ export function createOperations(directory, native, execution, {prepareHandover,
         if (!closed) {
           const current = byId.get(project.id, input.id);
           if (current?.phase === 'reserved') {
-            const failure = error?.code === 'CODEX_RESUME_TARGET_UNAVAILABLE' ? resumeUnavailable().message :
-              handoverReceipt ? '送信直前の引継ぎ条件またはCodex接続を確認できませんでした。' : '';
+            const failure = Object.hasOwn(subscriptionUsageMessages, error?.code) ? subscriptionUsageMessages[error.code] :
+              error?.code === 'CODEX_RESUME_TARGET_UNAVAILABLE' ? resumeUnavailable().message :
+                handoverReceipt ? '送信直前の引継ぎ条件またはCodex接続を確認できませんでした。' : '';
             if (failure) append.run(failure, timestamp(), project.id, input.id);
             advance(current, 'failed');
           }
@@ -634,8 +659,15 @@ export function createOperations(directory, native, execution, {prepareHandover,
         execution?.preflight(project, target.stage, workspace, target.explicitRoute, target.handoverReceipt);
       };
       maySteer();
-      if (!await native.subscriptionReady?.()) throw problem(403, 'ChatGPTプランの認証を確認できないため、実行していません。');
-      if (target.handoverReceipt) await checkHandoverUsage();
+      let admissionObservedAt;
+      try {
+        if (!await native.subscriptionReady?.()) throw problem(403, 'ChatGPTプランの認証を確認できないため、実行していません。');
+        admissionObservedAt = await checkSubscriptionUsage();
+      } catch (error) {
+        const concurrent = previous();
+        if (concurrent) return steeringResponse(concurrent);
+        throw error;
+      }
       const concurrent = previous();
       if (concurrent) return steeringResponse(concurrent);
       const run = byId.get(project.id, input.operationId);
@@ -643,29 +675,39 @@ export function createOperations(directory, native, execution, {prepareHandover,
         throw problem(409, '追加指示の対象のターンは実行中と確認できません。');
       }
       maySteer();
+      if (!freshUsage(admissionObservedAt)) throw usageProblem('CODEX_SUBSCRIPTION_USAGE_UNCONFIRMED');
       if (!reserveSteering.run(project.id, input.id, run.id, run.turnId, digest, timestamp()).changes) {
         return steeringResponse(previous());
       }
       let outcome = 'unconfirmed';
-      let usageChecked = !run.handoverReceipt;
-      const beforeSteer = run.handoverReceipt ? async () => {
-        try { await checkHandoverUsage(); usageChecked = true; }
-        catch (error) { outcome = 'rejected'; throw error; }
-      } : undefined;
+      let usageObservedAt;
+      let usageFailure;
+      const beforeSteer = async () => {
+        try { usageObservedAt = await checkSubscriptionUsage(); }
+        catch (error) {
+          outcome = 'rejected';
+          usageFailure = subscriptionUsageMessages[error.code];
+          throw error;
+        }
+      };
       try {
         const sentTurn = await native.steer({workspace, threadId: run.threadId, turnId: run.turnId, requestId: steerClientId(input.id),
-          prompt: input.prompt, ...(beforeSteer ? {beforeSteer} : {}), beforeSend: () => {
+          prompt: input.prompt, beforeSteer, beforeSend: () => {
             try {
-              if (!usageChecked) throw problem(409, '現在のCodex契約内の利用枠を確認できません。');
+              if (!freshUsage(usageObservedAt)) throw usageProblem('CODEX_SUBSCRIPTION_USAGE_UNCONFIRMED');
               maySteer();
             }
-            catch (error) { outcome = 'rejected'; throw error; }
+            catch (error) {
+              outcome = 'rejected';
+              if (Object.hasOwn(subscriptionUsageMessages, error?.code)) usageFailure = subscriptionUsageMessages[error.code];
+              throw error;
+            }
           }});
         if (sentTurn === run.turnId) outcome = 'accepted';
       } catch {}
       if (closed) return steeringResponse(null);
       resolveSteering.run(outcome, timestamp(), project.id, input.id);
-      return steeringResponse(steeringById.get(project.id, input.id));
+      return {...steeringResponse(steeringById.get(project.id, input.id)), ...(usageFailure && {reason:usageFailure})};
     },
     close() { closed = true; unsubscribe?.(); db.close(); },
   };

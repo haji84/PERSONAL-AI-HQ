@@ -4028,7 +4028,9 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
     } catch (error) {
       const imageModelRejected = Boolean(payload.imageSha256) && error.code === 'CODEX_IMAGE_MODEL_UNAVAILABLE';
       const targetRejected = error.status === 409 && error.code === 'CODEX_RESUME_TARGET_UNAVAILABLE';
-      const confirmedRejection = [400, 403, 413].includes(error.status) || imageModelRejected || targetRejected ||
+      const usageRejected = error.status === 409 &&
+        ['CODEX_SUBSCRIPTION_LIMIT_REACHED', 'CODEX_SUBSCRIPTION_USAGE_UNCONFIRMED'].includes(error.code);
+      const confirmedRejection = [400, 403, 413].includes(error.status) || imageModelRejected || targetRejected || usageRejected ||
         (apiMode || payload.handover) && error.status === 409;
       if (endpoint === path && confirmedRejection && ui.runIntents.get(runKey)?.id === payload.id) {
         ui.runIntents.delete(runKey);
@@ -4037,8 +4039,8 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
         storeTab();
         paintRelatedRuns();
       }
-      run.known = Boolean((apiMode || payload.handover || imageModelRejected) && confirmedRejection);
-      run.message = error.message + ' 作業状態を確認してください。';
+      run.known = Boolean((apiMode || payload.handover || imageModelRejected || usageRejected) && confirmedRejection);
+      run.message = usageRejected ? error.message : error.message + ' 作業状態を確認してください。';
       verifyCancellation = endpoint === '/api/codex/cancel' && (!error.status || error.status >= 500);
     } finally {
       run.busy = false;
@@ -4057,7 +4059,7 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
       const path = apiPath('/api/codex/steer', {project, id: submit ? undefined : intent.id});
       const {draftReceipt, expectedThreadId, ...request} = intent;
       const options = submit ? {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(request)} : {};
-      const {steering} = await api(path, {...options, signal: AbortSignal.timeout(14000)});
+      const {steering, reason} = await api(path, {...options, signal: AbortSignal.timeout(14000)});
       if (ui.steerIntents.get(project)?.id !== intent.id) return;
       const matchesIntent = steering?.id === intent.id && steering.project === project && steering.operationId === intent.operationId;
       if (matchesIntent && steering.phase === 'accepted') {
@@ -4072,7 +4074,7 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
       } else if (matchesIntent && steering.phase === 'rejected') {
         ui.steerIntents.delete(project);
         storeTab();
-        run.steerMessage = '元のターンの状態が変わったため、追加指示を送信しませんでした。';
+        run.steerMessage = text(reason, '追加指示の送信条件を確認できず、送信しませんでした。');
       } else run.steerMessage = '追加指示の受理をまだ確認できません。作業状態を照合できます。';
     } catch (error) {
       if (submit && [400, 403, 409, 413].includes(error.status) && ui.steerIntents.get(project)?.id === intent.id) {
