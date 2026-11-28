@@ -12,7 +12,7 @@ import {startOwnerApp} from '../app/server.mjs';
 import {createChatStore} from '../app/chat-store.mjs';
 import {createChatGPTResponses} from '../app/chatgpt-responses.mjs';
 import {ExecutionStore} from '../app/execution-store.mjs';
-import {ensurePrivateDirectory} from '../app/private-directory.mjs';
+import {assertWindowsPrivateWorkspace, ensurePrivateDirectory} from '../app/private-directory.mjs';
 
 const seed = {
   observedAt: '2026-11-27T06:25:00.000Z',
@@ -2353,6 +2353,8 @@ test('linked Codex work reads only the current conversation and workspace withou
 });
 
 test('linked Codex result confirms an exact older receipt outside recent native history', async t => {
+  let db;
+  t.after(() => db?.close());
   const {directory,start} = await runtimeFixture(t);
   const checkout = join(directory,'workspaces','example');
   const registry = join(directory,'portfolio.json');
@@ -2393,8 +2395,7 @@ test('linked Codex result confirms an exact older receipt outside recent native 
         output:'PRIVATE_NATIVE_OUTPUT'}],nextCursor:null};
     },
   }});
-  const db=new DatabaseSync(join(directory,'conversations.sqlite'));
-  t.after(()=>db.close());
+  db = new DatabaseSync(join(directory,'conversations.sqlite'));
   const cookie=await login(app);
   const archive=id=>({id,title:'元の会話',update_time:1,current_node:'m',mapping:{m:{parent:null,
     message:{author:{role:'user'},content:{parts:['PRIVATE_CHAT']}}}}});
@@ -2469,6 +2470,26 @@ async function assertPublishedCodexArtifact(t, artifactName, artifactContents) {
   const fixture = {'.hq-owned-workspace':'example\n','requirements.txt':'PRIVATE_REQUIREMENTS\n',
     'verification.txt':'PRIVATE_PROOF\n',[artifactName]:artifactContents};
   await Promise.all(Object.entries(fixture).map(([name,value])=>writeFile(join(checkout,name),value,{mode:0o600})));
+  if (process.platform === 'win32') {
+    // Elevated accounts may give newly created entries to Administrators instead of the test user.
+    const powershell = join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+    execFileSync(powershell, ['-NoProfile', '-NonInteractive', '-Command', `
+      $ErrorActionPreference = 'Stop'
+      $checkout = $env:HQ_TEST_ARTIFACT_CHECKOUT
+      $owner = [Security.Principal.WindowsIdentity]::GetCurrent().User
+      $acl = [IO.Directory]::GetAccessControl($checkout)
+      $acl.SetOwner($owner)
+      [IO.Directory]::SetAccessControl($checkout, $acl)
+      foreach ($name in $env:HQ_TEST_ARTIFACT_FILES.Split([char]10)) {
+        $target = Join-Path $checkout $name
+        $acl = [IO.File]::GetAccessControl($target)
+        $acl.SetOwner($owner)
+        [IO.File]::SetAccessControl($target, $acl)
+      }
+    `], {windowsHide:true, timeout:10000, env:{...process.env,
+      HQ_TEST_ARTIFACT_CHECKOUT:checkout, HQ_TEST_ARTIFACT_FILES:Object.keys(fixture).join('\n')}});
+    await assertWindowsPrivateWorkspace(checkout, Object.keys(fixture));
+  }
   const git = args => execFileSync('git',['-C',checkout,...args],{encoding:'utf8',stdio:['ignore','pipe','ignore']}).trim();
   git(['init','-q']);
   git(['config','core.autocrlf','false']);
