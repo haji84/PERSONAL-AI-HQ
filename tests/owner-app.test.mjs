@@ -1817,13 +1817,121 @@ test('Codex chat context pins only exact existing conversation handoffs and pres
     setPhase.run('completed');
   } finally { operations.close(); }
   const changed = {...document,text:document.text+' '};
-  await submit('modified-link',changed);
-  const unlinked = await (await getContext('modified-link')).json();
-  assert.deepEqual(unlinked.conversation,{id:'other-chat',title:'Candidate',linked:false});
+  const rejected = await call('/api/codex/run',{}, {id:'modified-link',prompt:'引継ぎ資料の確認',document:changed});
+  assert.equal(rejected.status,409);
+  assert.equal((await rejected.json()).code,'CHAT_HANDOFF_STALE');
   await submit('historic-turn');
   assert.deepEqual((await (await getContext('historic-turn')).json()).conversation,
     {id:'other-chat',title:'Candidate',linked:false});
-  assert.equal(submits,3);
+  assert.equal(submits,2);
+});
+
+test('direct and staged handoffs pin the canonical requirements and reject an advanced project record', async t => {
+  const {directory,start} = await runtimeFixture(t);
+  const checkout = join(directory,'workspaces','example');
+  const source = join(directory,'source');
+  const initiative = 'docs/initiatives/chatgpt-codex-integration';
+  const ownerPath = initiative + '/OWNER_REQUEST_20261127.txt';
+  const timelinePath = initiative + '/DELIVERY.md';
+  const repository = 'https://github.com/example/approved-source';
+  await mkdir(checkout,{recursive:true,mode:0o700});
+  await mkdir(join(source,initiative),{recursive:true,mode:0o700});
+  await writeFile(join(checkout,'.hq-owned-workspace'),'example\n');
+  const git = (...args) => execFileSync('git',args,{cwd:source,encoding:'utf8',stdio:['ignore','pipe','pipe']}).trim();
+  git('init','-q');
+  git('remote','add','origin',repository+'.git');
+  const owner = '# 確認用の原要求\n個別の証拠を照合する。\n';
+  await writeFile(join(source,ownerPath),owner);
+  async function advance(action) {
+    await writeFile(join(source,timelinePath),'### 次工程\n- 次は '+action+'\n');
+    git('add','--',ownerPath,timelinePath);
+    git('-c','user.name=Fixture','-c','user.email=test@example.invalid','commit','-qm','Update project record');
+    return git('rev-parse','HEAD');
+  }
+  const requirementsRevision = await advance('チェックを準備する。');
+  const initial = await advance('残りの照合を進める。');
+  const requirementsSha = createHash('sha256').update(owner).digest('hex');
+  const deliverySource = {kind:'integration-milestone',repository,checkout:source,ref:git('symbolic-ref','HEAD'),
+    ownerRequestRevision:requirementsRevision,ownerRequestSha256:requirementsSha};
+  await writeFile(join(directory,'portfolio.json'),JSON.stringify({...seed,projects:[{
+    ...seed.projects[0],cwd:checkout,enableCodexWrite:true,deliverySource,
+  }]}),{mode:0o600});
+  let submitted = 0;
+  let advanceDuringAdmission = false;
+  const submittedTurn = Promise.withResolvers();
+  const app = await start({codex:{
+    canWrite:true,subscriptionReady:async()=>true,usage:async()=>ordinaryUsage(),
+    async models() {
+      if (advanceDuringAdmission) {
+        advanceDuringAdmission = false;
+        await advance('利用条件の確認中に更新した。');
+      }
+      return {accountType:'chatgpt',data:[{id:'current',isDefault:true,
+        defaultReasoningEffort:'low',reasoningEfforts:[{reasoningEffort:'low'}]}]};
+    },
+    async submit(input) {
+      assert.equal(input.beforeThread?.(),true);
+      await input.beforeTurn?.();
+      if (input.requestId === 'ref-changed-before-turn') {
+        await advance('別の確定版に更新した。');
+        try { input.onThread('thread-cannot-start'); submittedTurn.resolve(null); }
+        catch (failure) { submittedTurn.resolve(failure); throw failure; }
+      }
+      assert.equal(input.onThread('thread-'+input.requestId),true);
+      submitted++;
+      return {turn:{id:'turn-'+input.requestId,status:'completed'}};
+    },
+  }});
+  const cookie = await login(app);
+  const call = (path, params={}, body) => fetch(app.url+path+'?'+new URLSearchParams({project:'example',...params}),{
+    method:body?'POST':'GET',headers:{cookie,...(body&&{Origin:app.url,'Content-Type':'application/json'})},
+    ...(body&&{body:JSON.stringify(body)}),
+  });
+  const id = 'canonical-chat';
+  const archive = {id,title:'原本を確認する会話',current_node:'m',update_time:1,mapping:{
+    m:{parent:null,message:{author:{role:'user'},content:{parts:['保護した正本を照合してください。']}}},
+  }};
+  assert.equal((await call('/api/chat/import',{},[archive])).status,200);
+  const {conversation} = await (await call('/api/chat',{id})).json();
+  const range = {through:1,observedAt:conversation.importedAt,
+    viewSha256:createHash('sha256').update(JSON.stringify(conversation.messages)).digest('hex')};
+  const preview = async () => {
+    const result = await call('/api/chat/handoff',{id,...range});
+    assert.equal(result.status,200);
+    return result.json();
+  };
+  const reviewed = await preview();
+  assert.deepEqual(JSON.parse(reviewed.document.text).project.record,{
+    requirements:{url:repository+'/blob/'+requirementsRevision+'/'+ownerPath,revision:requirementsRevision,sha256:requirementsSha},
+    progress:{url:repository+'/blob/'+initial+'/'+timelinePath,revision:initial,nextAction:'残りの照合を進める。'},
+  });
+  assert.equal(reviewed.document.text.includes(source),false);
+  assert.equal(reviewed.document.text.includes('個別の証拠を照合する'),false);
+  await advance('照合の記録を更新した。');
+  const staleRequests = [
+    call('/api/chat/handoff',{id},{...range,id:'direct-old-record',prompt:'資料を確認する',sha256:reviewed.sha256}),
+    call('/api/codex/run',{}, {id:'staged-old-record',prompt:'資料を確認する',document:reviewed.document}),
+  ];
+  for (const pending of staleRequests) {
+    const response = await pending;
+    assert.equal(response.status,409);
+    assert.equal((await response.json()).code,'CHAT_HANDOFF_STALE');
+  }
+  assert.equal(submitted,0);
+  const beforeAdmission = await preview();
+  advanceDuringAdmission = true;
+  const staleAdmission = await call('/api/codex/run',{},
+    {id:'ref-changed-during-admission',prompt:'資料を確認する',document:beforeAdmission.document});
+  assert.equal(staleAdmission.status,409);
+  assert.equal((await staleAdmission.json()).code,'CHAT_HANDOFF_STALE');
+  const unsent = await (await call('/api/chat/codex-work',{id,receipt:'ref-changed-during-admission'})).json();
+  assert.deepEqual(unsent,{works:[]});
+  const fresh = await preview();
+  const pending = await call('/api/codex/run',{}, {id:'ref-changed-before-turn',prompt:'資料を確認する',document:fresh.document});
+  assert.equal(pending.status,202);
+  const blocked = await submittedTurn.promise;
+  assert.equal(blocked?.code,'CHAT_HANDOFF_STALE');
+  assert.equal(submitted,0);
 });
 
 test('linked Codex work reads only the current conversation and workspace without reconciling or dispatching', async t => {

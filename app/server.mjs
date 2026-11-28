@@ -10,7 +10,7 @@ import {fileURLToPath, pathToFileURL} from 'node:url';
 import {pipeline} from 'node:stream/promises';
 import {readCurrentProject, readPortfolio, readProjectDeliverySource, readProjectEstimateBinding, registerProject} from './portfolio.mjs';
 import {normalizeSettings} from './execution-policy.mjs';
-import {readExecutionEstimateSource, readOwnerRequirementCoverage} from './delivery-records.mjs';
+import {chatProjectRecordIsCurrent, readChatProjectRecord, readExecutionEstimateSource, readOwnerRequirementCoverage} from './delivery-records.mjs';
 import {chatHistoryLastOffset, chatHistoryPageSize, createChatStore} from './chat-store.mjs';
 import {createCodexClient, emptyNativeActivity, historySearchCursorLimit, isCodexLoopbackUrl,
   validEvidenceCursor, validEvidenceTarget} from './codex.mjs';
@@ -30,7 +30,7 @@ import {createCodexPeerVerifier} from './codex-peer.mjs';
 import {localSpeechAvailable, localSpeechMaxChars, synthesizeLocalSpeech} from './local-speech.mjs';
 import {createTailnetAccess, tailnetCookieName} from './tailnet-access.mjs';
 import {validatedDocument} from './text-attachment.mjs';
-import {chatConversationForHandoff, readChatHandoff} from './chat-handoff.mjs';
+import {chatHandoffReviewParams, chatHandoffStale, readChatHandoff} from './chat-handoff.mjs';
 import {readCodexChatContext} from './codex-chat-context.mjs';
 import {createWorkRouting} from './work-routing.mjs';
 
@@ -224,8 +224,39 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
   const github = githubProjects ? createGithubProjects(directory, githubProjects) : undefined;
   const chats = createChatStore(directory);
   const execution = createExecutionAccess(directory, native);
+  function currentHandoffProject(project, canDispatch) {
+    if (canDispatch && !canDispatch()) throw error(401,'サインインが必要です。');
+    const current = readCurrentProject(directory,project.id);
+    if (!current || current.cwd.length !== project.cwd.length || current.cwd.some(cwd=>!project.cwd.includes(cwd))) {
+      throw error(404,'この案件の作業先を確認できません。');
+    }
+    return current;
+  }
+  async function bindChatHandoff(project, params, canDispatch, expectedSha) {
+    currentHandoffProject(project,canDispatch);
+    const source = readProjectDeliverySource(directory,project.id);
+    const binding = JSON.stringify(source);
+    const record = await readChatProjectRecord(source).catch(() => { throw chatHandoffStale(); });
+    const assertCurrent = (checkRevision = false) => {
+      const current = currentHandoffProject(project,canDispatch);
+      if (binding !== JSON.stringify(readProjectDeliverySource(directory,project.id)) ||
+          (checkRevision && !chatProjectRecordIsCurrent(source,record))) throw chatHandoffStale();
+      let checked;
+      try { checked = readChatHandoff(chats,current,params,record); }
+      catch (problem) {
+        if (expectedSha && [400,404,409,413].includes(problem.status)) throw chatHandoffStale();
+        throw problem;
+      }
+      if (expectedSha && checked.sha256 !== expectedSha) throw chatHandoffStale();
+      return checked;
+    };
+    return {checked:assertCurrent(true),conversationId:params.get('id'),assertCurrent};
+  }
   const operations = createOperations(directory, native, execution, {
-    chatConversationForHandoff: (project, reference) => chatConversationForHandoff(chats, project, reference),
+    prepareChatReview(project, reference, canDispatch) {
+      const review = chatHandoffReviewParams(project,reference);
+      return review && bindChatHandoff(project,review,canDispatch,reference.digest);
+    },
     prepareHandover: (...args) => apiWork.prepareNativeHandover(...args),
   });
   const nativeArtifacts = createNativeArtifacts(directory, operations.completedArtifactSource);
@@ -720,7 +751,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
         if (input?.expectedThreadId !== undefined && target.searchParams.getAll('project').length !== 1) {
           throw error(400, '案件を1件指定してください。');
         }
-        return send(response, 202, await operations.start(project, input));
+        return send(response, 202, await operations.start(project, input,{canDispatch:signedIn}));
       }
     }
     if (post && route === '/api/codex/interrupt') {
@@ -764,7 +795,8 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       return send(response,200,part);
     }
     if (get && route === '/api/chat/handoff') {
-      return send(response, 200, readChatHandoff(chats, project, target.searchParams));
+      const prepared = await bindChatHandoff(project,target.searchParams,signedIn);
+      return send(response,200,prepared.checked);
     }
     if (post && route === '/api/chat/handoff') {
       const params = target.searchParams;
@@ -782,23 +814,11 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       }
       const review = new URLSearchParams({project:project.id,id:conversationId,through:input.through,
         observedAt:input.observedAt,viewSha256:input.viewSha256});
-      const currentScope = () => {
-        if (!signedIn()) throw error(401,'サインインが必要です。');
-        const current = readCurrentProject(directory,project.id);
-        if (!current || current.cwd.length !== project.cwd.length || current.cwd.some(cwd=>!project.cwd.includes(cwd))) {
-          throw error(404,'この案件の作業先を確認できません。');
-        }
-        return current;
-      };
-      const assertCurrent = () => {
-        const checked = readChatHandoff(chats,currentScope(),review);
-        if (checked.sha256 !== input.sha256) throw error(409,'会話と資料をもう一度照合してください。');
-        return checked.document;
-      };
-      const document = assertCurrent();
+      const chatReview = await bindChatHandoff(project,review,signedIn,input.sha256);
+      const {document} = chatReview.checked;
       const result = await operations.start(project,{id:input.id,prompt:input.prompt,stage:'implementation',route:'subscription',document},
-        {canDispatch:signedIn,chatReview:{conversationId,assertCurrent}});
-      currentScope();
+        {canDispatch:signedIn,chatReview});
+      currentHandoffProject(project,signedIn);
       return send(response,202,result);
     }
     if (route === '/api/chat/live') {
@@ -951,7 +971,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       if (response.headersSent) { response.destroy(); return; }
       const status = typeof problem?.status === 'number' ? problem.status : 500;
       send(response, status, {error: status === 500 ? '状態を読み取れませんでした。' : apiMessages[problem.code] ?? problem.message,
-        ...(['CODEX_IMAGE_MODEL_UNAVAILABLE', 'CODEX_RESUME_TARGET_UNAVAILABLE', 'CODEX_SUBSCRIPTION_LIMIT_REACHED',
+        ...(['CHAT_HANDOFF_STALE', 'CODEX_IMAGE_MODEL_UNAVAILABLE', 'CODEX_RESUME_TARGET_UNAVAILABLE', 'CODEX_SUBSCRIPTION_LIMIT_REACHED',
           'CODEX_SUBSCRIPTION_USAGE_UNCONFIRMED'].includes(problem.code) ||
           problem.code?.startsWith('REALTIME_VOICE_') ? {code: problem.code} : {})});
     });

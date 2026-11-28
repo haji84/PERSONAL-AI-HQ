@@ -1,4 +1,4 @@
-import {execFile} from 'node:child_process';
+import {execFile, execFileSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
 import {lstat, realpath} from 'node:fs/promises';
 import {dirname, isAbsolute, join, normalize} from 'node:path';
@@ -200,6 +200,43 @@ async function environmentRecord(source, reader) {
 function hasOwnerRequestAnchor(source) {
   return typeof source.ownerRequestRevision === 'string' && commitId.test(source.ownerRequestRevision) &&
     typeof source.ownerRequestSha256 === 'string' && contentDigest.test(source.ownerRequestSha256);
+}
+
+export async function readChatProjectRecord(source) {
+  if (!source) return null;
+  const reader = await openSource(source);
+  const {repository,revision,git,files} = reader;
+  const pinned = (version,file) => ({url:link(repository,version,file,'').url,revision:version});
+  if (source.kind === 'integration-milestone' && hasOwnerRequestAnchor(source)) {
+    const original = source.ownerRequestRevision;
+    const [[owner],[current],nextAction] = await Promise.all([
+      files(original,[ownerRequestPath]),files(revision,[ownerRequestPath]),latestTimelineAction(reader),
+      git('merge-base','--is-ancestor',original,revision),
+    ]);
+    const sha256 = createHash('sha256').update(owner).digest('hex');
+    if (!owner.equals(current) || sha256 !== source.ownerRequestSha256) throw new Error('The original requirements changed');
+    return {requirements:{...pinned(original,ownerRequestPath),sha256},
+      progress:{...pinned(revision,timelinePath),
+        ...(nextAction && !/[\p{Cc}\p{Cf}]/u.test(nextAction) && {nextAction})}};
+  }
+  if (source.kind === 'environment-audit') {
+    await environmentRecord(source,reader);
+    const [owner] = await files(source.requirementsCommit,[ownerPath]);
+    return {requirements:{...pinned(source.requirementsCommit,ownerPath),sha256:createHash('sha256').update(owner).digest('hex')},
+      progress:pinned(revision,auditPath)};
+  }
+  throw new Error('No verified project record');
+}
+
+export function chatProjectRecordIsCurrent(source, record) {
+  if (!source) return record === null;
+  if (!record || typeof source.ref !== 'string' || !sourceRef.test(source.ref) ||
+      source.ref.includes('..') || source.ref.endsWith('/')) return false;
+  try {
+    const command = readOnlyGitInvocation(source.checkout,['rev-parse','--verify',source.ref+'^{commit}']);
+    return execFileSync(command.executable,command.args,{env:command.env,stdio:['ignore','pipe','ignore'],
+      encoding:'utf8',timeout:1500,maxBuffer:1024,windowsHide:true}).trim() === record.progress.revision;
+  } catch { return false; }
 }
 
 export async function readDeliveryRecord(source) {

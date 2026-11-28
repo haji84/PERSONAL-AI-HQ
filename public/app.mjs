@@ -2158,7 +2158,7 @@ function moveToDraft(project, kind, item, description) {
   location.hash = kind;
 }
 
-function directChatWork(project, conversation, current, reviewed, openWork, refreshSource) {
+function directChatWork(project, conversation, current, reviewed, openWork, refreshSource, invalidateReview) {
   const key = chatDirectWorkKey(project);
   const draftKey = memoryKey('chat-direct-codex-draft',project,conversation);
   const area = node('section','run-control');
@@ -2274,6 +2274,7 @@ function directChatWork(project, conversation, current, reviewed, openWork, refr
       }
     } catch (error) {
       if (!active() || intent()?.id !== input.id) return;
+      if (post && error.code === 'CHAT_HANDOFF_STALE') invalidateReview();
       status.textContent = error.message;
       if (post && !attempted && [400,403,409,413].includes(error.status)) {
         ui.runIntents.delete(key);
@@ -2296,11 +2297,34 @@ function directChatWork(project, conversation, current, reviewed, openWork, refr
   return {area,paint,activate};
 }
 
+function handoffRecordLinks(record) {
+  const {requirements, progress} = record ?? {};
+  const pinned = entry => {
+    if (typeof entry?.url !== 'string' || entry.url.length > 4096 ||
+        typeof entry.revision !== 'string' || !/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(entry.revision)) return null;
+    const match = /^https:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/blob\/([a-f0-9]+)\/([A-Za-z0-9_.\/-]+)$/u.exec(entry.url);
+    if (match?.[2] !== entry.revision || (match[1] + '/' + match[3]).split('/').some(part =>
+      !part || part === '.' || part === '..')) return null;
+    return match[1].toLowerCase();
+  };
+  const repository = pinned(requirements);
+  if (!repository || repository !== pinned(progress) || typeof requirements.sha256 !== 'string' ||
+      !/^[a-f0-9]{64}$/.test(requirements.sha256) || (Object.hasOwn(progress, 'nextAction') &&
+        (typeof progress.nextAction !== 'string' || !progress.nextAction.trim() || progress.nextAction.length > 360))) {
+    throw new Error('案件の要求原本と進行記録を確認できませんでした。');
+  }
+  const links = node('div', 'run-actions');
+  links.append(link('要求原本', requirements.url), link('進行記録', progress.url));
+  return progress.nextAction ? [links, node('p', 'small', progress.nextAction)] : [links];
+}
+
 function chatCodexHandoff(project, conversation, isCurrent, openWork, refreshSource) {
   const details = node('details', 'scope-info');
   details.append(node('summary', '', '会話と資料をCodexへ'));
   const status = node('p', 'small muted');
   status.setAttribute('role', 'status');
+  const record = node('div', 'stack');
+  record.hidden = true;
   const preview = node('pre', 'run-output');
   preview.tabIndex = 0;
   preview.hidden = true;
@@ -2316,15 +2340,23 @@ function chatCodexHandoff(project, conversation, isCurrent, openWork, refreshSou
   let prepared;
   let loading = false;
   const draftKey = memoryKey('codex-draft', project);
+  const replacesOwnHandoff = attachment =>
+    attachment?.needsChatHandoffReview === true && attachment.chatHandoffConversationId === conversation.id;
   const direct = directChatWork(project,conversation.id,() => details.open && isCurrent(),() =>
-    prepared?.generation === connectionGeneration ? prepared.review : null,openWork,refreshSource);
+    prepared?.generation === connectionGeneration ? prepared.review : null,openWork,refreshSource,invalidateReview);
+
+  function invalidateReview() {
+    prepared = undefined;
+    preview.hidden = true;
+    record.hidden = true;
+    record.replaceChildren();
+    attach.disabled = true;
+    direct.paint();
+  }
 
   async function prepare() {
     if (loading || !details.open || !isCurrent()) return;
-    prepared = undefined;
-    preview.hidden = true;
-    attach.disabled = true;
-    direct.paint();
+    invalidateReview();
     const displayed = asArray(conversation.messages).length;
     const through = Number(endPicker.value);
     endPicker.max = String(displayed);
@@ -2336,10 +2368,11 @@ function chatCodexHandoff(project, conversation, isCurrent, openWork, refreshSou
     refresh.disabled = true;
     status.textContent = '会話と資料を照合しています…';
     const generation = connectionGeneration;
+    const reviewIsCurrent = () => isCurrent() && details.open && generation === connectionGeneration && Number(endPicker.value) === through;
     try {
       const viewed = asArray(conversation.messages).slice(Math.max(0, through - 40), through);
       const viewSha256 = await attachmentDigest(new TextEncoder().encode(JSON.stringify(viewed)));
-      if (!isCurrent() || !details.open || generation !== connectionGeneration || Number(endPicker.value) !== through) return;
+      if (!reviewIsCurrent()) return;
       const result = await api(apiPath('/api/chat/handoff',
         {project, id: conversation.id, through, observedAt: conversation.importedAt, viewSha256}),
         {signal: AbortSignal.timeout(8000)});
@@ -2354,25 +2387,29 @@ function chatCodexHandoff(project, conversation, isCurrent, openWork, refreshSou
         throw new Error('添付資料が照合結果と一致しません。');
       }
       const packet = JSON.parse(document.text);
-      if (packet.project?.id !== project || packet.source?.id !== conversation.id ||
+      if (packet?.schemaVersion !== 1 || packet.project?.id !== project || packet.source?.id !== conversation.id ||
           packet.source?.observedAt !== conversation.importedAt || packet.source?.viewSha256 !== viewSha256 ||
           packet.range?.start !== range.start || packet.range?.end !== through ||
           asArray(packet.messages).length !== range.end - range.start) {
         throw new Error('対象の会話と収録範囲を確認できませんでした。');
       }
       const digest = await attachmentDigest(bytes, document.name);
-      if (!isCurrent() || !details.open || generation !== connectionGeneration || Number(endPicker.value) !== through) return;
+      if (!reviewIsCurrent()) return;
+      const links = Object.hasOwn(packet.project, 'record') ? handoffRecordLinks(packet.project.record) : [];
       const rangeLabel = '発言 ' + (range.start + 1) + '〜' + range.end + ' を収録';
       status.textContent = [rangeLabel, (range.hasEarlier || range.hasLater) && 'ほかの発言は会話履歴で確認',
         imageCount && '画像' + imageCount + '件の参照を収録'].filter(Boolean).join(' · ');
+      record.replaceChildren(...links);
+      record.hidden = !links.length;
       preview.textContent = document.text;
       preview.hidden = false;
       prepared = {file:new File([bytes],document.name,{type:'application/json'}),digest,rangeLabel,generation,
         review:{through,observedAt:conversation.importedAt,viewSha256,sha256}};
+      attach.textContent = replacesOwnHandoff(ui.attachmentDrafts.get(draftKey)) ? 'Codexの添付を更新' : 'Codexの下書きに添付';
       attach.disabled = false;
       direct.paint();
     } catch (error) {
-      if (isCurrent() && details.open) status.textContent = error.message;
+      if (reviewIsCurrent()) status.textContent = error.message;
     } finally {
       loading = false;
       refresh.disabled = false;
@@ -2380,35 +2417,32 @@ function chatCodexHandoff(project, conversation, isCurrent, openWork, refreshSou
   }
 
   function stage() {
-    if (!prepared || !details.open || !isCurrent() || selectedProject()?.codexWrite !== true ||
+    if (!prepared || prepared.generation !== connectionGeneration || !details.open || !isCurrent() || selectedProject()?.codexWrite !== true ||
         ui.capabilities.codexWrite !== true) return;
     if (ui.runIntents.has(project) || ui.runIntents.has(chatDirectWorkKey(project)) || ui.steerIntents.has(project)) {
       status.textContent = 'Codexで保留中の受付を照合してから添付してください。';
       return;
     }
-    if (ui.attachmentDrafts.has(draftKey)) {
+    const previousAttachment = ui.attachmentDrafts.get(draftKey);
+    if (previousAttachment && !replacesOwnHandoff(previousAttachment)) {
       status.textContent = 'Codexの下書きで現在の添付を確認してください。';
       return;
     }
     ui.attachmentDrafts.set(draftKey, {kind: 'document', file: prepared.file, digest: prepared.digest,
-      chatHandoffLabel: prepared.rangeLabel});
+      chatHandoffLabel: prepared.rangeLabel, chatHandoffConversationId: conversation.id});
     location.hash = 'codex';
   }
 
-  endPicker.addEventListener('input', () => {
-    prepared = undefined;
-    attach.disabled = true;
-    preview.hidden = true;
-    direct.paint();
-  });
+  endPicker.addEventListener('input', invalidateReview);
   details.addEventListener('toggle', () => {
     if (!details.open) return;
     endPicker.value = String(asArray(conversation.messages).length);
     direct.activate();
     void prepare();
   });
-  details.append(label, refresh, status, preview, direct.area, attach);
-  if (ui.runIntents.get(chatDirectWorkKey(project))?.conversation === conversation.id) details.open = true;
+  details.append(label, refresh, status, record, preview, direct.area, attach);
+  if (ui.runIntents.get(chatDirectWorkKey(project))?.conversation === conversation.id ||
+      replacesOwnHandoff(ui.attachmentDrafts.get(draftKey))) details.open = true;
   return details;
 }
 
@@ -4193,6 +4227,7 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
   let attachmentInput;
   let attachmentInfo;
   let removeAttachment;
+  let reviewChatHandoff;
   let attachmentSequence = 0;
   let attachmentMessage = '';
   let readingAttachment = false;
@@ -4278,6 +4313,15 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
       attachmentMessage = '';
       paint();
     });
+    reviewChatHandoff = button('元の会話を再照合', () => {
+      const attachment = ui.attachmentDrafts.get(draftKey);
+      if (!isCurrent() || ui.project !== project || !attachment?.needsChatHandoffReview || !attachment.chatHandoffConversationId) return;
+      ui.chatIds.set(project, attachment.chatHandoffConversationId);
+      ui.chatNativeLocations.delete(project);
+      evictChats(project);
+      storeTab();
+      location.hash = 'chat';
+    });
     attachmentInput.addEventListener('click', () => camera?.close());
     attachmentInput.addEventListener('change', () => {
       const file = attachmentInput.files?.[0];
@@ -4287,7 +4331,7 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
     });
     attachmentControls.append(attachmentLabel);
     if (camera) attachmentControls.append(camera.root);
-    attachmentControls.append(attachmentInfo, removeAttachment);
+    attachmentControls.append(attachmentInfo, reviewChatHandoff, removeAttachment);
     section.append(attachmentControls);
   }
   section.append(status, details, warning, steeringStatus, actions, output, artifacts);
@@ -4333,6 +4377,8 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
         [attachment.chatHandoffLabel, attachment.file.name,
           Math.ceil(attachment.file.size / 1024) + ' KiB'].filter(Boolean).join(' · ') : retryMessage);
       removeAttachment.hidden = !attachment;
+      reviewChatHandoff.hidden = !attachment?.needsChatHandoffReview;
+      reviewChatHandoff.disabled = run.busy || run.checking;
       syncCamera();
     }
     const foreignIntent = pendingElsewhere();
@@ -4375,7 +4421,7 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
     closeSteer.hidden = !pendingSteering || !run.known || !finishedPhases.has(phase);
     recover.hidden = !intention || !reviewMatches(intention) || (run.known && run.operation?.id === intention.id);
     for (const action of [send, resume, steer, recover]) action.disabled = run.busy || run.checking || camera?.active === true;
-    if (mayStart?.() === false) send.disabled = resume.disabled = true;
+    if (mayStart?.() === false || ui.attachmentDrafts.get(draftKey)?.needsChatHandoffReview) send.disabled = resume.disabled = true;
     for (const action of [interrupt, cancel, check, checkSteer, closeSteer]) action.disabled = run.busy || run.checking;
     const body = text(advice ? relevantOperation?.advice :
       apiMode ? relevantOperation?.verification?.output : relevantOperation?.output, '');
@@ -4484,19 +4530,27 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
     } catch (error) {
       const imageModelRejected = Boolean(payload.imageSha256) && error.code === 'CODEX_IMAGE_MODEL_UNAVAILABLE';
       const targetRejected = error.status === 409 && error.code === 'CODEX_RESUME_TARGET_UNAVAILABLE';
+      const chatHandoffRejected = Boolean(payload.documentSha256) && error.status === 409 && error.code === 'CHAT_HANDOFF_STALE';
       const usageRejected = error.status === 409 &&
         ['CODEX_SUBSCRIPTION_LIMIT_REACHED', 'CODEX_SUBSCRIPTION_USAGE_UNCONFIRMED'].includes(error.code);
-      const confirmedRejection = [400, 403, 413].includes(error.status) || imageModelRejected || targetRejected || usageRejected ||
+      const confirmedRejection = [400, 403, 413].includes(error.status) || imageModelRejected || targetRejected || usageRejected || chatHandoffRejected ||
         (apiMode || payload.handover) && error.status === 409;
       if (endpoint === path && confirmedRejection && ui.runIntents.get(runKey)?.id === payload.id) {
         ui.runIntents.delete(runKey);
+        if (chatHandoffRejected) {
+          const key = intentDraftKey(payload);
+          const attachment = ui.attachmentDrafts.get(key);
+          if (attachment?.digest === payload.documentSha256 && attachment.chatHandoffConversationId) {
+            ui.attachmentDrafts.set(key, {...attachment, needsChatHandoffReview: true});
+          }
+        }
         if (payload.handover) handoff?.invalidate();
         if (payload.nativeOrigin) native?.invalidate();
         storeTab();
         paintRelatedRuns();
       }
-      run.known = Boolean((apiMode || payload.handover || imageModelRejected || usageRejected) && confirmedRejection);
-      run.message = usageRejected ? error.message : error.message + ' 作業状態を確認してください。';
+      run.known = Boolean((apiMode || payload.handover || imageModelRejected || usageRejected || chatHandoffRejected) && confirmedRejection);
+      run.message = usageRejected || chatHandoffRejected ? error.message : error.message + ' 作業状態を確認してください。';
       verifyCancellation = endpoint === '/api/codex/cancel' && (!error.status || error.status >= 500);
     } finally {
       run.busy = false;
@@ -4573,7 +4627,8 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
   }
 
   function submitNew(previous) {
-    if (run.busy || run.checking || !hasRoom() || !isCurrent() || mayStart?.() === false || previous?.phase === 'cancelled') return;
+    if (run.busy || run.checking || !hasRoom() || !isCurrent() || mayStart?.() === false || previous?.phase === 'cancelled' ||
+        ui.attachmentDrafts.get(draftKey)?.needsChatHandoffReview) return;
     if (camera?.active) {
       run.message = '撮影を完了するか、カメラを閉じてから送信してください。';
       paint();

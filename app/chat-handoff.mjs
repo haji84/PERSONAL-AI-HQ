@@ -7,6 +7,8 @@ const displayedLimit = 5000 + pageSize;
 const documentName = 'chatgpt-handoff.json';
 const problem = (status, message) => Object.assign(new Error(message), {status});
 const invalidRange = () => problem(400, '表示した会話の範囲を確認してください。');
+export const chatHandoffStale = () => Object.assign(problem(409, '元の会話で案件の正本と発言をもう一度照合してください。'),
+  {code:'CHAT_HANDOFF_STALE'});
 
 function handoffMessage(message) {
   const {role, text, createdAt, status, turnId, document, image} = message;
@@ -19,7 +21,7 @@ function handoffMessage(message) {
   };
 }
 
-export function readChatHandoff(chats, project, params) {
+export function readChatHandoff(chats, project, params, record = null) {
   if (!['project', 'id', 'through', 'observedAt', 'viewSha256'].every(key => params.getAll(key).length === 1)) throw invalidRange();
   const id = params.get('id');
   const requested = params.get('through');
@@ -48,7 +50,7 @@ export function readChatHandoff(chats, project, params) {
   const messages = displayed.map(handoffMessage);
   const origin = {
     schemaVersion: 1,
-    project: {id: project.id, goal: project.goal, repository: project.repository},
+    project: {id: project.id, goal: project.goal, repository: project.repository, ...(record && {record})},
     source: {id, kind: conversation.source, title: conversation.title, observedAt, viewSha256},
   };
   const hasLater = conversation.messages.length > size || result.nextOffset !== null;
@@ -71,15 +73,14 @@ export function readChatHandoff(chats, project, params) {
   return handoff;
 }
 
-export function chatConversationForHandoff(chats, project, reference) {
+export function chatHandoffReviewParams(project, reference) {
   if (reference?.document.name !== documentName) return null;
   try {
     const packet = JSON.parse(reference.document.text);
-    if (packet?.schemaVersion !== 1 || packet.project?.id !== project.id || typeof packet.source?.id !== 'string') return null;
-    const params = new URLSearchParams({project: project.id, id: packet.source.id, through: packet.range?.end,
+    if (packet?.schemaVersion !== 1 || packet.project?.id !== project.id || typeof packet.source?.id !== 'string') throw chatHandoffStale();
+    return new URLSearchParams({project: project.id, id: packet.source.id, through: packet.range?.end,
       observedAt: packet.source.observedAt, viewSha256: packet.source.viewSha256});
-    return readChatHandoff(chats, project, params).sha256 === reference.digest ? packet.source.id : null;
   } catch {
-    return null;
+    throw chatHandoffStale();
   }
 }

@@ -48,7 +48,7 @@ function savedMeasurement(value) {
   } catch { return null; }
 }
 
-export function createOperations(directory, native, execution, {prepareHandover, chatConversationForHandoff} = {}) {
+export function createOperations(directory, native, execution, {prepareHandover, prepareChatReview} = {}) {
   const db = new DatabaseSync(join(directory, 'conversations.sqlite'));
   db.exec(`PRAGMA busy_timeout = 3000;
     CREATE TABLE IF NOT EXISTS codex_operations (
@@ -566,6 +566,7 @@ export function createOperations(directory, native, execution, {prepareHandover,
       let admissionObservedAt;
       let submittedPrompt = input.prompt;
       try {
+        if (!chatReview && reference) chatReview = await prepareChatReview?.(project,reference,canDispatch);
         if (alreadyLaunched()) throw problem(409, 'この受付は引継ぎ済みです。元のCodexスレッドで続きを実行してください。');
         if (beginsHandover && (!prepareHandover || !execution)) throw problem(409, '引継ぎの照合を利用できません。');
         execution?.preflight(project, stage, expected, route, handoverReceipt);
@@ -609,9 +610,8 @@ export function createOperations(directory, native, execution, {prepareHandover,
           if (expectedRevision !== undefined && !execution.isCurrent(project, expectedRevision, stage, expected, route, handoverReceipt)) {
             throw problem(409,'案件の実行設定が変わりました。','EXECUTION_SETTINGS_CHANGED');
           }
-          chatReview?.assertCurrent();
-          const chatConversationId = chatReview?.conversationId ??
-            (reference ? chatConversationForHandoff?.(project,reference) ?? null : null);
+          chatReview?.assertCurrent(true);
+          const chatConversationId = chatReview?.conversationId ?? null;
           if (!freshUsage(admissionObservedAt)) throw usageProblem('CODEX_SUBSCRIPTION_USAGE_UNCONFIRMED');
           if (!insert.run(project.id, input.id, expected, digest, timestamp(), timestamp(), stage, route, handoverReceipt,
             handover?.review ?? null, input.resume ?? null, previous?.threadId ?? null, chatConversationId).changes) throw resumeUnavailable();
@@ -649,13 +649,13 @@ export function createOperations(directory, native, execution, {prepareHandover,
         beforeThread: () => {
           if (!maySubmit()) return false;
           if (!freshUsage(admissionObservedAt)) throw usageProblem('CODEX_SUBSCRIPTION_USAGE_UNCONFIRMED');
-          chatReview?.assertCurrent();
+          chatReview?.assertCurrent(true);
           return true;
         }, beforeTurn,
         onThread: id => {
           if ((previous && id !== previous.threadId) || !maySubmit() || (beginsHandover && stillCurrent?.() !== true)) return false;
           if (!freshUsage(usageObservedAt)) throw usageProblem('CODEX_SUBSCRIPTION_USAGE_UNCONFIRMED');
-          chatReview?.assertCurrent();
+          chatReview?.assertCurrent(true);
           return setThread.run(id, timestamp(), Object.keys(chosen).length ? JSON.stringify(chosen) : null, project.id, input.id).changes === 1;
         },
       }).then(result => {
@@ -668,6 +668,7 @@ export function createOperations(directory, native, execution, {prepareHandover,
           if (current?.phase === 'reserved') {
             const failure = Object.hasOwn(subscriptionUsageMessages, error?.code) ? subscriptionUsageMessages[error.code] :
               error?.code === 'CODEX_RESUME_TARGET_UNAVAILABLE' ? resumeUnavailable().message :
+                error?.code === 'CHAT_HANDOFF_STALE' ? error.message :
                 chatReview ? '会話の照合条件またはCodex接続を確認できず、送信前に停止しました。' :
                   handoverReceipt ? '送信直前の引継ぎ条件またはCodex接続を確認できませんでした。' : '';
             if (failure) append.run(failure, timestamp(), project.id, input.id);
