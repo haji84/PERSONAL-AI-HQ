@@ -470,7 +470,7 @@ export function createOperations(directory, native, execution, {prepareHandover,
           if (!exact && !unsentFailure) continue;
           const measurement = exact && receiptMeasurement(row);
           results.push({projectId:project.id, id:row.id, kind:'codex', phase:row.phase, observedAt:row.updatedAt,
-            ...(exact && {threadId:row.threadId}), ...(measurement && {measurement})});
+            ...(exact && {threadId:row.threadId}), ...((measurement?.startedAt || measurement?.tokens) && {measurement})});
           if (++count === workOutcomeLimit) break;
         }
       }
