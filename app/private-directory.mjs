@@ -58,6 +58,47 @@ if (-not (Test-Private ([IO.Directory]::GetAccessControl($directory.FullName))) 
 [Console]::Out.Write('private')
 `;
 
+const windowsUserProtection = `
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Security
+$scope = [Security.Cryptography.DataProtectionScope]::CurrentUser
+$entropy = [Text.Encoding]::UTF8.GetBytes('Personal AI HQ ChatGPT credentials v1')
+$inputBytes = [Convert]::FromBase64String([Console]::In.ReadToEnd())
+$outputBytes = $null
+try {
+  $destination = $env:PERSONAL_AI_HQ_DPAPI_DESTINATION
+  if ([string]::IsNullOrEmpty($destination)) {
+    $outputBytes = [Security.Cryptography.ProtectedData]::Unprotect($inputBytes, $entropy, $scope)
+    [Console]::Out.Write([Convert]::ToBase64String($outputBytes))
+    return
+  }
+  $outputBytes = [Security.Cryptography.ProtectedData]::Protect($inputBytes, $entropy, $scope)
+  ${windowsOwnerACL}
+  $acl = [Security.AccessControl.FileSecurity]::new()
+  $acl.SetOwner($identity.User)
+  $acl.SetAccessRuleProtection($true, $false)
+  foreach ($sid in $trusted) {
+    $rule = [Security.AccessControl.FileSystemAccessRule]::new(
+      [Security.Principal.SecurityIdentifier]::new($sid),
+      [Security.AccessControl.FileSystemRights]::FullControl,
+      [Security.AccessControl.AccessControlType]::Allow)
+    $acl.AddAccessRule($rule)
+  }
+  $stream = [IO.FileStream]::new($destination, [IO.FileMode]::CreateNew,
+    [Security.AccessControl.FileSystemRights]::Write, [IO.FileShare]::None, 4096, [IO.FileOptions]::WriteThrough, $acl)
+  try {
+    $stream.Write($outputBytes, 0, $outputBytes.Length)
+    $stream.Flush($true)
+  } finally {
+    $stream.Dispose()
+  }
+  [Console]::Out.Write('protected')
+} finally {
+  [Array]::Clear($inputBytes, 0, $inputBytes.Length)
+  if ($null -ne $outputBytes) { [Array]::Clear($outputBytes, 0, $outputBytes.Length) }
+}
+`;
+
 const windowsWorkspaceCheck = String.raw`
 $ErrorActionPreference = 'Stop'
 ${windowsOwnerACL}
@@ -143,6 +184,41 @@ export async function assertWindowsPrivateWorkspace(directory, relativeFiles, si
       return !info.isFile() || info.nlink !== 1 || realpathSync.native(target) !== target;
     })) throw rejected();
   } catch { throw rejected(); }
+}
+
+function windowsProtection(data, destination = '') {
+  const unavailable = () => new Error('Windows user data protection is unavailable');
+  const systemRoot = process.env.SystemRoot;
+  if (process.platform !== 'win32' || !validWindowsDirectory(systemRoot) ||
+      !Buffer.isBuffer(data) || data.length === 0 || data.length > 144 * 1024) throw unavailable();
+  return new Promise((resolveOutput, rejectOutput) => {
+    const child = execFile(powershell(), ['-NoProfile', '-NonInteractive', '-Command', windowsUserProtection], {
+      cwd: systemRoot, windowsHide: true, timeout: 10_000, maxBuffer: 200 * 1024,
+      env: {SystemRoot: systemRoot, WINDIR: systemRoot, SystemDrive: systemRoot.slice(0, 2),
+        PERSONAL_AI_HQ_DPAPI_DESTINATION: destination},
+    }, (problem, stdout) => {
+      // Never expose child output or errors, since stdout can contain decrypted data.
+      if (problem) rejectOutput(unavailable());
+      else resolveOutput(stdout);
+    });
+    child.stdin.on('error', () => {});
+    child.stdin.end(data.toString('base64'));
+  });
+}
+
+export async function writeWindowsUserEncryptedFile(directory, name, contents) {
+  if (typeof name !== 'string' || !isOrdinaryWindowsPathComponent(name)) throw invalid();
+  await assertWindowsPrivateWorkspace(directory, []);
+  const destination = win32.join(directory, name);
+  if (await windowsProtection(contents, destination) !== 'protected') throw invalid();
+  await assertWindowsPrivateWorkspace(directory, [name]);
+}
+
+export async function decryptWindowsUserData(data) {
+  const response = await windowsProtection(data);
+  const plain = Buffer.from(response, 'base64');
+  if (!plain.length || plain.toString('base64') !== response) throw invalid();
+  return plain;
 }
 
 export async function ensurePrivateDirectory(input) {

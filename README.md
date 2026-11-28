@@ -22,7 +22,9 @@ Node.js 24とサインイン済みのCodex CLIを利用します。最初に `np
 
 Node.js 24以降とCodex Desktopを使います。`npm ci --ignore-scripts` の後、`start-windows.cmd` を開くと、URLと本人用のサインインファイルが表示されます。ファイルをブラウザーで開いてサインインします。Windowsの標準保存先は `%LOCALAPPDATA%\PersonalAIHQ\integration` です。新規ディレクトリは作成時に本人を所有者とし、アクセスを本人・SYSTEM・管理者に限定します。既存ディレクトリは所有者とアクセス権を確認し、条件を満たす場合だけ開きます。
 
-Windows版は、Desktop同梱の公式App Serverから実履歴と対応モデルを読み取ります。現在は閲覧用です。Macで確認済みの独立実行接続を、Windowsの実行確認と同じ扱いにはしません。
+Windows版は、Desktop同梱の公式App Serverから実履歴と対応モデルを読み取ります。Codexは既定で閲覧用です。Macで確認済みの独立実行接続を、Windowsの実行確認と同じ扱いにはしません。
+
+WindowsでChatGPTプランを使う場合は、同じコマンドプロンプトで `set HQ_CHATGPT_PLAN=1` を設定して `start-windows.cmd` を起動し、本人用のチャット画面からOpenAIでサインインして許可します。資格はWindows DPAPIのユーザースコープで暗号化し、その端末の本人専用ランタイムに保存します。各端末で本人のサインインが必要です。
 
 ## 接続と確認範囲
 

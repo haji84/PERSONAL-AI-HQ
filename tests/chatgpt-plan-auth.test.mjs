@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import {createHash, generateKeyPairSync, sign} from 'node:crypto';
-import {chmod, mkdtemp, readdir, readFile, rename, rm, stat, symlink} from 'node:fs/promises';
+import {chmod, mkdtemp, readdir, readFile, realpath, rename, rm, stat, symlink, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import test from 'node:test';
 import {createPlanAuth, PLAN_AUTH_CALLBACK_PATH} from '../app/chatgpt-plan-auth.mjs';
+import {ensurePrivateDirectory} from '../app/private-directory.mjs';
 
 const origin = 'http://127.0.0.1:4328';
 const issuer = 'https://auth.openai.com';
@@ -15,6 +16,8 @@ const scope = 'openid profile email offline_access resource.invoke chatgpt.token
 const {privateKey, publicKey} = generateKeyPairSync('rsa', {modulusLength: 2048});
 const jwk = {...publicKey.export({format: 'jwk'}), kid: 'fixture-key', alg: 'RS256', use: 'sig'};
 const mac = {skip: process.platform !== 'darwin' && 'The protected store requires macOS FileVault'};
+const windows = {skip: process.platform !== 'win32' && 'Windows DPAPI is required'};
+const protectedRuntime = {skip: !['darwin', 'win32'].includes(process.platform)};
 
 function idToken(nonce, claims = {}) {
   const encode = value => Buffer.from(JSON.stringify(value)).toString('base64url');
@@ -26,9 +29,10 @@ function idToken(nonce, claims = {}) {
   return input + '.' + sign('RSA-SHA256', Buffer.from(input), privateKey).toString('base64url');
 }
 
-async function fixture(t) {
-  const directory = await mkdtemp(join(tmpdir(), 'hq-auth-test-'));
-  t.after(() => rm(directory, {recursive: true, force: true}));
+async function fixture(t, {windowsPrivate = false} = {}) {
+  const scratch = await mkdtemp(join(windowsPrivate ? await realpath(tmpdir()) : tmpdir(), 'hq-auth-test-'));
+  t.after(() => rm(scratch, {recursive: true, force: true}));
+  const directory = windowsPrivate ? await ensurePrivateDirectory(join(scratch, 'private')) : scratch;
   const requests = [];
   let nextGrant;
   const fetchImpl = async (url, options) => {
@@ -131,8 +135,8 @@ test('rejects missing permission and unverified identity without replacing an ac
   }
 });
 
-test('serialized refresh rotates the entire record and survives reopening', mac, async t => {
-  const {auth, begin, reopen, requests, setGrant, validGrant} = await fixture(t);
+test('serialized refresh rotates the entire record and survives reopening', protectedRuntime, async t => {
+  const {auth, begin, reopen, requests, setGrant, validGrant} = await fixture(t, {windowsPrivate: process.platform === 'win32'});
   const {query, params} = await begin();
   setGrant(validGrant(params.get('nonce'), {expires_in: 1}));
   await auth.complete(origin, owner, query);
@@ -171,12 +175,43 @@ test('refuses a credential symlink and preserves its target', mac, async t => {
   assert.deepEqual(await readFile(target), before);
 });
 
-test('refuses persistent credentials on unverified platforms', {skip: process.platform === 'darwin'}, async t => {
+test('refuses persistent credentials on unverified platforms', {skip: ['darwin', 'win32'].includes(process.platform)}, async t => {
   const {auth, directory, requests} = await fixture(t);
   assert.deepEqual(await auth.status(), {configured: false, status: 'storage_unavailable'});
   await assert.rejects(auth.begin(origin, owner), {code: 'STORAGE_UNAVAILABLE'});
   assert.deepEqual(await readdir(directory), []);
   assert.equal(requests.length, 0);
+});
+
+test('Windows protects the grant for the signed-in OS user and reopens it', windows, async t => {
+  const {auth, begin, directory, reopen, requests} = await fixture(t, {windowsPrivate: true});
+  const {params, query} = await begin();
+  await assert.rejects(auth.complete(origin, 'other-owner-session', query), {code: 'INVALID_CALLBACK'});
+  assert.equal(requests.length, 0);
+  await auth.complete(origin, owner, query);
+  const files = await readdir(directory);
+  assert.deepEqual(files, ['chatgpt-plan-auth.dpapi']);
+  const sealed = await readFile(join(directory, files[0]));
+  for (const secret of ['fixture-access', 'fixture-refresh', 'fixture-user', params.get('ext_agent_host_id')]) {
+    assert.equal(sealed.includes(secret), false);
+  }
+  assert.equal((await reopen().status()).status, 'connected');
+  assert.equal(await reopen().accessToken(), 'fixture-access');
+});
+
+test('Windows rejects tampered data without authorizing or erasing it', windows, async t => {
+  const {auth, begin, directory, reopen, requests} = await fixture(t, {windowsPrivate: true});
+  const {query} = await begin();
+  await auth.complete(origin, owner, query);
+  const file = join(directory, 'chatgpt-plan-auth.dpapi');
+  const damaged = await readFile(file);
+  damaged[damaged.length - 1] ^= 1;
+  await writeFile(file, damaged);
+  requests.length = 0;
+  assert.deepEqual(await reopen().status(), {configured: false, status: 'storage_unavailable'});
+  await assert.rejects(reopen().begin(origin, owner), {code: 'STORAGE_UNAVAILABLE'});
+  assert.equal(requests.length, 0);
+  assert.deepEqual(await readFile(file), damaged);
 });
 
 test('authorization denial consumes the attempt and never exchanges the code', mac, async t => {
@@ -233,8 +268,8 @@ test('rejects canonical JWT encoding with an invalid cryptographic signature', m
   assert.equal((await auth.status()).status, 'disconnected');
 });
 
-test('separate auth instances cannot race a rotating refresh grant', mac, async t => {
-  const {auth, begin, reopen, requests, setGrant, validGrant} = await fixture(t);
+test('separate auth instances cannot race a rotating refresh grant', protectedRuntime, async t => {
+  const {auth, begin, reopen, requests, setGrant, validGrant} = await fixture(t, {windowsPrivate: process.platform === 'win32'});
   const {query, params} = await begin();
   setGrant(validGrant(params.get('nonce'), {expires_in: 1}));
   await auth.complete(origin, owner, query);
@@ -247,7 +282,7 @@ test('separate auth instances cannot race a rotating refresh grant', mac, async 
   });
   const first = auth.accessToken();
   try {
-    await entered.promise;
+    await Promise.race([entered.promise, first]);
     await assert.rejects(reopen().accessToken(), {code: 'AUTH_BUSY'});
   } finally {
     finish.resolve();

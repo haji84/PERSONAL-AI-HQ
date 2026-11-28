@@ -10,6 +10,7 @@
 *.sqlite-*
 *.db
 chatgpt-plan-auth.json
+chatgpt-plan-auth.dpapi
 .chatgpt-plan-auth*
 portfolio.json
 execution-policy.json*

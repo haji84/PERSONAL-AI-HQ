@@ -2,8 +2,9 @@ import {execFile} from 'node:child_process';
 import {createHash, createPublicKey, randomBytes, randomUUID, timingSafeEqual, verify} from 'node:crypto';
 import {constants} from 'node:fs';
 import {lstat, mkdir, open, realpath, rename, rmdir, stat, unlink} from 'node:fs/promises';
-import {join, resolve} from 'node:path';
+import {basename, join, resolve} from 'node:path';
 import {promisify} from 'node:util';
+import {assertWindowsPrivateWorkspace, decryptWindowsUserData, writeWindowsUserEncryptedFile} from './private-directory.mjs';
 
 export const PLAN_AUTH_CALLBACK_PATH = '/auth/callback';
 
@@ -23,6 +24,7 @@ const terminalRefreshErrors = new Set([
 const renewLifetime = 30 * 24 * 60 * 60_000;
 const refreshWindow = 30_000;
 const credentialLimit = 128 * 1024;
+const windowsCipherLimit = credentialLimit + 16 * 1024;
 const exec = promisify(execFile);
 const systemCommand = {timeout: 3000, maxBuffer: 16_384, env: {LC_ALL: 'C'}};
 const randomValue = () => randomBytes(32).toString('base64url');
@@ -86,9 +88,15 @@ function validStoredGrant(grant) {
 }
 
 function createCredentialStore(directory) {
+  const windows = process.platform === 'win32';
+  const filename = windows ? 'chatgpt-plan-auth.dpapi' : 'chatgpt-plan-auth.json';
   let volume;
   async function storagePath() {
     try {
+      if (windows) {
+        await assertWindowsPrivateWorkspace(directory, []);
+        return directory;
+      }
       volume ??= protectedVolume();
       const [device, info] = await Promise.all([volume, lstat(directory)]);
       if (!info.isDirectory() || !owner(info) || (info.mode & 0o777) !== 0o700 ||
@@ -102,20 +110,41 @@ function createCredentialStore(directory) {
   }
 
   async function read(path) {
-    const file = join(path, 'chatgpt-plan-auth.json');
+    const file = join(path, filename);
     let handle;
+    let selected;
     try {
-      handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      if (windows) {
+        selected = await lstat(file);
+        await assertWindowsPrivateWorkspace(path, [filename]);
+      }
+      handle = await open(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
     } catch (error) {
-      if (error.code === 'ENOENT') return null;
+      if (error.code === 'ENOENT' && !selected) return null;
       throw failure('STORAGE_UNAVAILABLE');
     }
     try {
       const info = await handle.stat();
-      if (!info.isFile() || !owner(info) || (info.mode & 0o777) !== 0o600 ||
-          info.nlink !== 1 || info.size > credentialLimit) throw failure('STORAGE_UNAVAILABLE');
-      await assertNoACL(file);
-      const record = JSON.parse(await handle.readFile('utf8'));
+      if (!info.isFile() || info.nlink !== 1 || info.size === 0 ||
+          info.size > (windows ? windowsCipherLimit : credentialLimit)) throw failure('STORAGE_UNAVAILABLE');
+      let record;
+      if (windows) {
+        if (!sameWindowsFile(selected, info)) throw failure('STORAGE_UNAVAILABLE');
+        const sealed = Buffer.alloc(info.size + 1);
+        const {bytesRead} = await handle.read(sealed, 0, sealed.length, 0);
+        if (bytesRead !== info.size || !sameWindowsFile(info, await handle.stat())) throw failure('STORAGE_UNAVAILABLE');
+        const plaintext = await decryptWindowsUserData(sealed.subarray(0, bytesRead));
+        try {
+          if (plaintext.length > credentialLimit) throw failure('STORAGE_UNAVAILABLE');
+          record = JSON.parse(plaintext.toString('utf8'));
+        } finally {
+          plaintext.fill(0);
+        }
+      } else {
+        if (!owner(info) || (info.mode & 0o777) !== 0o600) throw failure('STORAGE_UNAVAILABLE');
+        await assertNoACL(file);
+        record = JSON.parse(await handle.readFile('utf8'));
+      }
       if (record?.version !== 1 || !validHost(record.hostId) ||
           (record.grant !== null && !validStoredGrant(record.grant))) throw failure('STORAGE_UNAVAILABLE');
       return record;
@@ -128,21 +157,26 @@ function createCredentialStore(directory) {
 
   async function write(path, record) {
     const tempfile = join(path, '.chatgpt-plan-auth-' + randomUUID() + '.tmp');
+    const contents = Buffer.from(JSON.stringify(record));
     try {
-      const contents = JSON.stringify(record);
-      if (Buffer.byteLength(contents) > credentialLimit) throw failure('STORAGE_UNAVAILABLE');
-      const handle = await open(tempfile, 'wx', 0o600);
-      try {
-        await assertNoACL(tempfile);
-        await handle.writeFile(contents);
-        await handle.sync();
-      } finally {
-        await handle.close();
+      if (contents.length > credentialLimit) throw failure('STORAGE_UNAVAILABLE');
+      if (windows) {
+        await writeWindowsUserEncryptedFile(path, basename(tempfile), contents);
+      } else {
+        const handle = await open(tempfile, 'wx', 0o600);
+        try {
+          await assertNoACL(tempfile);
+          await handle.writeFile(contents);
+          await handle.sync();
+        } finally {
+          await handle.close();
+        }
       }
-      await rename(tempfile, join(path, 'chatgpt-plan-auth.json'));
+      await rename(tempfile, join(path, filename));
     } catch {
       throw failure('STORAGE_UNAVAILABLE');
     } finally {
+      contents.fill(0);
       await unlink(tempfile).catch(() => {});
     }
   }
@@ -164,6 +198,11 @@ function createCredentialStore(directory) {
   }
 
   return {storagePath, read, write, exclusive};
+}
+
+function sameWindowsFile(before, after) {
+  return after.isFile() && after.nlink === 1 && before.dev === after.dev && before.ino === after.ino &&
+    before.size === after.size && before.ctimeMs === after.ctimeMs && before.mtimeMs === after.mtimeMs;
 }
 
 function decodePart(part) {
