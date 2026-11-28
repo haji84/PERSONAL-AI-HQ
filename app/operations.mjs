@@ -100,6 +100,17 @@ export function createOperations(directory, native, execution, {prepareHandover,
   const chatForTurn = db.prepare(`SELECT phase, chatConversationId FROM codex_operations
     WHERE project=? AND threadId=? AND turnId=? AND chatConversationId IS NOT NULL
     AND workspace IN (SELECT value FROM json_each(?)) LIMIT 2`);
+  const linkedChatScope = `saved.project=?1 AND saved.chatConversationId=?2 AND saved.workspace IN (SELECT value FROM json_each(?3))
+      AND NOT EXISTS (SELECT 1 FROM codex_operations AS conflict
+        WHERE conflict.project=saved.project AND conflict.rowid<>saved.rowid
+          AND conflict.threadId=saved.threadId AND conflict.turnId=saved.turnId
+          AND conflict.workspace IN (SELECT value FROM json_each(?3)))`;
+  const linkedChatRows = db.prepare(`SELECT saved.id,saved.phase,saved.threadId,saved.turnId,saved.createdAt,saved.updatedAt,
+      saved.cancellationRequestedAt,saved.fingerprint FROM codex_operations AS saved WHERE ${linkedChatScope}
+    ORDER BY saved.createdAt DESC, saved.rowid DESC LIMIT ?4`);
+  const linkedChatReceipt = db.prepare(`SELECT saved.workspace,saved.fingerprint,saved.phase,saved.threadId,saved.turnId,
+      saved.createdAt,saved.updatedAt,saved.startedAt,saved.cancellationRequestedAt
+    FROM codex_operations AS saved WHERE ${linkedChatScope} AND saved.id=?4`);
   const insert = db.prepare(`INSERT INTO codex_operations(project,id,workspace,fingerprint,phase,createdAt,updatedAt,stage,explicitRoute,handoverReceipt,handoverReview,expectedThreadId,chatConversationId)
     SELECT ?1,?2,?3,?4,'reserved',?5,?6,?7,?8,?9,?10,?12,?13 WHERE ?11 IS NULL OR EXISTS (
       SELECT 1 FROM codex_operations WHERE project=?1 AND id=?11 AND workspace=?3 AND threadId IS NOT NULL AND turnId IS NOT NULL
@@ -295,6 +306,37 @@ export function createOperations(directory, native, execution, {prepareHandover,
       if (!row) return null;
       if (row.phase === 'completed' || (active.has(row.phase) && row.phase !== 'reserved')) return row.chatConversationId;
       return undefined;
+    },
+    completedChatReceipt(project, conversationId, id, threadId, turnId) {
+      if (!allowedId.test(id)) return null;
+      const row = linkedChatReceipt.get(project.id, conversationId, JSON.stringify(project.cwd), id);
+      if (row?.phase !== 'completed' || row.threadId !== threadId || row.turnId !== turnId ||
+          !nativeThreadId.test(row.threadId) || !nativeThreadId.test(row.turnId) ||
+          !reviewHash.test(row.fingerprint) || !observedWorkTime(row.updatedAt, Date.now())) return null;
+      const updated = Date.parse(row.updatedAt);
+      if (!observedWorkTime(row.createdAt, updated) ||
+          (row.startedAt !== null && !observedWorkTime(row.startedAt, updated)) ||
+          (row.cancellationRequestedAt !== null && !observedWorkTime(row.cancellationRequestedAt, updated))) return null;
+      return {workspace:row.workspace, snapshot:JSON.stringify(row)};
+    },
+    workForChat(project, conversationId) {
+      const works = [];
+      const now = Date.now();
+      for (const row of linkedChatRows.all(project.id, conversationId, JSON.stringify(project.cwd), workOutcomeLimit)) {
+        if (!allowedId.test(row.id) || !reviewHash.test(row.fingerprint) ||
+            (!active.has(row.phase) && !terminal.has(row.phase)) || !observedWorkTime(row.updatedAt, now)) continue;
+        const updated = Date.parse(row.updatedAt);
+        if (!observedWorkTime(row.createdAt, updated) ||
+            (row.cancellationRequestedAt !== null && !observedWorkTime(row.cancellationRequestedAt, updated))) continue;
+        const hasThread = typeof row.threadId === 'string' && nativeThreadId.test(row.threadId);
+        const hasTurn = typeof row.turnId === 'string' && nativeThreadId.test(row.turnId);
+        if ((row.threadId !== null && !hasThread) || (row.turnId !== null && (!hasThread || !hasTurn))) continue;
+        const confirmed = hasThread && hasTurn && row.phase !== 'reserved' && row.phase !== 'sending';
+        if (!confirmed && (row.phase === 'completed' || row.phase === 'interrupted')) continue;
+        works.push({id:row.id,phase:visiblePhase(row),observedAt:row.updatedAt,
+          threadId:confirmed ? row.threadId : null,turnId:confirmed ? row.turnId : null});
+      }
+      return works;
     },
     completedArtifactSource(project, checkout, {operationId, threadId, turnId}) {
       if (typeof operationId !== 'string' || !allowedId.test(operationId) || typeof threadId !== 'string' ||

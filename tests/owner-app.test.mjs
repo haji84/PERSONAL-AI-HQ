@@ -1451,6 +1451,9 @@ test('Codex chat context pins only exact existing conversation handoffs and pres
   const operations = new DatabaseSync(join(directory,'conversations.sqlite'));
   try {
     const {updatedAt} = operations.prepare("SELECT updatedAt FROM codex_operations WHERE project='example' AND id='actual-link'").get();
+    assert.deepEqual(await (await call('/api/chat/codex-work',{id:'correct-chat'})).json(),{works:[
+      {id:'actual-link',phase:'completed',observedAt:updatedAt,threadId:'thread-actual-link',turnId:'turn-actual-link'},
+    ]});
     assert.deepEqual((await (await call('/api/portfolio')).json()).recentWorkOutcomes,
       [{projectId:'example', id:'actual-link', kind:'codex', phase:'completed', observedAt:updatedAt, threadId:'thread-actual-link'}]);
     const setPhase = operations.prepare("UPDATE codex_operations SET phase=? WHERE project='example' AND id='actual-link'");
@@ -1477,6 +1480,197 @@ test('Codex chat context pins only exact existing conversation handoffs and pres
   assert.deepEqual((await (await getContext('historic-turn')).json()).conversation,
     {id:'other-chat',title:'Candidate',linked:false});
   assert.equal(submits,3);
+});
+
+test('linked Codex work reads only the current conversation and workspace without reconciling or dispatching', async t => {
+  const {directory, start} = await runtimeFixture(t);
+  const checkout = join(directory,'workspaces','example');
+  const registry = join(directory,'portfolio.json');
+  const definition = {...seed,projects:[{...seed.projects[0],cwd:checkout},
+    {id:'other',name:'別案件',cwd:checkout}]};
+  const save = () => writeFile(registry,JSON.stringify(definition),{mode:0o600});
+  await save();
+  let nativeRequests=0;
+  const unexpected = () => { nativeRequests++; throw new Error('Native call during linked work read'); };
+  const app = await start({codex:{models:unexpected,readThread:unexpected,findSubmission:unexpected,submit:unexpected}});
+  const cookie = await login(app);
+  const call = (route, params, body) => fetch(app.url+route+'?'+new URLSearchParams(params),{
+    method:body?'POST':'GET',headers:{cookie,...(body&&{Origin:app.url,'Content-Type':'application/json'})},
+    ...(body&&{body:JSON.stringify(body)}),
+  });
+  const archive = id => ({id,title:'検証用の会話',update_time:1,current_node:'m',mapping:{m:{parent:null,
+    message:{author:{role:'user'},content:{parts:['会話本文は作業一覧へ含めない']}}}}});
+  assert.equal((await call('/api/chat/import',{project:'example'},[archive('origin-chat'),archive('other-chat')])).status,200);
+  assert.equal((await call('/api/chat/import',{project:'other'},[archive('origin-chat')])).status,200);
+  const store = createChatStore(directory,{now:()=>Date.parse('2026-11-27T00:00:00.000Z')});
+  const wrongSource = 'api/10000000-0000-4000-a000-100000000000';
+  let liveId;
+  try {
+    store.beginDevelopment('example',{id:wrongSource.slice(4),prompt:'API only',model:'fixture-model',
+      createdAt:'2026-11-27T00:00:00.000Z'});
+    const {turn}=store.beginLive('example',{id:'live-history-fixture',prompt:'会話',model:'fixture-model'});
+    liveId=turn.conversationId;
+  }
+  finally { store.close(); }
+
+  const db = new DatabaseSync(join(directory,'conversations.sqlite'));
+  try {
+    const insert = db.prepare(`INSERT INTO codex_operations(project,id,workspace,fingerprint,phase,threadId,turnId,createdAt,
+      updatedAt,output,chatConversationId,cancellationRequestedAt) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`);
+    const bit = '2026-11-27T00:00:00.000Z';
+    const pendingAt = '2026-11-27T00:00:02.000Z';
+    const put = ({id,project='example',workspace=checkout,phase='completed',thread='shared-thread',turn=id,at=bit,
+      updatedAt=at,chat='origin-chat',cancel=null}) =>
+      insert.run(project,id,workspace,'a'.repeat(64),phase,thread,turn,at,updatedAt,'PRIVATE_OUTPUT',chat,cancel);
+    put({id:'successful-work'});
+    put({id:'sending-work',phase:'sending',turn:null,at:pendingAt,cancel:pendingAt});
+    put({id:'legacy-work',chat:null});
+    put({id:'another-chat-work',chat:'other-chat'});
+    put({id:'live-chat-work',chat:liveId});
+    put({id:'other-project-work',project:'other'});
+    put({id:'detached-work',workspace:checkout+'-old'});
+    put({id:'invalid-date-work',updatedAt:'2026-11-27'});
+    put({id:'invalid-thread-work',thread:'invalid/id'});
+    put({id:'duplicate-work'});
+    put({id:'duplicate-from-other-chat',turn:'duplicate-work',chat:'other-chat'});
+    const path = '/api/chat/codex-work';
+    const scope = {project:'example',id:'origin-chat'};
+    assert.equal((await fetch(app.url+path+'?'+new URLSearchParams(scope))).status,401);
+    const response = await call(path,scope);
+    assert.equal(response.status,200);
+    assert.deepEqual(await response.json(),{works:[
+      {id:'sending-work',phase:'cancelling',observedAt:pendingAt,threadId:null,turnId:null},
+      {id:'successful-work',phase:'completed',observedAt:bit,threadId:'shared-thread',turnId:'successful-work'},
+    ]});
+    assert.deepEqual(await (await call(path,{project:'other',id:'origin-chat'})).json(),{works:[
+      {id:'other-project-work',phase:'completed',observedAt:bit,threadId:'shared-thread',turnId:'other-project-work'},
+    ]});
+    assert.deepEqual(await (await call(path,{project:'example',id:'other-chat'})).json(),{works:[
+      {id:'another-chat-work',phase:'completed',observedAt:bit,threadId:'shared-thread',turnId:'another-chat-work'},
+    ]});
+    assert.deepEqual(await (await call(path,{project:'example',id:liveId})).json(),{works:[
+      {id:'live-chat-work',phase:'completed',observedAt:bit,threadId:'shared-thread',turnId:'live-chat-work'},
+    ]});
+    assert.equal(db.prepare("SELECT status FROM live_turns WHERE id='live-history-fixture'").get().status,'in_progress');
+    for (const id of ['missing-chat',wrongSource]) assert.equal((await call(path,{...scope,id})).status,404);
+    assert.equal((await call(path,[['project','example'],['project','other'],['id','origin-chat']])).status,404);
+    assert.equal((await call(path,[['project','example'],['id','origin-chat'],['id','other-chat']])).status,404);
+    assert.equal((await call(path,scope,{})).status,404);
+    assert.deepEqual({...db.prepare("SELECT phase,updatedAt FROM codex_operations WHERE id='sending-work'").get()},
+      {phase:'sending',updatedAt:pendingAt});
+    for(let index=10;index<19;index++) put({id:'newer-work-'+index,phase:'failed',thread:null,turn:null,
+      at:'2026-11-27T00:00:'+index+'.000Z'});
+    const newest=(await (await call(path,scope)).json()).works;
+    assert.deepEqual(newest.map(row=>row.id),Array.from({length:8},(_,index)=>'newer-work-'+(18-index)));
+    definition.projects[0].cwd=checkout+'-new';
+    await save();
+    assert.deepEqual(await (await call(path,scope)).json(),{works:[]});
+    assert.equal(nativeRequests,0);
+  } finally {db.close();}
+});
+
+test('linked Codex result confirms an exact older receipt outside recent native history', async t => {
+  const {directory,start} = await runtimeFixture(t);
+  const checkout = join(directory,'workspaces','example');
+  const registry = join(directory,'portfolio.json');
+  const definition = {...seed,projects:[{...seed.projects[0],cwd:checkout},
+    {id:'other',name:'別案件',cwd:checkout}]};
+  const save = () => writeFile(registry,JSON.stringify(definition),{mode:0o600});
+  await save();
+  const ids={receipt:'exact-old-receipt',thread:'native-long-thread',turn:'old-native-turn',chat:'origin-chat'};
+  let historyReads=0, confirmations=0, evidenceReads=0;
+  let mode;
+  const app = await start({codex:{
+    async readThread(scope,thread,cursor) {
+      historyReads++;
+      assert.deepEqual(scope,[checkout]);
+      assert.equal(thread,ids.thread);
+      const page=Number(cursor ?? 0);
+      return {thread:{id:thread},turns:Array.from({length:4},(_,index)=>({id:'recent-'+(page*4+index),
+        status:'completed'})),nextCursor:String(page+1)};
+    },
+    async confirmLinkedTurn(workspace,thread,turn,receipt) {
+      confirmations++;
+      assert.deepEqual([workspace,thread,turn,receipt],[checkout,ids.thread,ids.turn,ids.receipt]);
+      return mode!=='wrong-first-user';
+    },
+    async readTurnEvidence(scope,thread,turn) {
+      evidenceReads++;
+      assert.deepEqual(scope,[checkout]);
+      assert.deepEqual([thread,turn],[ids.thread,ids.turn]);
+      if(mode==='revoke-receipt') db.prepare('UPDATE codex_operations SET chatConversationId=? WHERE id=?')
+        .run('other-chat',ids.receipt);
+      if(mode==='replace-checkpoint') db.prepare('UPDATE codex_operations SET fingerprint=? WHERE id=?')
+        .run('b'.repeat(64),ids.receipt);
+      if(mode==='revoke-workspace') {
+        definition.projects[0].cwd=checkout+'-new';
+        await save();
+      }
+      return {threadId:thread,turnId:turn,entries:[{type:'command',id:'verified-command',status:'completed',exitCode:0,
+        output:'PRIVATE_NATIVE_OUTPUT'}],nextCursor:null};
+    },
+  }});
+  const db=new DatabaseSync(join(directory,'conversations.sqlite'));
+  t.after(()=>db.close());
+  const cookie=await login(app);
+  const archive=id=>({id,title:'元の会話',update_time:1,current_node:'m',mapping:{m:{parent:null,
+    message:{author:{role:'user'},content:{parts:['PRIVATE_CHAT']}}}}});
+  const post=project=>fetch(app.url+'/api/chat/import?project='+project,{method:'POST',
+    headers:{cookie,Origin:app.url,'Content-Type':'application/json'},body:JSON.stringify([archive(ids.chat),archive('other-chat')])});
+  assert.equal((await post('example')).status,200);
+  assert.equal((await post('other')).status,200);
+  const at='2026-11-27T00:00:00.000Z';
+  const insert=db.prepare(`INSERT INTO codex_operations(project,id,workspace,fingerprint,phase,threadId,turnId,createdAt,
+    updatedAt,chatConversationId) VALUES ('example',?,? ,?,'completed',?,?,?, ?,?)`);
+  const createReceipt=(id,chat=ids.chat)=>insert.run(id,checkout,'a'.repeat(64),ids.thread,ids.turn,at,at,chat);
+  createReceipt(ids.receipt);
+  const route=app.url+'/api/codex/chat-context?';
+  const scope={project:'example',id:ids.thread,turn:ids.turn,conversation:ids.chat,receipt:ids.receipt};
+  const linked=(params={},authentication=cookie)=>fetch(route+new URLSearchParams({...scope,...params}),{headers:{cookie:authentication}});
+  const legacy=new URLSearchParams(scope);
+  legacy.delete('receipt');
+  assert.equal((await fetch(route+legacy,{headers:{cookie}})).status,404);
+  assert.equal(historyReads,4);
+
+  const response=await linked();
+  assert.equal(response.status,200);
+  const result=await response.json();
+  assert.deepEqual(result.conversation,{id:ids.chat,title:'元の会話',linked:true});
+  const packet=JSON.parse(result.document.text);
+  assert.equal(packet.status,'completed');
+  assert.equal(packet.completedAt,undefined);
+  assert.equal(packet.coverage.turnPages,0);
+  assert.deepEqual(packet.commands,[{status:'completed',exitCode:0}]);
+  assert.equal(JSON.stringify(result).includes('PRIVATE_'),false);
+  assert.deepEqual([historyReads,confirmations,evidenceReads],[4,1,1]);
+
+  assert.equal((await linked({},'')).status,401);
+  const noConversation=new URLSearchParams(scope);
+  noConversation.delete('conversation');
+  assert.equal((await fetch(route+noConversation,{headers:{cookie}})).status,400);
+  assert.equal((await linked({historyCursor:'wrong-cursor'})).status,400);
+  assert.equal((await fetch(route+new URLSearchParams(scope)+'&receipt=another-receipt',{headers:{cookie}})).status,400);
+  for (const params of [{project:'other'},{conversation:'other-chat'},{receipt:'another-receipt'},
+    {id:'wrong-thread'},{turn:'wrong-turn'}]) assert.equal((await linked(params)).status,404);
+  createReceipt('conflicting-receipt','other-chat');
+  assert.equal((await linked()).status,404);
+  db.prepare('DELETE FROM codex_operations WHERE id=?').run('conflicting-receipt');
+  db.prepare("UPDATE codex_operations SET phase='failed' WHERE id=?").run(ids.receipt);
+  assert.equal((await linked()).status,404);
+  db.prepare("UPDATE codex_operations SET phase='completed' WHERE id=?").run(ids.receipt);
+  assert.deepEqual([historyReads,confirmations,evidenceReads],[4,1,1]);
+  mode='wrong-first-user';
+  assert.equal((await linked()).status,404);
+  assert.equal(evidenceReads,1);
+
+  mode='revoke-receipt';
+  assert.equal((await linked()).status,404);
+  db.prepare('UPDATE codex_operations SET chatConversationId=? WHERE id=?').run(ids.chat,ids.receipt);
+  mode='replace-checkpoint';
+  assert.equal((await linked()).status,404);
+  mode='revoke-workspace';
+  assert.equal((await linked()).status,404);
+  assert.equal(historyReads,4);
 });
 
 test('Codex chat context includes only committed artifacts attested for the exact turn',

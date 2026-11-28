@@ -6,6 +6,7 @@ const missingThread = () => problem(404, 'この案件のCodex作業を確認で
 const unavailable = () => problem(503, 'このCodex接続から作業記録を照合できません。');
 const conversationSources = new Set(['chatgpt-export', 'chatgpt-live']);
 const conversationId = /^(?:[a-z0-9_.:-]{1,160}|live\/[a-f0-9-]{36})$/i;
+const receiptId = /^[a-z0-9_-]{8,80}$/i;
 const hexDigest = /^[a-f0-9]{64}$/;
 const statuses = new Set(['completed', 'failed', 'declined', 'inProgress']);
 const kinds = new Set(['add', 'update', 'delete']);
@@ -87,6 +88,10 @@ function selectConversation(chats, operations, project, id, turnId, candidate) {
   const linked = established !== null;
   const selected = established ?? candidate;
   if (selected === null) return null;
+  return conversationView(chats, project, selected, linked);
+}
+
+function conversationView(chats, project, selected, linked) {
   const source = chats.read(project.id, selected, 0, {reconcile: false})?.conversation;
   return conversationSources.has(source?.source) && source.id === selected
     ? {id: source.id, title: source.title, linked} : null;
@@ -117,19 +122,30 @@ export async function readCodexChatContext({chats, operations, native, nativeArt
   const turnId = params.get('turn');
   const candidate = params.get('conversation');
   const historyCursor = params.get('historyCursor');
+  const receipt = params.get('receipt');
   if (!['project', 'id', 'turn'].every(key => params.getAll(key).length === 1) ||
       params.getAll('conversation').length > 1 || params.getAll('historyCursor').length > 1 ||
       (historyCursor !== null && !validEvidenceCursor(historyCursor)) || !validEvidenceTarget(id) || !validEvidenceTarget(turnId) ||
-      (candidate !== null && !conversationId.test(candidate))) {
+      (candidate !== null && !conversationId.test(candidate)) ||
+      (receipt !== null && (params.getAll('receipt').length !== 1 || !receiptId.test(receipt) || candidate === null ||
+        historyCursor !== null))) {
     throw problem(400, 'スレッド、作業、会話の指定を確認してください。');
   }
   if (!project.cwd.length) throw missingThread();
-  if (!native.readThread || !native.readTurnEvidence) throw unavailable();
+  if (!native.readTurnEvidence || (receipt === null ? !native.readThread : !native.confirmLinkedTurn)) throw unavailable();
+  const readReceipt = () => operations.completedChatReceipt(project, candidate, receipt, id, turnId);
+  const saved = receipt === null ? null : readReceipt();
+  if (receipt !== null && (!saved || !conversationView(chats, project, candidate, true))) throw missingThread();
   let turn;
   let evidence;
   try {
-    turn = await confirmTurn(native, project.cwd, id, turnId, historyCursor);
-    evidence = await turnEvidence(native, project.cwd, id, turnId);
+    if (saved) {
+      if (await native.confirmLinkedTurn(saved.workspace, id, turnId, receipt) !== true) throw missingThread();
+      turn = {pages: 0};
+    } else {
+      turn = await confirmTurn(native, project.cwd, id, turnId, historyCursor);
+    }
+    evidence = await turnEvidence(native, saved ? [saved.workspace] : project.cwd, id, turnId);
   } catch (error) {
     if ([404, 409, 503].includes(error?.status)) throw error;
     throw unavailable();
@@ -140,7 +156,9 @@ export async function readCodexChatContext({chats, operations, native, nativeArt
   const artifacts = published.flatMap(item =>
     relativeFile(item.title) && hexDigest.test(item.sha256) && exactDate(item.observedAt)
       ? [{path: item.title, sha256: item.sha256, observedAt: item.observedAt}] : []);
-  const conversation = selectConversation(chats, operations, project, id, turnId, candidate);
+  const conversation = saved ? conversationView(chats, project, candidate, true) :
+    selectConversation(chats, operations, project, id, turnId, candidate);
+  if (saved && (!conversation || readReceipt()?.snapshot !== saved.snapshot)) throw missingThread();
   const origin = {schemaVersion: 1, project: {id: project.id}, threadId: id, turnId, status: 'completed',
     ...(exactDate(turn.completedAt) && {completedAt: turn.completedAt}),
     coverage: {turnPages: turn.pages, evidencePages: evidence.pages, moreEvidence: evidence.more,

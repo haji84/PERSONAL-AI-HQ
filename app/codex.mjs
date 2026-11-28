@@ -477,9 +477,9 @@ export function createCodexClient({command, socket, loopback} = {}) {
     if (result?.data?.length !== 1 || latest?.id !== previousTurnId || !terminalTurns.has(latest.status)) throw resumeUnavailable();
   }
 
-  async function startedBy(rpc, id, turnId, clientId) {
+  async function startedBy(rpc, id, turnId, clientId, signal) {
     const result = await rpc.call('thread/items/list', {threadId: id, turnId,
-      limit: turnItemPageLimit, sortDirection: 'asc'});
+      limit: turnItemPageLimit, sortDirection: 'asc'}, undefined, signal);
     const first = items(result?.data).find(entry => entry?.item?.type === 'userMessage');
     return first ? first.turnId === turnId && first.item.clientId === clientId : null;
   }
@@ -636,6 +636,14 @@ export function createCodexClient({command, socket, loopback} = {}) {
       if (!validEvidenceTarget(turnId) || (item !== null && (!validEvidenceTarget(item) || cursor !== null)) ||
           (cursor !== null && !validEvidenceCursor(cursor))) throw missing('作業記録を見つけられませんでした。');
       return readEvidence(scope, id, turnId, cursor, item);
+    },
+    async confirmLinkedTurn(workspace, id, turnId, clientId) {
+      if (typeof workspace !== 'string' || !workspace || !validCodexRecordId(turnId) || !validCodexRecordId(clientId)) return false;
+      const signal = AbortSignal.timeout(8000);
+      const {rpc} = await scopedThread([workspace], id, undefined, signal);
+      if (await startedBy(rpc, id, turnId, clientId, signal) !== true) return false;
+      await scopedThread([workspace], id, rpc, signal);
+      return true;
     },
     async readHandoverTurn(workspace, id, turnId, clientId) {
       if (typeof workspace !== 'string' || !workspace || !validCodexRecordId(turnId) ||

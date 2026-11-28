@@ -478,6 +478,18 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       const subscription = await Promise.resolve(native.usage?.()).catch(() => null);
       return send(response, 200, {subscription: subscription ?? null});
     }
+    if (get && route === '/api/chat/codex-work') {
+      const params = target.searchParams;
+      const projectId = params.get('project');
+      const id = params.get('id');
+      const missing = () => error(404, 'この案件のChatGPT会話を確認できません。');
+      if (params.size !== 2 || !projectId || !id || id.length > 160) throw missing();
+      const project = readCurrentProject(directory,projectId);
+      if (!project) throw missing();
+      const conversation = chats.read(project.id,id,0,{reconcile:false})?.conversation;
+      if (conversation?.id !== id || !['chatgpt-export','chatgpt-live'].includes(conversation.source)) throw missing();
+      return send(response, 200, {works:operations.workForChat(project,id)});
+    }
     if (get && route === '/api/chat/plan' && plan) return send(response, 200, await plan.auth.status());
     if (post && route === '/api/chat/plan/authorize' && plan) {
       try { return send(response, 200, {authorizationUrl: await plan.auth.begin(url, session)}); }

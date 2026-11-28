@@ -3049,7 +3049,17 @@ function planComposer(project, onConversation) {
     }
   })();
   const conversationChanged = () => { closeCamera(); controls(); };
-  return {root: area.root, conversationChanged, reuseImage};
+  function stageCodexResult({document, digest, sourceConversationId}) {
+    if (!currentAttachmentField() || ui.chatIds.get(project) !== sourceConversationId || readingAttachment ||
+        attached() || ui.chatIntents.has(project) || chatStreams.has(project)) return false;
+    closeCamera();
+    ui.attachmentDrafts.set(draftKey, {document, digest, sourceConversationId});
+    reference.checked = true;
+    attachmentError = '';
+    controls();
+    return true;
+  }
+  return {root: area.root, conversationChanged, reuseImage, stageCodexResult};
 }
 function importSection(project) {
   const box = node('div', 'import-box');
@@ -3199,6 +3209,137 @@ function syncChatDevelopment() {
   if (visible) refreshEstimateReadouts();
 }
 
+function linkedCodexWork(project, conversation, isCurrent, stageResult) {
+  const details = node('details', 'scope-info');
+  const status = node('p', 'small muted');
+  status.setAttribute('role', 'status');
+  const rows = node('ul', 'marked-list');
+  const refresh = button('作業の記録を更新', () => void load());
+  details.append(node('summary', '', 'この会話から依頼したCodex作業'), status, rows, refresh);
+  let timer, activeRequest, signature;
+  let rendered = new Map();
+  const current = () => details.open && details.isConnected && isCurrent();
+  const endpoint = apiPath('/api/chat/codex-work', {project, id: conversation});
+  function refreshWhileActive() {
+    if (!current()) return;
+    timer = setTimeout(() => {
+      if (document.hidden) refreshWhileActive();
+      else void load();
+    }, 8000);
+  }
+
+  function workRow(work) {
+    const row = node('li', 'stack');
+    row.append(node('p', 'strong', activityLabels[work.phase]),
+      node('p', 'small muted', '記録 ' + time(work.observedAt)));
+    if (work.phase !== 'completed' || !validLinkedCodexId(work.threadId) || !validLinkedCodexId(work.turnId)) return row;
+    const confirmation = node('p', 'small muted');
+    confirmation.setAttribute('role', 'status');
+    const preview = node('pre', 'run-output');
+    preview.tabIndex = 0;
+    preview.hidden = true;
+    preview.setAttribute('aria-label', '照合済みのCodex作業結果');
+    const actions = node('div', 'run-actions');
+    let verified, reviewedConnection;
+    const attach = stageResult && button('Codex結果をこの会話の下書きに添付', () => {
+      if (!current() || !row.isConnected || !verified) return;
+      if (reviewedConnection !== connectionGeneration) {
+        confirmation.textContent = '接続が変わりました。実行結果をもう一度確認してください。';
+        attach.hidden = true;
+        return;
+      }
+      confirmation.textContent = stageResult(verified) ? 'この会話の下書きに添付しました。' :
+        '現在の添付と保留中の応答を確認してから追加してください。';
+    });
+    if (attach) attach.hidden = true;
+    const read = button('この作業の結果を確認', async () => {
+      if (!current() || read.disabled) return;
+      read.disabled = true;
+      preview.hidden = true;
+      verified = undefined;
+      if (attach) attach.hidden = true;
+      confirmation.textContent = '元の会話と実行結果を照合しています…';
+      const generation = connectionGeneration;
+      const canApply = () => current() && row.isConnected && generation === connectionGeneration;
+      try {
+        const result = await verifiedCodexChatResult(project, work.threadId, work.turnId, {
+          candidate: conversation, receipt: work.id, requireLinked: true, signal: AbortSignal.timeout(12000),
+        });
+        if (!canApply()) return;
+        verified = result;
+        reviewedConnection = generation;
+        const [commands, files, artifacts] = result.counts;
+        confirmation.textContent = `照合済み · 実行記録 ${commands}件 · 変更ファイル ${files}件 · 成果物 ${artifacts}件`;
+        preview.textContent = JSON.stringify(result.packet, null, 2);
+        preview.hidden = false;
+        if (attach) attach.hidden = false;
+      } catch (error) {
+        if (canApply()) confirmation.textContent = error.message;
+      } finally { read.disabled = false; }
+    });
+    actions.append(read);
+    if (attach) actions.append(attach);
+    row.append(actions, confirmation, preview);
+    return row;
+  }
+
+  async function load() {
+    if (!current() || activeRequest) return;
+    clearTimeout(timer);
+    const controller = new AbortController();
+    activeRequest = controller;
+    refresh.disabled = true;
+    if (signature === undefined) status.textContent = 'Codex作業を取得中…';
+    try {
+      const {works} = await api(endpoint, {signal: AbortSignal.any([controller.signal, AbortSignal.timeout(8000)])});
+      if (!current() || controller.signal.aborted) return;
+      if (!Array.isArray(works) || works.length > 8 || works.some(work => !validLinkedCodexId(work?.id) ||
+          !Object.hasOwn(activityLabels, work.phase) || !Number.isFinite(Date.parse(work.observedAt)))) {
+        throw new Error('この会話の作業記録を確認できませんでした。');
+      }
+      const next = JSON.stringify(works);
+      if (signature !== next) {
+        const focused = rows.contains(document.activeElement) ? document.activeElement : null;
+        const currentRows = new Map();
+        const elements = works.map(work => {
+          const key = JSON.stringify(work);
+          const element = rendered.get(key) ?? workRow(work);
+          currentRows.set(key, element);
+          return element;
+        });
+        rows.replaceChildren(...elements);
+        if (focused?.isConnected) focused.focus({preventScroll: true});
+        rendered = currentRows;
+        signature = next;
+      }
+      status.textContent = works.length ? '' : 'この会話に紐づくCodex作業はありません。';
+      if (works.some(work => pollingPhases.has(work.phase) && work.phase !== 'unconfirmed')) refreshWhileActive();
+    } catch (error) {
+      if (current() && !controller.signal.aborted) status.textContent = error.message;
+    } finally {
+      if (activeRequest === controller) {
+        activeRequest = undefined;
+        refresh.disabled = false;
+      }
+    }
+  }
+  details.addEventListener('toggle', () => {
+    if (details.open) void load();
+    else {
+      clearTimeout(timer);
+      activeRequest?.abort();
+      activeRequest = undefined;
+      refresh.disabled = false;
+      signature = undefined;
+      rendered.clear();
+      rows.replaceChildren();
+    }
+  });
+  return details;
+}
+
+const validLinkedCodexId = value => typeof value === 'string' && codexRecordId.test(value);
+
 function chat() {
   const details = selectedProject();
   const requestedVoice = realtimeCodexIntent?.project === details?.id ? realtimeCodexIntent : undefined;
@@ -3335,9 +3476,13 @@ function chat() {
       else messages.append(load);
       updateTransfer();
       destination.append(transfer);
-      if (['chatgpt-export', 'chatgpt-live'].includes(conversation.source) && asArray(conversation.messages).length &&
-          selectedProject()?.codexWrite === true && ui.capabilities.codexWrite === true) {
-        destination.append(chatCodexHandoff(project, conversation, detailIsCurrent));
+      if (['chatgpt-export', 'chatgpt-live'].includes(conversation.source)) {
+        if (selectedProject()?.codexScopes) {
+          destination.append(linkedCodexWork(project, conversation.id, detailIsCurrent, plan?.stageCodexResult));
+        }
+        if (asArray(conversation.messages).length && selectedProject()?.codexWrite === true && ui.capabilities.codexWrite === true) {
+          destination.append(chatCodexHandoff(project, conversation, detailIsCurrent));
+        }
       }
       if (apiArchive && conversation.outcome === 'completed') {
         cleanupHandoff = mountChatHandoff(destination, project, conversation, detailIsCurrent);
@@ -4268,6 +4413,31 @@ const evidenceKind = {add: '追加', update: '変更', delete: '削除'};
 const turnHistoryCursors = new WeakMap();
 const codexHistoryPages = new WeakMap();
 
+async function verifiedCodexChatResult(project, threadId, turn, {candidate, historyCursor, receipt, requireLinked = false, signal}) {
+  const result = await api(apiPath('/api/codex/chat-context', {project, id: threadId, turn, conversation: candidate, historyCursor, receipt}),
+    {signal});
+  const {document, conversation, sha256, summary} = result ?? {};
+  const counts = [summary?.commands, summary?.files, summary?.artifacts];
+  if (result?.threadId !== threadId || result.turnId !== turn || document?.name !== 'codex-result.json' ||
+      typeof document.text !== 'string' || counts.some(count => !Number.isSafeInteger(count) || count < 0) ||
+      (conversation !== null && (typeof conversation?.id !== 'string' || !conversation.id ||
+        typeof conversation.linked !== 'boolean' || (!conversation.linked && conversation.id !== candidate))) ||
+      (requireLinked && (conversation?.linked !== true || conversation.id !== candidate))) {
+    throw new Error('選択したターンまたは共有先を確認できませんでした。');
+  }
+  const bytes = new TextEncoder().encode(document.text);
+  if (bytes.length > textDocumentLimit || await attachmentDigest(bytes) !== sha256) {
+    throw new Error('添付資料が照合結果と一致しません。');
+  }
+  const packet = JSON.parse(document.text);
+  if (packet.project?.id !== project || packet.threadId !== threadId || packet.turnId !== turn || packet.status !== 'completed' ||
+      ['commands', 'files', 'artifacts'].some((key, index) => asArray(packet[key]).length !== counts[index])) {
+    throw new Error('収録した結果を確認できませんでした。');
+  }
+  const digest = await attachmentDigest(bytes, document.name);
+  return {document, conversation, counts, packet, digest, sourceConversationId: conversation?.id ?? null};
+}
+
 function codexResultChatHandoff(project, threadId, selector, isCurrent) {
   const root = node('div', 'stack');
   const actions = node('div', 'run-actions');
@@ -4308,33 +4478,14 @@ function codexResultChatHandoff(project, threadId, selector, isCurrent) {
     const current = () => visit === generation && isCurrent() && eligible() && selector.value === turn;
     status.textContent = 'このターンの結果と共有先を照合しています…';
     try {
-      const result = await api(apiPath('/api/codex/chat-context', {project, id: threadId, turn, conversation: candidate, historyCursor}),
-        {signal: AbortSignal.timeout(12000)});
-      if (!current()) return;
-      const {document, conversation, sha256, summary} = result ?? {};
-      const counts = [summary?.commands, summary?.files, summary?.artifacts];
-      if (result?.threadId !== threadId || result.turnId !== turn || document?.name !== 'codex-result.json' ||
-          typeof document.text !== 'string' || counts.some(count => !Number.isSafeInteger(count) || count < 0) ||
-          (conversation !== null && (typeof conversation?.id !== 'string' || !conversation.id ||
-            typeof conversation.linked !== 'boolean' || (!conversation.linked && conversation.id !== candidate)))) {
-        throw new Error('選択したターンまたは共有先を確認できませんでした。');
-      }
-      const bytes = new TextEncoder().encode(document.text);
-      if (bytes.length > textDocumentLimit || await attachmentDigest(bytes) !== sha256) {
-        throw new Error('添付資料が照合結果と一致しません。');
-      }
-      const packet = JSON.parse(document.text);
-      if (packet.project?.id !== project || packet.threadId !== threadId || packet.turnId !== turn || packet.status !== 'completed' ||
-          ['commands', 'files', 'artifacts'].some((key, index) => asArray(packet[key]).length !== counts[index])) {
-        throw new Error('収録した結果を確認できませんでした。');
-      }
-      const digest = await attachmentDigest(bytes, document.name);
+      const {document, conversation, counts, digest, sourceConversationId} = await verifiedCodexChatResult(project, threadId, turn,
+        {candidate, historyCursor, signal: AbortSignal.timeout(12000)});
       if (!current()) return;
       const target = conversation ? text(conversation.title, '保存済みの会話') : 'この案件の新しい相談';
       status.textContent = [`共有先 ${target}`, `実行記録${counts[0]}件・変更ファイル${counts[1]}件・成果物${counts[2]}件`].join(' · ');
       preview.textContent = document.text;
       preview.hidden = false;
-      prepared = {turn, document, digest, sourceConversationId: conversation?.id ?? null};
+      prepared = {turn, document, digest, sourceConversationId};
       attach.disabled = false;
     } catch (error) {
       if (current()) status.textContent = error.message;
