@@ -1,7 +1,7 @@
 import {execFileSync} from 'node:child_process';
 import {createHash, randomUUID} from 'node:crypto';
 import assert from 'node:assert/strict';
-import {mkdir, mkdtemp, readFile, realpath, rm, writeFile} from 'node:fs/promises';
+import {mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {basename, dirname, join, resolve} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
@@ -565,8 +565,8 @@ test('portfolio separates saved modes, accepted route evidence and authoritative
     {id:'api-pending',name:'API intent',cwd:checkout('api-pending')},
     {id:'removed-scope',name:'Changed workspace',cwd:checkout('different')},
   ]};
+  for (const project of fixed.projects) await mkdir(project.cwd,{recursive:true,mode:0o700});
   for (const id of ['managed','uncertain-status']) {
-    await mkdir(checkout(id),{recursive:true,mode:0o700});
     await writeFile(join(checkout(id),'.hq-owned-workspace'),id+'\n');
   }
   await writeFile(join(directory,'portfolio.json'),JSON.stringify(fixed),{mode:0o600});
@@ -1327,6 +1327,165 @@ test('Codex cancellation is owner-scoped and closes the exact pre-send receipt w
   assert.equal(canSubmit('late-thread'), false);
   const activity = await fetch(app.url + '/api/execution/activity?project=example', {headers: {cookie}});
   assert.equal((await activity.json()).activity.phase, 'cancelled');
+});
+
+test('a saved workspace hold blocks new work and a hold during admission leaves no receipt', async t => {
+  const {directory,start} = await runtimeFixture(t);
+  const checkout = join(directory,'workspaces','example');
+  const other = join(directory,'workspaces','independent');
+  await mkdir(join(checkout,'.codex'),{recursive:true,mode:0o700});
+  await mkdir(other,{recursive:true,mode:0o700});
+  await writeFile(join(checkout,'.hq-owned-workspace'),'example\n');
+  await writeFile(join(other,'.hq-owned-workspace'),'independent\n');
+  const statePath = join(checkout,'.codex','autonomy-state.json');
+  const state = (status,extra) => writeFile(statePath,JSON.stringify({version:1,goal:{id:'example-goal',title:'Saved goal'},status,
+    tasks:[{id:'one',status:'pending',actionable:true,depends_on:[]}],next_action:'Check a fixture',...extra}),{mode:0o600});
+  await state('paused');
+  await writeFile(join(directory,'portfolio.json'),JSON.stringify({...seed,projects:[
+    {...seed.projects[0],cwd:checkout,enableCodexWrite:true},
+    {id:'independent',name:'Independent',cwd:other,enableCodexWrite:true},
+  ]}),{mode:0o600});
+  let pausedDuringUsage = false;
+  let pauseBeforeTurn = false;
+  let codexModels = 0;
+  let planModels = 0;
+  const sent = [];
+  const lastCheck = Promise.withResolvers();
+  const interrupted = Promise.withResolvers();
+  const app = await start({codex:{canWrite:true,subscriptionReady:async()=>true,
+    async models() {
+      codexModels++;
+      return {accountType:'chatgpt',data:[{id:'fixture-model',isDefault:true,reasoningEfforts:[]}]};
+    },
+    async usage() {
+      if (pausedDuringUsage) { pausedDuringUsage = false; await state('awaiting_approval'); }
+      return ordinaryUsage();
+    },
+    async submit(input) {
+      if (!input.beforeThread()) throw new Error('Thread not admitted');
+      await input.beforeTurn();
+      if (pauseBeforeTurn) { pauseBeforeTurn = false; await state('resource_limited'); }
+      try {
+        if (!input.onThread('thread-'+input.requestId)) throw new Error('Turn not admitted');
+        sent.push(input.requestId);
+        return {turn:{id:'turn-'+input.requestId,status:input.requestId === 'running-at-stop' ? 'inProgress' : 'completed'}};
+      } finally { if (input.requestId === 'before-native-turn') lastCheck.resolve(); }
+    },
+    async interrupt(_scope, thread, turn, beforeSend) {
+      beforeSend();
+      interrupted.resolve({thread,turn});
+    },
+  },plan:{responses:{async models() { planModels++; return []; }}}});
+  const cookie = await login(app);
+  const request = (route,project,body,params={}) => fetch(app.url+route+'?'+new URLSearchParams({project,...params}), {
+    method:body?'POST':'GET',headers:{cookie,...(body&&{Origin:app.url,'Content-Type':'application/json'})},
+    ...(body&&{body:JSON.stringify(body)}),
+  });
+  const run = (project,id) => request('/api/codex/run',project,{id,prompt:'Accepted fixture only'});
+  const read = (project,id) => request('/api/codex/run',project,null,{id}).then(result=>result.json());
+  const dashboard = () => request('/api/portfolio','example').then(result=>result.json());
+  assert.equal((await run('example','initial-hold')).status,409);
+  assert.equal((await read('example','initial-hold')).operation,null);
+  const [paused,unaffected] = (await dashboard()).projects;
+  assert.equal(paused.state,'paused');
+  assert.equal(paused.executionSummary.stopReason,'paused');
+  assert.equal(unaffected.state,'unknown');
+  assert.equal((await request('/api/chat/live','example',{id:'held-chat',model:'fixture-model',prompt:'Do not send'})).status,409);
+  const unavailable = checkout+'-offline';
+  await rename(checkout,unavailable);
+  const offline = await request('/api/chat/live','example',{id:'workspace-offline',model:'fixture-model',prompt:'Do not send'});
+  assert.equal(offline.status,409);
+  assert.equal((await offline.json()).code,'EXECUTION_HELD');
+  assert.equal((await dashboard()).projects[0].state,'blocked');
+  await rename(unavailable,checkout);
+  await writeFile(statePath,'{"status":',{mode:0o600});
+  assert.equal((await run('example','unreadable-state')).status,409);
+  assert.equal((await read('example','unreadable-state')).operation,null);
+  assert.equal((await dashboard()).projects[0].state,'blocked');
+  const savedSource = 'Verified project state\n';
+  await writeFile(join(checkout,'GOAL.md'),savedSource);
+  const source = {path:'GOAL.md',sha256:createHash('sha256').update(savedSource).digest('hex')};
+  await state('active',{source});
+  await writeFile(join(checkout,'GOAL.md'),'Changed project state\n');
+  assert.equal((await run('example','stale-source')).status,409);
+  assert.equal((await read('example','stale-source')).operation,null);
+  assert.equal((await dashboard()).projects[0].state,'blocked');
+  await state('complete');
+  assert.equal((await run('example','unchecked-completion')).status,409);
+  const unchecked = (await dashboard()).projects[0];
+  assert.equal(unchecked.state,'blocked');
+  assert.match(unchecked.stateScope,/完了記録.*確認/);
+  assert.equal(unchecked.measurements.verifiedCompletion,null);
+  assert.equal(codexModels,0);
+  assert.equal(planModels,0);
+  assert.equal((await run('independent','independent-receipt')).status,202);
+  assert.deepEqual(sent,['independent-receipt']);
+  await writeFile(join(checkout,'GOAL.md'),savedSource);
+  await state('active',{source});
+  pausedDuringUsage = true;
+  assert.equal((await run('example','during-authorization')).status,409);
+  assert.equal((await read('example','during-authorization')).operation,null);
+  assert.equal((await dashboard()).projects[0].state,'approval');
+  await state('active');
+  pauseBeforeTurn = true;
+  assert.equal((await run('example','before-native-turn')).status,202);
+  await lastCheck.promise;
+  const held = (await read('example','before-native-turn')).operation;
+  assert.equal(held.phase,'failed');
+  assert.match(held.output,/停止/);
+  assert.deepEqual(sent,['independent-receipt']);
+  assert.equal((await dashboard()).projects[0].state,'limit');
+  await state('active');
+  assert.equal((await run('example','running-at-stop')).status,202);
+  assert.equal((await read('example','running-at-stop')).operation.phase,'running');
+  await state('cancelled');
+  assert.equal((await request('/api/codex/cancel','example',{id:'running-at-stop'})).status,202);
+  assert.deepEqual(await interrupted.promise,{thread:'thread-running-at-stop',turn:'turn-running-at-stop'});
+  assert.equal((await dashboard()).projects[0].state,'blocked');
+});
+
+test('a ChatGPT hold after receipt remains recoverable without sending the saved attachment', async t => {
+  const {directory,start} = await runtimeFixture(t);
+  const cwd = join(directory,'workspaces','example');
+  const folder = join(cwd,'.codex');
+  await mkdir(folder,{recursive:true,mode:0o700});
+  await writeFile(join(directory,'portfolio.json'),JSON.stringify({...seed,projects:[{...seed.projects[0],cwd}]}),{mode:0o600});
+  let tokenReads = 0;
+  let providerPosts = 0;
+  const auth = {async accessToken(){
+    if (++tokenReads === 2) await writeFile(join(folder,'autonomy-state.json'),JSON.stringify({version:1,
+      goal:{id:'late-hold',title:'Owner held the project'},status:'paused',tasks:[]}),{mode:0o600});
+    return 'fixture-token';
+  }};
+  const responses = createChatGPTResponses({auth,async fetchImpl(_url,options){
+    if (options.method === 'GET') return Response.json({models:[{slug:'fixture-model',display_name:'Fixture',visibility:'list'}]});
+    providerPosts++;
+    throw new Error('Stopped input reached the provider');
+  }});
+  const options = {codex:{},plan:{auth,responses}};
+  let app = await start(options);
+  let cookie = await login(app);
+  const payload = {id:'late-chat-hold',model:'fixture-model',prompt:'Keep the draft.',document:{name:'draft.md',text:'Keep this attachment.'}};
+  const post = () => fetch(app.url+'/api/chat/live?project=example',{method:'POST',
+    headers:{cookie,Origin:app.url,'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  const events = async reply => (await reply.text()).trim().split('\n\n').map(line=>JSON.parse(line.slice(6)));
+  const reply = await post();
+  assert.equal(reply.status,200);
+  const initial = (await events(reply)).at(-1);
+  assert.equal(initial.type,'done');
+  assert.equal(initial.code,'EXECUTION_HELD');
+  assert.equal(initial.turn.status,'failed');
+  assert.equal(initial.turn.prompt,payload.prompt);
+  assert.equal(initial.turn.document.name,payload.document.name);
+  assert.equal(providerPosts,0);
+  await app.close();
+  app = await start(options);
+  cookie = await login(app);
+  const saved = await fetch(app.url+'/api/chat/live?project=example&id='+payload.id,{headers:{cookie}});
+  assert.deepEqual((await saved.json()).turn,initial.turn);
+  assert.deepEqual(await events(await post()),[initial]);
+  assert.equal(tokenReads,2);
+  assert.equal(providerPosts,0);
 });
 
 test('a scoped ChatGPT plan stream preserves text and never repeats the provider call on replay', async t => {

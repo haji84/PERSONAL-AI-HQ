@@ -11,6 +11,7 @@ import {realtimeArchiveId, realtimeArchiveReview, realtimeReceiptId, validRealti
 const date = value => Number.isFinite(value) && value >= 0 && value < 253402300800 ? new Date(value * 1000).toISOString() : null;
 const title = value => typeof value === 'string' && value.trim() ? value.trim().slice(0, 240) : '無題の会話';
 const idPattern = /^[a-z0-9_.:-]{1,160}$/i;
+export const isLivePreSendFailure = code => code === codexResultStaleCode || code === 'EXECUTION_HELD';
 export const chatHistoryPageSize = 40;
 export const chatHistoryLastOffset = 5000;
 const exportedTextPartSize = 30000;
@@ -305,7 +306,7 @@ export function createChatStore(directory, {now = Date.now} = {}) {
   function turnView(row) {
     if (!row) return null;
     const {requestedConversationId, document: saved, failureCode, ...turn} = row;
-    if (turn.status === 'failed' && failureCode === codexResultStaleCode) turn.code = failureCode;
+    if (turn.status === 'failed' && isLivePreSendFailure(failureCode)) turn.code = failureCode;
     const {document, image} = storedAttachment(saved);
     if (image) return {...turn, image: imageMetadata(image)};
     return document ? {...turn, document: {name: document.name}} : turn;
@@ -520,7 +521,7 @@ export function createChatStore(directory, {now = Date.now} = {}) {
     persistLiveText: (project, id, text) => updateTurn(project, id, 'in_progress', text),
     finishLive(project, id, {status, text, code}) {
       if (!liveStatuses.has(status)) throw storeError(400, 'INVALID_CHAT_STATUS', '応答の状態が正しくありません。');
-      if (code !== undefined && (status !== 'failed' || code !== codexResultStaleCode)) {
+      if (code !== undefined && (status !== 'failed' || !isLivePreSendFailure(code))) {
         throw storeError(400, 'INVALID_CHAT_STATUS', '応答の状態が正しくありません。');
       }
       return updateTurn(project, id, status, text, code);

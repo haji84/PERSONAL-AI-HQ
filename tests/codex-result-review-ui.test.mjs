@@ -6,13 +6,15 @@ import {runInNewContext} from 'node:vm';
 
 const source = readFileSync(new URL('../public/app.mjs', import.meta.url), 'utf8');
 const section = (first, next) => source.slice(source.indexOf(first), source.indexOf(next));
-const composerSource = section('function planComposer(', 'function importSection(');
+const composerSource = section('const stateLabels = ', 'const dom = ') +
+  section('function projectList(', 'function artifactFilterScope(') + section('function planComposer(', 'function importSection(');
 const previewSource = section('function handoffRecordLinks(', 'function chatCodexHandoff(') +
   section('async function verifiedCodexChatResult(', 'function codexTurnEvidence(');
 const project = 'example';
 const draftKey = 'chat-draft/example';
 const prompt = '確認した結果について相談したい';
 const stale = 'CODEX_RESULT_STALE';
+const held = 'EXECUTION_HELD';
 const settled = () => new Promise(setImmediate);
 const digest = (value, name = '') => createHash('sha256').update(name).update(value).digest('hex');
 
@@ -77,6 +79,97 @@ function fixture() {
   ui, packet, review, record, location, requests, selectedConversations, respond(response) { providerResponse = response; },
   acceptPrevious(turn) { previousTurn = turn; }};
 }
+
+test('a saved project stop disables ChatGPT send and retry while keeping receipt lookup and drafts', async () => {
+  const view = fixture();
+  view.ui.portfolio = {projects: [{id: project, state: 'paused', stateScope: '作業先の保存状態'}]};
+  view.ui.chatTurns.set(project, 'earlier-id');
+  view.acceptPrevious({id: 'earlier-id', status: 'completed', text: '保存済みの回答'});
+  const composer = view.composer();
+  await settled();
+  const elements = descendants(composer.root);
+  const send = elements.find(item => item.textContent === 'ChatGPTに送る');
+  const retry = elements.find(item => item.textContent === '同じ受付番号を使う');
+  const check = elements.find(item => item.textContent === '前の応答を確認');
+  assert.equal(send.disabled, true);
+  assert.equal(retry.disabled, true);
+  assert.ok(elements.some(item => !item.hidden && /一時停止.*作業先の保存状態/.test(item.textContent)));
+  send.click();
+  retry.click();
+  await check.click();
+  assert.ok(elements.some(item => item.textContent === '保存済みの回答'));
+  assert.deepEqual(view.requests, []);
+  assert.equal(view.ui.drafts.get(draftKey), prompt);
+});
+
+test('a pre-receipt stop rejection leaves the draft and accepts a later new request', async () => {
+  const view = fixture();
+  view.respond({status: 409, ok: false, json: async () => ({
+    code: 'EXECUTION_HELD', error: '案件の停止条件を確認してください。',
+  })});
+  const composer = view.composer();
+  await settled();
+  const send = descendants(composer.root).find(item => item.textContent === 'ChatGPTに送る');
+  send.click();
+  await settled();
+  assert.equal(view.requests.length, 1);
+  assert.equal(view.ui.chatIntents.has(project), false);
+  assert.equal(view.ui.chatTurns.has(project), false);
+  assert.equal(view.ui.drafts.get(draftKey), prompt);
+  assert.equal(send.disabled, false);
+});
+
+test('a stop after ChatGPT receipt restores the prompt and keeps the attachment and receipt', async () => {
+  const view = fixture();
+  const id = 'unique-submit-id';
+  const document = {name: 'context.txt', text: '相談する資料'};
+  const attachment = {document, digest: digest(document.text, document.name)};
+  view.ui.attachmentDrafts.set(draftKey, attachment);
+  view.respond({status: 200, ok: true, events: [
+    {type: 'started', turn: {id, status: 'in_progress'}},
+    {type: 'done', code: held, turn: {id, status: 'failed', conversationId: 'live/rejected'}},
+  ]});
+  const composer = view.composer();
+  await settled();
+  const elements = descendants(composer.root);
+  elements.find(item => item.textContent === 'ChatGPTに送る').click();
+  await settled();
+  assert.equal(view.requests.length, 1);
+  assert.equal(view.ui.drafts.get(draftKey), prompt);
+  assert.equal(elements.find(item => item.tag === 'textarea').value, prompt);
+  assert.equal(view.ui.attachmentDrafts.get(draftKey), attachment);
+  assert.equal(view.ui.chatIntents.has(project), false);
+  assert.equal(view.ui.chatTurns.get(project), id);
+  assert.equal(elements.find(item => item.textContent === '前の応答を確認').hidden, false);
+  assert.deepEqual(view.selectedConversations, []);
+  assert.ok(elements.some(item => /送信前.*受付/.test(item.textContent)));
+});
+
+test('readback of a saved pre-send stop restores a cleared draft and preserves a replacement attachment', async () => {
+  const view = fixture();
+  const id = 'saved-held';
+  view.ui.drafts.delete(draftKey);
+  view.ui.chatTurns.set(project, id);
+  view.ui.chatIntents.set(project, {id, prompt, documentDigest: 'original'});
+  const replacement = {document: {name: 'replacement.txt', text: '新しい資料'}, digest: 'new'};
+  view.ui.attachmentDrafts.set(draftKey, replacement);
+  view.acceptPrevious({id, status: 'failed', code: held, conversationId: 'live/rejected'});
+  const composer = view.composer();
+  await settled();
+  const elements = descendants(composer.root);
+  const check = elements.find(item => item.textContent === '前の応答を確認');
+  await check.click();
+  await check.click();
+  assert.equal(view.ui.drafts.get(draftKey), prompt);
+  assert.equal(elements.find(item => item.tag === 'textarea').value, prompt);
+  assert.equal(view.ui.attachmentDrafts.get(draftKey), replacement);
+  assert.equal(view.ui.chatIntents.has(project), false);
+  assert.equal(view.ui.chatTurns.get(project), id);
+  assert.equal(check.hidden, false);
+  assert.deepEqual(view.selectedConversations, []);
+  assert.deepEqual(view.requests, []);
+  assert.ok(elements.some(item => /送信前.*受付/.test(item.textContent)));
+});
 
 test('result review presents pinned project links and stages the exact selected Codex evidence', async () => {
   const view = fixture();

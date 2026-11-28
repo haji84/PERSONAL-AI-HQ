@@ -11,7 +11,7 @@ import {pipeline} from 'node:stream/promises';
 import {readCurrentProject, readPortfolio, readProjectDeliverySource, readProjectEstimateBinding, registerProject} from './portfolio.mjs';
 import {normalizeSettings} from './execution-policy.mjs';
 import {chatProjectRecordIsCurrent, readChatProjectRecord, readExecutionEstimateSource, readOwnerRequirementCoverage} from './delivery-records.mjs';
-import {chatHistoryLastOffset, chatHistoryPageSize, createChatStore} from './chat-store.mjs';
+import {chatHistoryLastOffset, chatHistoryPageSize, createChatStore, isLivePreSendFailure} from './chat-store.mjs';
 import {createCodexClient, emptyNativeActivity, historySearchCursorLimit, isCodexLoopbackUrl,
   validEvidenceCursor, validEvidenceTarget} from './codex.mjs';
 import {createOperations} from './operations.mjs';
@@ -411,7 +411,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
         status = controller.signal.aborted ? 'aborted' : signal.aborted ? 'interrupted' :
           cause.code === 'CHATGPT_PLAN_INCOMPLETE' ? 'incomplete' :
           cause.code === 'CHATGPT_PLAN_INTERRUPTED' ? 'interrupted' : 'failed';
-        if (status === 'failed' && cause.code === codexResultStaleCode) blocked = cause.code;
+        if (status === 'failed' && isLivePreSendFailure(cause.code)) blocked = cause.code;
       }
       await publishDone(chats.finishLive(project.id, input.id, {status, text, code:blocked}));
     } catch (cause) {
@@ -1020,7 +1020,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       if (response.headersSent) { response.destroy(); return; }
       const status = typeof problem?.status === 'number' ? problem.status : 500;
       send(response, status, {error: status === 500 ? '状態を読み取れませんでした。' : apiMessages[problem.code] ?? problem.message,
-        ...(['CHAT_HANDOFF_STALE', codexResultStaleCode, 'CODEX_IMAGE_MODEL_UNAVAILABLE', 'CODEX_RESUME_TARGET_UNAVAILABLE', 'CODEX_SUBSCRIPTION_LIMIT_REACHED',
+        ...(['CHAT_HANDOFF_STALE', codexResultStaleCode, 'EXECUTION_HELD', 'CODEX_IMAGE_MODEL_UNAVAILABLE', 'CODEX_RESUME_TARGET_UNAVAILABLE', 'CODEX_SUBSCRIPTION_LIMIT_REACHED',
           'CODEX_SUBSCRIPTION_USAGE_UNCONFIRMED'].includes(problem.code) ||
           problem.code?.startsWith('REALTIME_VOICE_') ? {code: problem.code} : {})});
     });

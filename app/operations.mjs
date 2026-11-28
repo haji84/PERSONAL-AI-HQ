@@ -607,7 +607,7 @@ export function createOperations(directory, native, execution, {prepareHandover,
           if (execution?.store?.getWork(project.id,input.id).operation) {
             throw problem(409,'受付番号が別の経路で使われています。','TASK_ID_CONFLICT');
           }
-          if (expectedRevision !== undefined && !execution.isCurrent(project, expectedRevision, stage, expected, route, handoverReceipt)) {
+          if (execution && !execution.isCurrent(project, selection.revision, stage, expected, route, handoverReceipt)) {
             throw problem(409,'案件の実行設定が変わりました。','EXECUTION_SETTINGS_CHANGED');
           }
           chatReview?.assertCurrent(true);
@@ -668,7 +668,7 @@ export function createOperations(directory, native, execution, {prepareHandover,
           if (current?.phase === 'reserved') {
             const failure = Object.hasOwn(subscriptionUsageMessages, error?.code) ? subscriptionUsageMessages[error.code] :
               error?.code === 'CODEX_RESUME_TARGET_UNAVAILABLE' ? resumeUnavailable().message :
-                error?.code === 'CHAT_HANDOFF_STALE' ? error.message :
+                ['CHAT_HANDOFF_STALE','EXECUTION_HELD'].includes(error?.code) ? error.message :
                 chatReview ? '会話の照合条件またはCodex接続を確認できず、送信前に停止しました。' :
                   handoverReceipt ? '送信直前の引継ぎ条件またはCodex接続を確認できませんでした。' : '';
             if (failure) append.run(failure, timestamp(), project.id, input.id);

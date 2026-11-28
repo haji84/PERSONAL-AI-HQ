@@ -1,5 +1,6 @@
 import {execFile, execFileSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
+import {closeSync, constants, fstatSync, lstatSync, openSync, readSync, realpathSync} from 'node:fs';
 import {lstat, realpath} from 'node:fs/promises';
 import {dirname, isAbsolute, join, normalize} from 'node:path';
 import {promisify} from 'node:util';
@@ -323,10 +324,87 @@ const lifecycleTaskStates = new Set(['pending','running','verified','failed','bl
 const lifecycleId = /^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/;
 const lifecycleStateLimit = 128 * 1024;
 const lifecycleEvidenceLimit = 256 * 1024;
+const lifecycleSourceLimit = 8 * 1024 * 1024;
+const lifecycleFileStats = {bigint:true,throwIfNoEntry:false};
+const lifecycleHolds = new Map([
+  ['paused', 'paused'], ['cancelled', 'blocked'], ['blocked', 'blocked'],
+  ['awaiting_approval', 'approval'], ['resource_limited', 'limit'], ['complete', 'complete'],
+]);
+
+function validLifecycleState(state) {
+  return state?.version === 1 && lifecycleStates.has(state.status) && typeof state.goal?.title === 'string' &&
+    Array.isArray(state.tasks) && state.tasks.length <= 64 && state.tasks.every(task =>
+      lifecycleId.test(task?.id ?? '') && lifecycleTaskStates.has(task.status) && typeof task.actionable === 'boolean' &&
+      Array.isArray(task.depends_on) && task.depends_on.length <= 64);
+}
+
+const sameEntry = (left, right) => right && left.dev === right.dev && left.ino === right.ino && left.uid === right.uid;
+
+function readLifecycleSnapshot(checkout, filename, maxBytes) {
+  const folder = dirname(filename);
+  const uid = process.getuid?.();
+  const owned = stat => uid === undefined || stat.uid === BigInt(uid);
+  const root = lstatSync(checkout, lifecycleFileStats);
+  if (!root) throw new Error('Lifecycle checkout is unavailable');
+  if (!root.isDirectory() || !owned(root) || normalize(realpathSync(checkout)) !== checkout) {
+    throw new Error('Invalid lifecycle checkout');
+  }
+  const parent = lstatSync(folder, lifecycleFileStats);
+  if (!parent) return null;
+  if (!parent.isDirectory() || !owned(parent) || normalize(realpathSync(folder)) !== folder) {
+    throw new Error('Invalid lifecycle folder');
+  }
+  const entry = lstatSync(filename, lifecycleFileStats);
+  if (!entry) return null;
+  if (!entry.isFile() || entry.nlink !== 1n || !owned(entry) || entry.size > BigInt(maxBytes) ||
+      normalize(realpathSync(filename)) !== filename) throw new Error('Invalid lifecycle file');
+  const fd = openSync(filename, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+  try {
+    const before = fstatSync(fd, lifecycleFileStats);
+    if (!before.isFile() || before.nlink !== 1n || !sameEntry(entry, before) || before.size !== entry.size ||
+        before.ctimeNs !== entry.ctimeNs) throw new Error('Lifecycle file changed');
+    const buffer = Buffer.alloc(Number(before.size) + 1);
+    let size = 0;
+    while (size < buffer.length) {
+      const count = readSync(fd, buffer, size, buffer.length - size, size);
+      if (!count) break;
+      size += count;
+    }
+    const after = lstatSync(filename, lifecycleFileStats);
+    if (BigInt(size) !== before.size || !sameEntry(before, after) || !after.isFile() || after.nlink !== 1n ||
+        after.ctimeNs !== before.ctimeNs || after.mtimeNs !== before.mtimeNs || after.size !== before.size ||
+        !sameEntry(root, lstatSync(checkout, lifecycleFileStats)) || !sameEntry(parent, lstatSync(folder, lifecycleFileStats)) ||
+        normalize(realpathSync(filename)) !== filename) throw new Error('Lifecycle file changed');
+    return buffer.subarray(0,size);
+  } finally { closeSync(fd); }
+}
+
+// A saved stop stays in force even if its optional forecast source has moved.
+export function readProjectLifecycleHold(checkout, {verifySource = true} = {}) {
+  if (typeof checkout !== 'string' || !isAbsolute(checkout) || normalize(checkout) !== checkout) return 'unverified';
+  try {
+    const statePath = join(checkout,lifecycleStateFile);
+    const bytes = readLifecycleSnapshot(checkout,statePath,lifecycleStateLimit);
+    if (!bytes) return null;
+    const state = JSON.parse(bytes);
+    if (!validLifecycleState(state) || typeof state.goal.id !== 'string' || !lifecycleId.test(state.goal.id)) return 'unverified';
+    const hold = lifecycleHolds.get(state.status);
+    if (hold) return hold;
+    if (verifySource && state.source !== undefined) {
+      if (!state.source || !lifecyclePathValid(state.source.path) ||
+          typeof state.source.sha256 !== 'string' || !contentDigest.test(state.source.sha256)) return 'unverified';
+      const source = readLifecycleSnapshot(checkout,join(checkout,state.source.path),lifecycleSourceLimit);
+      if (!source || createHash('sha256').update(source).digest('hex') !== state.source.sha256 ||
+          !bytes.equals(readLifecycleSnapshot(checkout,statePath,lifecycleStateLimit) ?? Buffer.alloc(0))) return 'unverified';
+    }
+    return null;
+  } catch { return 'unverified'; }
+}
 
 function lifecyclePathValid(file) {
   return typeof file==='string' && file.length<=240 && file.split('/').every(part=>
     part!=='.' && part!=='..' && /^[A-Za-z0-9._-]+$/.test(part) &&
+    !/\.$|^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(part) &&
     !/^(?:\.git$|\.env(?:\.|$))|\.(?:key|pem|pfx|p12)$/i.test(part));
 }
 
@@ -364,10 +442,7 @@ export async function readProjectForecastState(checkout, repository) {
     }
     const bytes = await read(lifecycleStateFile,lifecycleStateLimit);
     const state = JSON.parse(bytes);
-    if (state?.version!==1 || !lifecycleStates.has(state.status) || typeof state.goal?.title!=='string' ||
-        !Array.isArray(state.tasks) || state.tasks.length>64 || state.tasks.some(task=>!lifecycleId.test(task?.id??'') ||
-          !lifecycleTaskStates.has(task.status) || typeof task.actionable!=='boolean' ||
-          !Array.isArray(task.depends_on) || task.depends_on.length>64)) return null;
+    if (!validLifecycleState(state)) return null;
     if (state.source) {
       if (!lifecyclePathValid(state.source.path) || !contentDigest.test(state.source.sha256??'')) return null;
       const canonical = await read(state.source.path);

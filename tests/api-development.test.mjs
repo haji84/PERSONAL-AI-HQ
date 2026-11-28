@@ -196,10 +196,21 @@ test('project-selected dispatch uses only authorized fallback and preserves the 
 test('project-selected dispatch uses approved API once and reads it after settings and availability change', {skip: process.platform !== 'darwin'}, async t => {
   let providerCalls = 0;
   const nativeSends = [];
-  const {call, open} = await fixture(t, () => { providerCalls++; return providerAnswer(2); }, {codex:dispatchCodex(nativeSends)});
+  const {call, open, directory} = await fixture(t, () => { providerCalls++; return providerAnswer(2); }, {codex:dispatchCodex(nativeSends)});
   const set = (revision, settings) => call('/api/execution/settings', {data: {revision, settings}});
   const send = (data = instruction) => call(dispatchPath, {data});
   assert.equal((await set(0, {mode: 'auto', preference: 'api-first', allowFallback: true, apiBudgetUsd: 1})).status, 200);
+  const folder = join(directory,'workspaces',id,'.codex');
+  await mkdir(folder,{mode:0o700});
+  const saveState = status => writeFile(join(folder,'autonomy-state.json'), JSON.stringify({version:1,
+    goal:{id:'api-fixture-goal',title:'Continue the existing fixture'},status,tasks:[]}),{mode:0o600});
+  await saveState('awaiting_approval');
+  assert.equal((await send()).status,409);
+  assert.equal((await call('/api/execution/api',{data:instruction})).status,409);
+  assert.deepEqual(await (await call(dispatchPath,{query:{id:instruction.id}})).json(),{route:null,operation:null});
+  assert.equal(providerCalls,0);
+  assert.deepEqual(nativeSends,[]);
+  await saveState('active');
   const concurrent = await Promise.all([send(), send()]);
   assert.deepEqual(concurrent.map(response => response.status), [202, 202]);
   for (const response of concurrent) {

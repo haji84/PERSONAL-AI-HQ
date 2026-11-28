@@ -3,6 +3,8 @@
 export const ROUTES = Object.freeze(['api', 'subscription']);
 export const MODES = Object.freeze(['api-only', 'subscription-only', 'auto', 'hybrid']);
 export const STAGES = Object.freeze(['consultation', 'design', 'implementation', 'test', 'verification', 'review', 'delivery']);
+const heldProjectStates = new Set(['paused', 'approval', 'limit', 'blocked', 'offline', 'waiting', 'completed']);
+export const executionHeld = state => heldProjectStates.has(state);
 const FIELDS = ['mode', 'allowedRoutes', 'preference', 'allowFallback', 'model', 'reasoningEffort', 'apiBudgetUsd', 'stageRoutes'];
 const own = (value, key) => Object.hasOwn(value, key);
 const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);

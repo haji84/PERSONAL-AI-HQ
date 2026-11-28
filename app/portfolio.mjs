@@ -4,8 +4,8 @@ import {lstat, realpath} from 'node:fs/promises';
 import {isAbsolute, join, resolve, sep} from 'node:path';
 import {isDeepStrictEqual} from 'node:util';
 import {deliveryProgress, developmentForecast, remainingEstimate, requirementProgress, taskHasOpenWork, taskIsVerified} from './progress.mjs';
-import {readDeliveryRecord, readPortfolioTaskRecords, readProjectForecastState, tasksForProject} from './delivery-records.mjs';
-import {normalizeSettings} from './execution-policy.mjs';
+import {readDeliveryRecord, readPortfolioTaskRecords, readProjectForecastState, readProjectLifecycleHold, tasksForProject} from './delivery-records.mjs';
+import {executionHeld, normalizeSettings} from './execution-policy.mjs';
 
 export const projectKey = /^[a-z0-9][a-z0-9_.-]{0,79}$/i;
 const requestKey = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
@@ -123,6 +123,16 @@ function normalizeProject(row, observedAt) {
   };
 }
 
+function registeredProject(row, observedAt, directory, verifySource = true) {
+  const project = normalizeProject(row,observedAt);
+  const checkout = join(directory,'workspaces',project.id);
+  if (executionHeld(project.state) || !project.cwd.includes(checkout)) return project;
+  const state = readProjectLifecycleHold(checkout,{verifySource});
+  if (state === 'unverified') return {...project,state:'blocked',stateScope:'作業先の保存状態を確認できません'};
+  if (state === 'complete') return {...project,state:'blocked',stateScope:'作業先の完了記録を確認してください'};
+  return state ? {...project,state,stateScope:'作業先の保存状態'} : project;
+}
+
 async function normalizeArtifact(row, projects, observedAt) {
   if (typeof row?.id !== 'string' || !projectKey.test(row.id) || !projects.has(row.project) || !text(row.title)) return null;
   const info = {id: row.id, title: text(row.title, 160), project: row.project, kind: text(row.kind, 40),
@@ -162,7 +172,7 @@ function readDefinition(directory) {
 export function readCurrentProject(directory, id) {
   const raw = readDefinition(directory);
   const rows = raw.projects.filter(row => row?.id === id);
-  return rows.length === 1 ? normalizeProject(rows[0], date(raw.observedAt)) : null;
+  return rows.length === 1 ? registeredProject(rows[0], date(raw.observedAt), directory) : null;
 }
 
 function initialExecution(row) {
@@ -200,7 +210,7 @@ export function readProjectExecutionBindings(directory, ids) {
       ambiguous.add(row.id);
       continue;
     }
-    const project = normalizeProject(row, observedAt);
+    const project = registeredProject(row, observedAt, directory);
     let initial;
     try { initial = initialExecution(row); } catch { /* An invalid initial policy is not a default. */ }
     found.set(row.id, {project, initial});
@@ -354,7 +364,7 @@ export function readProjectDeliverySource(directory, id) {
 export async function readPortfolio(directory, githubProjects, refreshGithub = false) {
   const raw = readDefinition(directory);
   const observedAt = date(raw.observedAt);
-  const projects = raw.projects.map(row => normalizeProject(row, observedAt));
+  const projects = raw.projects.map(row => registeredProject(row, observedAt, directory, refreshGithub));
   const byId = new Map(projects.map(row => [row.id, row]));
   if (projects.length !== byId.size) throw new Error('Duplicate project');
   const github = githubProjects?.view(projects, refreshGithub);

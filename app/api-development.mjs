@@ -5,7 +5,7 @@ import {basename, join, resolve, sep} from 'node:path';
 import {readApiAuthority, readBoundApiAuthority, verifiedApiCredit} from './api-authority.mjs';
 import {apiAdviceMaxLength, apiJobRounds, createApiResponseClient, maximumApiJobUsd} from './api-response.mjs';
 import {checkedEvidenceIsCurrent, prepareApiWorkspace, readAdvisoryWorkspace, readCommittedEvidence} from './api-workspace.mjs';
-import {STAGES, moneyMicros} from './execution-policy.mjs';
+import {executionHeld, STAGES, moneyMicros} from './execution-policy.mjs';
 import {readCurrentProject} from './portfolio.mjs';
 import {ensurePrivateDirectory} from './private-directory.mjs';
 import {measuredTokens, observedWorkTime, workOutcomeLimit} from './work-outcomes.mjs';
@@ -14,7 +14,6 @@ const taskKey = /^[A-Za-z0-9][A-Za-z0-9_-]{7,79}$/;
 const receiptKey = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 const evidenceHash = /^[a-f0-9]{64}$/;
 const gitRevision = /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/;
-const held = new Set(['paused', 'approval', 'limit', 'blocked', 'offline', 'waiting', 'completed']);
 const sha = value => createHash('sha256').update(value).digest('hex');
 const digest = value => sha(JSON.stringify(value));
 const problem = (status, code) => Object.assign(new Error(code), {status, code});
@@ -79,7 +78,7 @@ export function createApiDevelopment({directory, store, conversations, withProje
 
   function ownedProject(projectId) {
     const current = readCurrentProject(directory, projectId);
-    if (!current || held.has(current.state) || closing) throw problem(409, 'EXECUTION_HELD');
+    if (!current || executionHeld(current.state) || closing) throw problem(409, 'EXECUTION_HELD');
     return {current, checkout:enrolledCheckout(current)};
   }
 

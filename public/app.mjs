@@ -207,8 +207,17 @@ function matches(query, ...values) {
 function projectList() {
   return asArray(ui.portfolio?.projects);
 }
-function selectedProject() {
-  return projectList().find(item => item.id === ui.project);
+function selectedProject(project = ui.project) {
+  return projectList().find(item => item.id === project);
+}
+function projectExecutionHold(project, notice) {
+  const {state, stateScope} = selectedProject(project) ?? {};
+  const held = ['paused', 'approval', 'limit', 'blocked', 'offline', 'waiting', 'completed'].includes(state);
+  if (notice) {
+    notice.hidden = !held;
+    notice.textContent = held ? [stateLabels[state], stateScope].filter(Boolean).join(' · ') : '';
+  }
+  return held;
 }
 function artifactFilterScope(project) {
   return project && ui.searches.get('artifact-filter') === 'project' ? 'project' : 'all';
@@ -2169,6 +2178,7 @@ function directChatWork(project, conversation, current, reviewed, openWork, refr
   draft.addEventListener('input', () => { ui.drafts.set(draftKey,draft.value); storeTab(); });
   label.append(node('span','','Codexへの作業指示'),draft);
   const status = node('p','small muted');
+  const hold = node('p','small muted');
   status.setAttribute('role','status');
   const send = button('この会話からCodexに依頼', () => void start());
   const check = button('依頼の受付を照合', () => void reconcile(false));
@@ -2178,7 +2188,7 @@ function directChatWork(project, conversation, current, reviewed, openWork, refr
   const retry = button('同じ受付番号で再送', () => void retryWithReview());
   const actions = node('div','run-actions');
   actions.append(send,check,refresh,retry);
-  area.append(label,actions,status);
+  area.append(label,hold,actions,status);
 
   const active = () => area.isConnected && current();
   const pending = () => ui.runIntents.get(key);
@@ -2195,21 +2205,22 @@ function directChatWork(project, conversation, current, reviewed, openWork, refr
 
   function paint() {
     const saved = intent();
+    const held = projectExecutionHold(project, hold);
     area.hidden = !allowed() && !saved;
     send.hidden = Boolean(saved);
-    send.disabled = busy || Boolean(busyElsewhere()) || !reviewed();
+    send.disabled = held || busy || Boolean(busyElsewhere()) || !reviewed();
     check.hidden = !saved;
     refresh.hidden = !saved || !notFound;
     retry.hidden = !saved || !notFound;
     retry.textContent = updatedReview(saved) ? '再照合した会話で同じ受付番号を送信' : '同じ受付番号で再送';
     check.disabled = refresh.disabled = busy;
-    retry.disabled = busy || !allowed();
+    retry.disabled = held || busy || !allowed();
     if (pending() && !saved) status.textContent = '別の会話からの依頼を先に照合してください。';
   }
 
   async function start() {
     const review = reviewed();
-    if (!active() || !allowed() || !review || busy || pending() || busyElsewhere()) return;
+    if (!active() || projectExecutionHold(project) || !allowed() || !review || busy || pending() || busyElsewhere()) return;
     const prompt = draft.value.trim();
     if (!prompt || prompt.length > 16000) {
       status.textContent = '16,000字以内で作業指示を入力してください。';
@@ -2223,7 +2234,7 @@ function directChatWork(project, conversation, current, reviewed, openWork, refr
 
   async function retryWithReview() {
     const saved = intent();
-    if (!active() || !allowed() || busy || !saved || !notFound) return;
+    if (!active() || projectExecutionHold(project) || !allowed() || busy || !saved || !notFound) return;
     const review = updatedReview(saved);
     if (review) {
       ui.runIntents.set(key,{...saved,...review});
@@ -2234,7 +2245,7 @@ function directChatWork(project, conversation, current, reviewed, openWork, refr
 
   async function reconcile(post) {
     const saved = intent();
-    if (!active() || busy || !saved || (post && !allowed())) return;
+    if (!active() || busy || !saved || (post && (projectExecutionHold(project) || !allowed()))) return;
     clearTimeout(timer);
     busy = true;
     notFound = false;
@@ -2977,6 +2988,8 @@ function planComposer(project, onConversation) {
   const area = panel('ChatGPTに相談');
   const status = node('p', 'muted small', 'ChatGPTプランの状態を確認中…');
   status.setAttribute('role', 'status');
+  const hold = node('p', 'muted small');
+  projectExecutionHold(project, hold);
   const picks = node('div', 'stack');
   const modelLabel = node('label', 'picker');
   const model = node('select');
@@ -3018,7 +3031,7 @@ function planComposer(project, onConversation) {
   reference.addEventListener('change', () => { closeCamera(); controls(); });
   const currentAttachmentField = () => !disposed && attachmentInput.isConnected && ui.view === 'chat' && ui.project === project;
   const imageAllowed = slug => imageModels.has(slug) &&
-    !['paused', 'approval', 'limit', 'blocked', 'offline', 'waiting', 'completed'].includes(selectedProject()?.state) &&
+    !projectExecutionHold(project) &&
     codexCameraRouteAllowed(consultationSettings?.value?.settings, 'consultation');
   const camera = createCodexCamera({maxBytes: codexImageLimit, onCapture: file => stageAttachment(file, true),
     onActiveChange: () => queueMicrotask(controls)});
@@ -3163,7 +3176,7 @@ function planComposer(project, onConversation) {
   picks.append(modelLabel, referenceLabel, draftLabel);
   addDictation(picks, draft);
   picks.append(attachmentField, actions, output);
-  area.body.append(status, signIn, picks);
+  area.body.append(status, hold, signIn, picks);
   signIn.hidden = true;
   picks.hidden = true;
   output.hidden = true;
@@ -3181,6 +3194,7 @@ function planComposer(project, onConversation) {
   }
   function controls() {
     if (!currentAttachmentField()) return;
+    const held = projectExecutionHold(project, hold);
     const active = chatStreams.get(project)?.controller;
     const pending = ui.chatIntents.get(project);
     const attachment = attached();
@@ -3190,12 +3204,12 @@ function planComposer(project, onConversation) {
     const wrongConversation = !matchesAttachmentConversation(attachment, draftConversationId());
     const needsFile = !matchesAttachment(pending, attachment);
     camera?.setAvailable(canSend && allowsImage && !active && !pending && !readingAttachment);
-    send.disabled = !canSend || Boolean(active || pending || camera?.active) || readingAttachment ||
+    send.disabled = held || !canSend || Boolean(active || pending || camera?.active) || readingAttachment ||
       Boolean(attachmentError) || imageBlocked || wrongConversation;
     stop.hidden = !active;
     check.hidden = !ui.chatTurns.has(project) || Boolean(active);
     retry.hidden = !pending || Boolean(active);
-    retry.disabled = readingAttachment || needsFile || imageBlocked || wrongConversation || Boolean(camera?.active || attachmentError);
+    retry.disabled = held || readingAttachment || needsFile || imageBlocked || wrongConversation || Boolean(camera?.active || attachmentError);
     discard.hidden = retry.hidden;
     output.hidden = !output.textContent;
     attachmentInput.accept = [...textDocumentExtensions, ...(allowsImage ? codexImageTypes : [])].join(',');
@@ -3212,10 +3226,16 @@ function planComposer(project, onConversation) {
             attachment?.file?.name ?? attachment?.document?.name ?? '');
   }
   const staleResultMessage = '送信を止めました。作業詳細でCodexの結果をもう一度確認し、添付し直してください。';
-  function showTurn(turn, selectConversation = true) {
+  function showTurn(turn, selectConversation = true, code = turn?.code) {
     if (!turn) { status.textContent = 'この受付番号の応答はまだ確認できません。'; return; }
     const intent = ui.chatIntents.get(project);
-    if (turn.code === 'CODEX_RESULT_STALE') {
+    if (code === 'EXECUTION_HELD') {
+      if (intent?.id === turn.id) releaseRejectedChatIntent(intent, {keepReceipt: true});
+      status.textContent = '案件の停止条件によりChatGPTへの送信前に停止しました。受付は保存されています。';
+      output.textContent = '';
+      return;
+    }
+    if (code === 'CODEX_RESULT_STALE') {
       if (intent?.id === turn.id && intent.codexResult) rejectStaleResult(intent, attached());
       else status.textContent = staleResultMessage;
       return;
@@ -3233,18 +3253,22 @@ function planComposer(project, onConversation) {
       onConversation(turn.conversationId);
     }
   }
-  function rejectStaleResult(intent, attachment) {
-    if (ui.chatIntents.get(project) !== intent) return;
+  function releaseRejectedChatIntent(intent, {keepReceipt = false} = {}) {
+    if (ui.chatIntents.get(project) !== intent) return false;
     ui.chatIntents.delete(project);
-    if (ui.chatTurns.get(project) === intent.id) ui.chatTurns.delete(project);
-    if (attachment?.codexReview && attached() === attachment && matchesAttachment(intent, attachment)) {
-      ui.attachmentDrafts.delete(draftKey);
-    }
+    if (!keepReceipt && ui.chatTurns.get(project) === intent.id) ui.chatTurns.delete(project);
     if (!ui.drafts.has(draftKey)) {
       ui.drafts.set(draftKey, intent.prompt);
       if (currentAttachmentField()) draft.value = intent.prompt;
     }
     storeTab();
+    return true;
+  }
+  function rejectStaleResult(intent, attachment) {
+    if (!releaseRejectedChatIntent(intent)) return;
+    if (attachment?.codexReview && attached() === attachment && matchesAttachment(intent, attachment)) {
+      ui.attachmentDrafts.delete(draftKey);
+    }
     status.textContent = staleResultMessage;
   }
   async function readPrevious() {
@@ -3256,6 +3280,7 @@ function planComposer(project, onConversation) {
   }
   function sendMessage() {
     const prompt = draft.value.trim();
+    if (projectExecutionHold(project, hold)) return;
     if (!currentAttachmentField() || camera?.active || send.disabled || !prompt || !model.value) {
       if (!prompt) status.textContent = '相談する内容を入力してください。';
       return;
@@ -3277,7 +3302,8 @@ function planComposer(project, onConversation) {
   }
   async function submitIntent() {
     const intent = ui.chatIntents.get(project);
-    if (!currentAttachmentField() || !intent || !canSend || chatStreams.has(project) || readingAttachment || camera?.active || attachmentError) return;
+    if (!currentAttachmentField() || projectExecutionHold(project, hold) || !intent || !canSend ||
+        chatStreams.has(project) || readingAttachment || camera?.active || attachmentError) return;
     const {documentDigest, imageSha256, codexResult, ...payload} = intent;
     const attachment = attached();
     if (!matchesAttachment(intent, attachment)) {
@@ -3316,6 +3342,10 @@ function planComposer(project, onConversation) {
       if (response.status === 401) endSession();
       if (!response.ok) {
         const problem = await response.json().catch(() => null);
+        if (response.status === 409 && problem?.code === 'EXECUTION_HELD') {
+          if (releaseRejectedChatIntent(intent)) status.textContent = problem.error;
+          return;
+        }
         if (codexResult && response.status === 409 && problem?.code === 'CODEX_RESULT_STALE') {
           rejectStaleResult(intent, attachment);
           return;
@@ -3326,7 +3356,7 @@ function planComposer(project, onConversation) {
       await chatEvents(response, event => {
         if (event.type === 'started') {
           status.textContent = phaseText.in_progress;
-          if (ui.drafts.get(draftKey)?.trim() === intent.prompt || draft.value.trim() === intent.prompt) {
+          if ((ui.drafts.get(draftKey) ?? draft.value).trim() === intent.prompt) {
             ui.drafts.delete(draftKey);
             draft.value = '';
             storeTab();
@@ -3337,7 +3367,7 @@ function planComposer(project, onConversation) {
         } else if (event.type === 'done') {
           done = true;
           if (codexResult && event.code === 'CODEX_RESULT_STALE') rejectStaleResult(intent, attachment);
-          else showTurn(event.turn, ui.chatIds.get(project) === selected);
+          else showTurn(event.turn, ui.chatIds.get(project) === selected, event.code);
         }
       });
       if (!done) status.textContent = '応答が途切れました。前の応答を確認してください。';
@@ -4219,6 +4249,7 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
     : apiMode ? '許可済みのファイルを分離作業先で編集し、テストを実行します。'
     : '指示は、このプロジェクト専用の分離作業先で実行されます。');
   const status = node('p', 'strong');
+  const hold = node('p', 'muted small');
   status.setAttribute('role', 'status');
   const details = node('p', 'muted small');
   const warning = node('p', 'run-warning small');
@@ -4370,7 +4401,7 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
     attachmentControls.append(attachmentInfo, reviewChatHandoff, removeAttachment);
     section.append(attachmentControls);
   }
-  section.append(status, details, warning, steeringStatus, actions, output, artifacts);
+  section.append(status, hold, details, warning, steeringStatus, actions, output, artifacts);
   area.body.append(section);
 
   let timer;
@@ -4399,6 +4430,7 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
   }
   function paint() {
     if (!isCurrent()) return;
+    const held = projectExecutionHold(project, hold);
     clearTimeout(timer);
     const phase = run.operation?.phase;
     const intention = currentIntent();
@@ -4456,7 +4488,7 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
     checkSteer.hidden = !pendingSteering;
     closeSteer.hidden = !pendingSteering || !run.known || !finishedPhases.has(phase);
     recover.hidden = !intention || !reviewMatches(intention) || (run.known && run.operation?.id === intention.id);
-    for (const action of [send, resume, steer, recover]) action.disabled = run.busy || run.checking || camera?.active === true;
+    for (const action of [send, resume, steer, recover]) action.disabled = held || run.busy || run.checking || camera?.active === true;
     if (mayStart?.() === false || ui.attachmentDrafts.get(draftKey)?.needsChatHandoffReview) send.disabled = resume.disabled = true;
     for (const action of [interrupt, cancel, check, checkSteer, closeSteer]) action.disabled = run.busy || run.checking;
     const body = text(advice ? relevantOperation?.advice :
@@ -4538,7 +4570,7 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
   }
 
   async function mutate(endpoint, payload) {
-    if (run.busy || run.checking || !isCurrent()) return;
+    if (run.busy || run.checking || !isCurrent() || (endpoint === path && projectExecutionHold(project, hold))) return;
     run.busy = true;
     run.message = '';
     run.onChange?.();
@@ -4553,7 +4585,7 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
         const {file} = attachment;
         const bytes = new Uint8Array(await file.arrayBuffer());
         if (await attachmentDigest(bytes, documentSha256 ? file.name : '') !== digest) throw new Error('送信する添付の内容が変わりました。');
-        if (!isCurrent()) return;
+        if (!isCurrent() || (endpoint === path && projectExecutionHold(project, hold))) return;
         if (imageSha256) request.image = {mime: file.type, data: bytesBase64(bytes)};
         else request.document = {name: file.name, text: documentDecoder.decode(bytes)};
       }
@@ -4569,8 +4601,9 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
       const chatHandoffRejected = Boolean(payload.documentSha256) && error.status === 409 && error.code === 'CHAT_HANDOFF_STALE';
       const usageRejected = error.status === 409 &&
         ['CODEX_SUBSCRIPTION_LIMIT_REACHED', 'CODEX_SUBSCRIPTION_USAGE_UNCONFIRMED'].includes(error.code);
+      const holdRejected = endpoint === path && error.status === 409 && error.code === 'EXECUTION_HELD';
       const confirmedRejection = [400, 403, 413].includes(error.status) || imageModelRejected || targetRejected || usageRejected || chatHandoffRejected ||
-        (apiMode || payload.handover) && error.status === 409;
+        holdRejected || (apiMode || payload.handover) && error.status === 409;
       if (endpoint === path && confirmedRejection && ui.runIntents.get(runKey)?.id === payload.id) {
         ui.runIntents.delete(runKey);
         if (chatHandoffRejected) {
@@ -4585,8 +4618,8 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
         storeTab();
         paintRelatedRuns();
       }
-      run.known = Boolean((apiMode || payload.handover || imageModelRejected || usageRejected || chatHandoffRejected) && confirmedRejection);
-      run.message = usageRejected || chatHandoffRejected ? error.message : error.message + ' 作業状態を確認してください。';
+      run.known = Boolean((apiMode || payload.handover || imageModelRejected || usageRejected || chatHandoffRejected || holdRejected) && confirmedRejection);
+      run.message = usageRejected || chatHandoffRejected || holdRejected ? error.message : error.message + ' 作業状態を確認してください。';
       verifyCancellation = endpoint === '/api/codex/cancel' && (!error.status || error.status >= 500);
     } finally {
       run.busy = false;
@@ -4597,7 +4630,7 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
 
   async function requestSteering(submit) {
     const intent = steeringIntent();
-    if (!intent || run.busy || run.checking || !isCurrent()) return;
+    if (!intent || run.busy || run.checking || !isCurrent() || (submit && projectExecutionHold(project, hold))) return;
     run.busy = true;
     run.steerMessage = '追加指示の受付を照合中…';
     paint();
@@ -4635,7 +4668,7 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
   }
 
   function sendSteering() {
-    if (steer.hidden || run.busy || run.checking || !isCurrent() || ui.steerIntents.has(project)) return;
+    if (steer.hidden || run.busy || run.checking || !isCurrent() || projectExecutionHold(project, hold) || ui.steerIntents.has(project)) return;
     if (camera?.active || readingAttachment) {
       run.steerMessage = '撮影・添付を終えてから送信してください。';
       paint();
@@ -4663,7 +4696,8 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
   }
 
   function submitNew(previous) {
-    if (run.busy || run.checking || !hasRoom() || !isCurrent() || mayStart?.() === false || previous?.phase === 'cancelled' ||
+    if (run.busy || run.checking || !hasRoom() || !isCurrent() || projectExecutionHold(project, hold) ||
+        mayStart?.() === false || previous?.phase === 'cancelled' ||
         ui.attachmentDrafts.get(draftKey)?.needsChatHandoffReview) return;
     if (camera?.active) {
       run.message = '撮影を完了するか、カメラを閉じてから送信してください。';
@@ -4833,6 +4867,7 @@ function mountProjectDispatch(area, project, draft, draftKey, settings, choices,
   const key = projectDispatchKey(project);
   const section = node('section','run-control');
   const status = node('p','muted small');
+  const hold = node('p','muted small');
   status.setAttribute('role','status');
   const actions = node('div','run-actions');
   const start = button('案件設定で実行', () => void begin());
@@ -4840,7 +4875,7 @@ function mountProjectDispatch(area, project, draft, draftKey, settings, choices,
   const retry = button('同じ受付番号で再送', () => void request(true));
   actions.append(start,check,retry);
   if (stagePicker) section.append(stagePicker);
-  section.append(actions,status);
+  section.append(hold,actions,status);
   area.append(section);
   let timer, busy = false, missing = false, disposed = false, accepted;
   const intent = () => ui.runIntents.get(key);
@@ -4851,16 +4886,18 @@ function mountProjectDispatch(area, project, draft, draftKey, settings, choices,
     ui.runIntents.has(chatDirectWorkKey(project));
 
   function paint() {
+    const held = projectExecutionHold(project, hold);
     section.hidden = !eligible();
     start.hidden = Boolean(intent());
-    start.disabled = busy || otherIntent() || mayStart?.() === false;
+    start.disabled = held || busy || otherIntent() || mayStart?.() === false;
     check.hidden = !intent();
     retry.hidden = !intent() || !missing;
-    check.disabled = retry.disabled = busy;
+    check.disabled = busy;
+    retry.disabled = held || busy;
   }
 
   async function begin() {
-    if (!current() || !eligible() || busy || intent() || otherIntent() || mayStart?.() === false) return;
+    if (!current() || !eligible() || busy || projectExecutionHold(project, hold) || intent() || otherIntent() || mayStart?.() === false) return;
     const prompt = draft.value.trim();
     if (!prompt || prompt.length > 12000) {
       status.textContent = '12,000字以内の開発指示を下書きに入力してください。';
@@ -4879,7 +4916,7 @@ function mountProjectDispatch(area, project, draft, draftKey, settings, choices,
 
   async function request(post) {
     const payload = intent();
-    if (!current() || busy || !payload) return;
+    if (!current() || busy || !payload || (post && projectExecutionHold(project, hold))) return;
     clearTimeout(timer);
     busy = true;
     missing = false;
