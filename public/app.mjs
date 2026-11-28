@@ -1184,10 +1184,39 @@ function progressRow(task) {
   return row;
 }
 
+function sharedLocalTasks(projects) {
+  const detail = node('details', 'scope-info');
+  detail.dataset.dashboardDetail = 'shared-local-tasks';
+  detail.append(node('summary', '', '共有記録の開発タスク ' + projects.length + '案件'),
+    node('p', 'small muted', '共有の保存記録です。この端末では参照のみできます。'));
+  const groups = node('div', 'development-tasks');
+  for (const project of projects) {
+    const group = node('section', 'task-project');
+    const heading = node('div', 'task-project-heading');
+    heading.append(node('strong', '', project.name));
+    if (project.observedAt) heading.append(node('span', 'small muted', '記録 ' + time(project.observedAt)));
+    group.append(heading);
+    if (project.sameIdRegistration) group.append(node('p', 'small muted',
+      '同じIDの登録案件「' + project.sameIdRegistration + '」との作業先の対応は未確認です。'));
+    if (project.stage) group.append(node('p', 'small', project.stage));
+    if (project.nextAction) group.append(node('p', 'small', '次の確認 ' + project.nextAction));
+    const tasks = asArray(project.tasks);
+    if (tasks.length) {
+      const entries = node('ul', 'task-progress-list');
+      entries.append(...tasks.map(progressRow));
+      group.append(entries);
+    } else group.append(node('p', 'small muted', 'タスクの詳細を確認できません。'));
+    groups.append(group);
+  }
+  detail.append(groups);
+  return detail;
+}
+
 function developmentTasks() {
   const area = panel('開発タスク');
   const list = node('div', 'development-tasks');
   const source = ui.portfolio?.taskProgressSource;
+  const shared = source?.status === 'current' ? asArray(source.unlinkedLocalProjects) : [];
   const development = new Set(['developing', 'researching', 'designing', 'verifying', 'fixing', 'integrating',
     'waiting', 'approval', 'blocked', 'limit', 'delayed']);
   for (const project of projectList()) {
@@ -1210,14 +1239,16 @@ function developmentTasks() {
     list.append(group);
   }
   if (list.children.length) area.body.append(list);
-  else if (source?.status !== 'unavailable') {
+  else if (!shared.length && source?.status !== 'unavailable') {
     area.body.append(node('p', 'muted', '進行中または未完了と確認できた開発タスクはありません。'));
   }
   if (source?.status === 'current') {
     const record = link(source.evidence?.label, source.evidence?.url);
     if (record) area.body.append(node('p', 'small muted', '案件の観測 ' + time(source.observedAt) + ' '), record);
-    if (source.unmatched > 0) area.body.append(node('p', 'small muted',
-      '登録案件と照合できない進捗記録 ' + source.unmatched + '件'));
+    if (shared.length) area.body.append(sharedLocalTasks(shared));
+    const unlinkedCount = source.unmatched - shared.length;
+    if (unlinkedCount > 0) area.body.append(node('p', 'small muted',
+      '登録案件と照合できない進捗記録 ' + unlinkedCount + '件'));
   } else if (source?.status === 'unavailable') {
     area.body.append(node('p', 'small muted', list.children.length
       ? '案件の観測記録を取得できません。取得できた作業だけ表示しています。'

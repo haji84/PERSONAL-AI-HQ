@@ -604,3 +604,57 @@ test('the existing shared observation can carry a local project across devices b
     observedAt,projects:[],localProjects:[{...localRecord,repository}]}})});
   assert.equal((await view()).taskProgressSource.status,'unavailable');
 });
+
+test('unmatched shared local records remain visible without joining the project registration or execution scope', async t => {
+  const {directory,checkout,commit,configure,portfolioPath}=await fixture(t);
+  const observedAt=new Date().toISOString();
+  const task={id:'verify-package',title:'Waiting for a real machine',status:'pending',actionable:true,
+    remainingMinutes:{optimistic:5,standard:10,cautious:20},estimate:{basis:'Saved test conditions',confidence:'medium'}};
+  const requirement={id:'check',implemented:true,review:{independent:true,status:'accepted'},
+    validation:{status:'passed',source:'Recorded elsewhere'},artifact:{usable:true}};
+  const localProjects=[
+    {localProjectId:'other-host',name:'Other machine project',workspace:'/private/not-a-binding',codexWrite:true,
+      observationAt:observedAt,delivery:{stage:'Review the delivery',nextAction:'Check the original acceptance'},
+      tasks:[{...task,status:'active'},{...task,id:'old-completion',status:'verified',requirements:[requirement],
+        remainingMinutes:{optimistic:0,standard:0,cautious:0}}]},
+    {localProjectId:'also-registered',tasks:[{...task,status:'waiting',externalWait:'unknown'}]},
+    {localProjectId:'already-linked',tasks:[task]},
+  ];
+  const observation=initiative+'/portfolio-observation.json';
+  const revision=await commit({[observation]:JSON.stringify({taskProgress:{observedAt,projects:[],localProjects}})});
+  await configure([
+    {id:'also-registered',name:'GitHub registration',repository:'https://github.com/fixture-owner/committed-project'},
+    {id:'already-linked',name:'Existing local registration',state:'paused'},
+  ]);
+  const config=JSON.parse(await readFile(portfolioPath,'utf8'));
+  config.taskProgressSource={checkout,repository,ref};
+  await writeFile(portfolioPath,JSON.stringify(config));
+  const original=await readFile(portfolioPath);
+
+  const result=await readPortfolio(directory,undefined,true);
+  const {view}=result;
+  assert.deepEqual([...result.projects.keys()],['also-registered','already-linked']);
+  assert.equal(readCurrentProject(directory,'other-host'),null);
+  assert.deepEqual(view.projects.find(project=>project.id==='also-registered').tasks,[]);
+  const linked=view.projects.find(project=>project.id==='already-linked');
+  assert.equal(linked.state,'paused');
+  assert.deepEqual(linked.forecast.schedule.readyTaskIds,[]);
+  assert.equal(linked.tasks.length,1);
+  assert.equal(view.taskProgressSource.unmatched,2);
+  assert.ok(view.taskProgressSource.evidence.url.includes(revision));
+  const shared=view.taskProgressSource.unlinkedLocalProjects;
+  assert.deepEqual(shared.map(row=>[row.id,row.sameIdRegistration]),[['other-host',null],['also-registered','GitHub registration']]);
+  assert.deepEqual([shared[0].name,shared[0].stage,shared[0].nextAction,shared[0].observedAt],
+    ['Other machine project','Review the delivery','Check the original acceptance',observedAt]);
+  assert.equal(shared[0].tasks[0].status,'unknown');
+  assert.equal(shared[0].tasks[0].remainingMinutes.standard,10);
+  assert.deepEqual([shared[0].tasks[1].status,shared[0].tasks[1].progress,shared[0].tasks[1].remainingMinutes],['unknown',null,null]);
+  assert.deepEqual([shared[1].tasks[0].status,shared[1].tasks[0].externalWait],['waiting',true]);
+  assert(!JSON.stringify(shared).includes('/private/not-a-binding'));
+  assert.deepEqual(await readFile(portfolioPath),original);
+
+  await commit({[observation]:JSON.stringify({taskProgress:{observedAt,projects:[],localProjects:[localProjects[2]]}})});
+  const refreshed=(await readPortfolio(directory,undefined,true)).view;
+  assert.equal(refreshed.taskProgressSource.unmatched,0);
+  assert.equal(refreshed.taskProgressSource.unlinkedLocalProjects,undefined);
+});

@@ -81,6 +81,15 @@ function taskProgress(delivery, verifiedForecast) {
   });
 }
 
+function sharedLocalProgress(record, registration) {
+  const {localProjectId:id, observationAt, tasks} = record;
+  const delivery = {...record.delivery,tasks,observationAt};
+  const forecast = developmentForecast(delivery,{status:'unknown',workspaceUnconfirmed:true,verifiedTaskIds:new Set()});
+  return {id, name:text(record.name,100) || id, sameIdRegistration:registration?.name ?? null,
+    observedAt:date(observationAt), stage:text(delivery.stage,160), nextAction:text(delivery.nextAction,360),
+    tasks:taskProgress(delivery,forecast).map(task=>task.status === 'active' ? {...task,status:'unknown'} : task)};
+}
+
 function normalizeProject(row, observedAt) {
   const {id} = row;
   const name = text(row.name, 100);
@@ -366,7 +375,9 @@ export async function readPortfolio(directory, githubProjects, refreshGithub = f
       taskMatches.set(record, (taskMatches.get(record) ?? 0) + 1);
     }
   }
-  const unmatchedTaskRecords = [...(taskRecords?.projects.values() ?? [])].filter(record => taskMatches.get(record) !== 1).length;
+  const unmatchedTaskRecords = [...(taskRecords?.projects.values() ?? [])].filter(record => taskMatches.get(record) !== 1);
+  const unlinkedLocalProjects = unmatchedTaskRecords.filter(record=>record.localProjectId)
+    .map(record=>sharedLocalProgress(record,byId.get(record.localProjectId)));
   const workspaceScopes = projects.flatMap(({id,cwd}) => cwd.map(checkout => ({id,prefix:workspacePrefix(checkout)})));
   const scopedStates = new Map(refreshGithub ? await Promise.all(projects.filter(project => {
     const delivery = definitions.get(project.id).delivery;
@@ -393,7 +404,8 @@ export async function readPortfolio(directory, githubProjects, refreshGithub = f
     view: {observedAt, limits: scope, devices, apiCreditObservation: apiCreditObservation(raw.apiCreditObservation),
       ...(github && {githubRegistration: {status:github.status, observedAt:github.observedAt, count:github.count}}),
       ...(refreshGithub && raw.taskProgressSource && {taskProgressSource: taskRecords ?
-        {status: 'current', observedAt: taskRecords.observedAt, evidence: taskRecords.source, unmatched: unmatchedTaskRecords} :
+        {status:'current', observedAt:taskRecords.observedAt, evidence:taskRecords.source, unmatched:unmatchedTaskRecords.length,
+          ...(unlinkedLocalProjects.length && {unlinkedLocalProjects})} :
         {status: 'unavailable'}}),
       projects: visible.map(({cwd, handoverRequirements, nativeHandover, ...project}) => {
         const tracking = trackingById.get(project.id);
