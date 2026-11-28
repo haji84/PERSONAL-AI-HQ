@@ -40,7 +40,7 @@ function latestApiActivity(store, projectId, localJob) {
 }
 
 export function createApiDevelopment({directory, store, conversations, withProjectWorkLock, hasNativeWork, hasActiveWork,
-  completedNativeSource, readHandoverTurn,
+  completedNativeSource, readHandoverTurn, hasNativeReceipt,
   getKey = () => process.env.OPENAI_API_KEY, fetchImpl, readAuthority = readApiAuthority, verifyInSandbox}) {
   const jobs = new Map();
   const artifacts = join(directory, 'api-work');
@@ -158,7 +158,7 @@ export function createApiDevelopment({directory, store, conversations, withProje
       preserveSummary: report?.kind === 'advice', updatedAt: observedAt(work)});
   }
 
-  async function run({project, operation, prior, scope, model, prompt, controller, approvedArtifacts}) {
+  async function run({project, operation, prior, scope, model, prompt, controller, approvedArtifacts, canDispatch}) {
     const projectId = project.id;
     const {executionId, taskId} = operation;
     const stage = operation.task?.stage;
@@ -180,6 +180,7 @@ export function createApiDevelopment({directory, store, conversations, withProje
     const fingerprint = binding(scope, model);
     const reauthorize = (forDispatch = true) => {
       signal.throwIfAborted();
+      if (forDispatch && canDispatch && !canDispatch()) throw problem(401,'SIGN_IN_REQUIRED');
       const fresh = authorized(projectId, forDispatch);
       const selected = fresh.authority.models.find(item => item.id === model.id);
       if (!selected || binding(fresh, selected) !== fingerprint) throw problem(409, 'API_AUTHORITY_CHANGED');
@@ -540,6 +541,13 @@ export function createApiDevelopment({directory, store, conversations, withProje
           models: authority.models.map(({id, reasoningEfforts}) => ({id, reasoningEfforts}))};
       } catch (cause) { return {available: false, reason: cause.code ?? 'API_AUTHORIZATION_REQUIRED', models: []}; }
     },
+    dispatchContext(project, {stage, model: requestedModel}) {
+      const {authority} = authorized(project.id);
+      const {settings} = store.getSettings(project.id);
+      const model = authority.models.find(item => item.id === (requestedModel ?? settings.model ?? authority.defaultModel));
+      if (!model) throw problem(409,'MODEL_UNAVAILABLE');
+      return context(authority, model, stage);
+    },
     portfolioActivity(project, operation) {
       if (operation?.route !== 'api' || operation.kind === 'realtime-voice' ||
           !project.cwd.includes(join(directory,'workspaces',project.id))) return null;
@@ -557,7 +565,7 @@ export function createApiDevelopment({directory, store, conversations, withProje
       if (id !== undefined && !taskKey.test(id)) throw problem(400, 'API_TASK_INVALID');
       return view(project.id, store.getWork(project.id, id, {excludeRealtime: true}).operation);
     },
-    async start(project, input) {
+    async start(project, input, {expectedRevision, replayOnly = false, canDispatch} = {}) {
       if (!taskKey.test(input?.id ?? '') || typeof input.prompt !== 'string' || !input.prompt.trim() || input.prompt.length > 12000 ||
           !STAGES.includes(input.stage ?? 'implementation') || input.model !== undefined && typeof input.model !== 'string' ||
           input.effort !== undefined && typeof input.effort !== 'string') throw problem(400, 'API_TASK_INVALID');
@@ -581,19 +589,23 @@ export function createApiDevelopment({directory, store, conversations, withProje
       };
       const duplicate = replay();
       if (duplicate) return duplicate;
+      if (replayOnly) throw problem(409,'TASK_ID_CONFLICT');
       let handover;
       if (nativeOrigin) {
         try { handover = await approvedNativeOrigin(project, nativeOrigin); }
         catch (cause) { const concurrent = replay(); if (concurrent) return concurrent; throw cause; }
       }
       return withProjectWorkLock(project, () => {
+        if (canDispatch && !canDispatch()) throw problem(401,'SIGN_IN_REQUIRED');
         const concurrent = replay();
         if (concurrent) return concurrent;
+        if (hasNativeReceipt?.(project,input.id)) throw problem(409,'TASK_ID_CONFLICT');
         if (handover) handover.assertCurrent();
         else if (hasNativeWork(project)) throw problem(409, 'HANDOVER_REQUIRED');
         const scope = authorized(projectId);
         const prior = store.getWork(projectId);
         const {settings, revision} = store.getSettings(projectId);
+        if (expectedRevision !== undefined && revision !== expectedRevision) throw problem(409,'EXECUTION_SETTINGS_CHANGED');
         const model = scope.authority.models.find(item => item.id === (input.model ?? settings.model ?? scope.authority.defaultModel));
         if (!model) throw problem(409, 'MODEL_UNAVAILABLE');
         const receipt = store.prepareDispatch({projectId, taskId: input.id, instructionDigest: inputDigest, expectedRevision: revision, task, nativeOrigin},
@@ -602,7 +614,7 @@ export function createApiDevelopment({directory, store, conversations, withProje
         const operation = receipt.operation;
         const controller = new AbortController();
         const worker = Promise.resolve().then(() => run({project, operation, prior, scope, model, prompt: input.prompt, controller,
-          approvedArtifacts: handover?.proof.artifacts})).catch(() => {
+          approvedArtifacts: handover?.proof.artifacts,canDispatch})).catch(() => {
           // Ambiguous persistence or provider state holds the reservation. Never restart on its own.
         }).finally(() => jobs.delete(operation.executionId));
         jobs.set(operation.executionId, {worker, controller});

@@ -1835,6 +1835,7 @@ function fetchView(key, path, container, paint, isCurrent = () => true) {
 function memoryKey(...parts) {
   return JSON.stringify(parts);
 }
+const projectDispatchKey = project => memoryKey('project-dispatch', project);
 function evictChats(project) {
   for (const key of resources.keys()) {
     const [kind, id] = JSON.parse(key);
@@ -3603,6 +3604,7 @@ const pollingPhases = new Set(['reserved', 'sending', 'running', 'interrupting',
 const finishedPhases = new Set(['completed', 'interrupted', 'cancelled', 'failed']);
 
 const apiWorkMessages = {
+  SIGN_IN_REQUIRED: 'サインインを確認できず、追加のAPI送信を止めました。',
   API_AUTHORIZATION_REQUIRED: 'この端末の通常API認証を確認できません。',
   API_RUNTIME_UNSUPPORTED: 'この端末で通常APIの隔離実行を確認できません。',
   API_AUTHORITY_MISSING: '本人が確認したAPIの組織・費用設定がありません。',
@@ -3860,6 +3862,7 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
   }
   function hasRoom() {
     return run.known && !readingAttachment && (!apiMode || apiReady()?.available === true) && !ui.runIntents.has(runKey) &&
+      !ui.runIntents.has(projectDispatchKey(project)) &&
       (!run.operation || finishedPhases.has(run.operation.phase));
   }
   function paint() {
@@ -4184,7 +4187,7 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
       void lookup();
     }
   });
-  return {paint, cleanup};
+  return {paint, cleanup, refresh:lookup};
 }
 
 function mountApiControls(area, project, draft, draftKey, advice) {
@@ -4282,6 +4285,128 @@ function apiAdviceComposer(project, onComplete, threadId) {
   return {root: area.root, cleanup: run.cleanup};
 }
 
+function mountProjectDispatch(area, project, draft, draftKey, settings, choices, onChange, stagePicker) {
+  const key = projectDispatchKey(project);
+  const section = node('section','run-control');
+  const status = node('p','muted small');
+  status.setAttribute('role','status');
+  const actions = node('div','run-actions');
+  const start = button('案件設定で実行', () => void begin());
+  const check = button('受付を照合', () => void request(false));
+  const retry = button('同じ受付番号で再送', () => void request(true));
+  actions.append(start,check,retry);
+  if (stagePicker) section.append(stagePicker);
+  section.append(actions,status);
+  area.append(section);
+  let timer, busy = false, missing = false, disposed = false, accepted;
+  const intent = () => ui.runIntents.get(key);
+  const current = () => !disposed && section.isConnected && ui.view === 'codex' && ui.project === project;
+  const eligible = () => Boolean(intent()) || ['auto','hybrid'].includes(settings?.value?.settings?.mode);
+  const terminal = operation => finishedPhases.has(operation.phase);
+  const otherIntent = () => ui.runIntents.has(project) || ui.runIntents.has(memoryKey('api-work',project));
+
+  function paint() {
+    section.hidden = !eligible();
+    start.hidden = Boolean(intent());
+    start.disabled = busy || otherIntent();
+    check.hidden = !intent();
+    retry.hidden = !intent() || !missing;
+    check.disabled = retry.disabled = busy;
+  }
+
+  async function begin() {
+    if (!current() || !eligible() || busy || intent() || otherIntent()) return;
+    const prompt = draft.value.trim();
+    if (!prompt || prompt.length > 12000) {
+      status.textContent = '12,000字以内の開発指示を下書きに入力してください。';
+      draft.focus();
+      return;
+    }
+    if (ui.attachmentDrafts.has(draftKey)) {
+      status.textContent = '添付を使う作業は、対応する経路の送信ボタンを選んでください。';
+      return;
+    }
+    ui.runIntents.set(key,{id:crypto.randomUUID(),prompt,...choices()});
+    storeTab();
+    onChange();
+    await request(true);
+  }
+
+  async function request(post) {
+    const payload = intent();
+    if (!current() || busy || !payload) return;
+    clearTimeout(timer);
+    busy = true;
+    missing = false;
+    paint();
+    status.textContent = post ? '案件設定と実行先を照合しています…' : '受付を照合しています…';
+    const href = apiPath('/api/execution/dispatch',{project,id:post ? undefined : payload.id});
+    const {attempted,...input} = payload;
+    if (post) {
+      ui.runIntents.set(key,{...input,attempted:true});
+      storeTab();
+    }
+    try {
+      const result = await api(href,{signal:AbortSignal.timeout(24000), ...(post && {method:'POST',
+        headers:{'Content-Type':'application/json'},body:JSON.stringify(input)})});
+      if (!current() || intent()?.id !== payload.id) return;
+      if (!result?.operation && result?.route === null && !post) {
+        missing = true;
+        status.textContent = 'この受付番号の実行を確認できません。同じ番号で照合または再送できます。';
+        return;
+      }
+      const {route,operation} = result;
+      if (!['api','subscription'].includes(route) || operation?.id !== payload.id || operation.project !== project ||
+          !Object.hasOwn(runPhases,operation.phase)) throw new Error('対象の受付を照合できませんでした。');
+      const label = route === 'api' ? '通常API' : '契約内Codex';
+      const phase = terminal(operation) && operation.phase === 'completed'
+        ? (route === 'api' ? '作業完了' : 'ターン完了') : runPhases[operation.phase];
+      const reason = route === 'api' ? apiWorkMessages[operation.result] : null;
+      status.textContent = [label,phase,reason].filter(Boolean).join(' · ');
+      if ((operation.startedAt || operation.turnId) && draft.value.trim() === payload.prompt &&
+          !ui.attachmentDrafts.has(draftKey)) {
+        ui.drafts.delete(draftKey);
+        draft.value = '';
+      }
+      if (terminal(operation)) ui.runIntents.delete(key);
+      storeTab();
+      if (accepted?.route !== route || accepted?.phase !== operation.phase) {
+        accepted = {route,phase:operation.phase};
+        onChange(route,operation.id);
+      }
+      if (!terminal(operation) && operation.phase !== 'unconfirmed' && !document.hidden) {
+        timer = setTimeout(() => void request(false),2500);
+      }
+    } catch (error) {
+      if (!current() || intent()?.id !== payload.id) return;
+      status.textContent = error.message;
+      if (post && !attempted && [400,403,409,413].includes(error.status)) {
+        ui.runIntents.delete(key);
+        storeTab();
+        onChange();
+      }
+    } finally {
+      busy = false;
+      if (current()) paint();
+    }
+  }
+  const cleanup = () => {
+    disposed = true;
+    clearTimeout(timer);
+    document.removeEventListener('visibilitychange',onVisibility);
+    runViewCleanups.delete(cleanup);
+  };
+  const onVisibility = () => {
+    if (!document.hidden && intent()) void request(false);
+  };
+  document.addEventListener('visibilitychange',onVisibility);
+  runViewCleanups.add(cleanup);
+  paint();
+  if (settings?.pending) void settings.pending.then(() => { if (current()) paint(); });
+  queueMicrotask(() => { if (intent()) void request(false); });
+  return {cleanup};
+}
+
 function modelSettings(target, back) {
   const project = ui.project;
   const canWrite = ui.capabilities.codexWrite === true && selectedProject()?.codexWrite === true;
@@ -4307,8 +4432,12 @@ function modelSettings(target, back) {
   addDictation(area.body, draft);
   let nativeRun;
   let apiRun;
+  let routedRun;
+  let stageChoice;
+  let routeChoice;
   let imageModel = null;
-  const projectSettings = canWrite ? viewResource(memoryKey('execution-settings', project), apiPath('/api/execution/settings', {project})) : null;
+  const projectSettings = (canWrite || (!target && ui.capabilities.apiDevelopment === true)) ?
+    viewResource(memoryKey('execution-settings', project), apiPath('/api/execution/settings', {project})) : null;
   let runChoices = {};
   if (canWrite) {
     const details = node('details', 'scope-info');
@@ -4316,6 +4445,8 @@ function modelSettings(target, back) {
     const route = labeledSelect('作業別の利用経路', {'': '案件設定を使う', subscription: 'サブスク',
       ...(!target && ui.capabilities.apiDevelopment !== true ? {api: 'API'} : {})});
     const stage = labeledSelect('作業の工程', {'': '標準設定を使う', ...workStageLabels});
+    stageChoice = () => stage.input.value || 'implementation';
+    routeChoice = () => route.input.value;
     fields.append(route.field, stage.field);
     details.append(node('summary', '', 'この作業の経路を指定'), fields);
     if (ui.capabilities.executionSettings === true) area.body.append(details);
@@ -4329,6 +4460,22 @@ function modelSettings(target, back) {
     area.body.append(node('p', 'small muted draft-hint', '現在の接続では履歴を閲覧できます。下書きはこのタブに保存されます。'));
   }
   if (!target && ui.capabilities.apiDevelopment === true) apiRun = mountApiControls(area, project, draft, draftKey);
+  if (!target && projectSettings) {
+    let stagePicker;
+    if (!stageChoice) {
+      const stage = labeledSelect('作業の工程',workStageLabels);
+      stage.input.value = 'implementation';
+      stageChoice = () => stage.input.value;
+      stagePicker = stage.field;
+    }
+    routedRun = mountProjectDispatch(area.body,project,draft,draftKey,projectSettings,
+      () => ({...runChoices,stage:stageChoice(),...(routeChoice?.() && {route:routeChoice()})}),(route,id) => {
+        nativeRun?.paint();
+        apiRun?.paint();
+        if (route === 'subscription') void nativeRun?.refresh(id);
+        if (route === 'api') void apiRun?.refresh(id);
+      },stagePicker);
+  }
   fetchView(memoryKey('models'), '/api/codex/models', form, (data, destination) => {
     const models = asArray(data?.data);
     if (!models.length) {
@@ -4408,6 +4555,7 @@ function modelSettings(target, back) {
     abortLocalDictation(draft);
     nativeRun?.cleanup();
     apiRun?.cleanup();
+    routedRun?.cleanup();
   }};
 }
 const evidenceStatus = {inProgress: '実行中', completed: '完了', interrupted: '中断', failed: '失敗', declined: '却下'};

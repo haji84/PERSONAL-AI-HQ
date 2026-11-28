@@ -308,6 +308,17 @@ export function createOperations(directory, native, execution, {prepareHandover,
   return {
     hasProjectHistory: id => Boolean(projectHistory.get(id)),
     hasActiveWork(project, exceptId = null) { return Boolean(activeRun.get(project.id, exceptId)); },
+    hasReceipt(project, id) { return Boolean(byId.get(project.id,id)); },
+    async dispatchCapability(project, requestedModel) {
+      await confirmedWorkspace(project);
+      const {accountType,data} = await native.models();
+      if (accountType !== 'chatgpt') throw problem(409,'ChatGPTプランの認証を確認できません。','SUBSCRIPTION_AUTH_REQUIRED');
+      await checkSubscriptionUsage();
+      const defaultModel = data.find(model => model.isDefault);
+      return {available:true,executorId:'native-codex',authMode:'chatgpt',defaultModel:defaultModel?.id,
+        defaultReasoningEffort:data.find(model => model.id === (requestedModel ?? defaultModel?.id))?.defaultReasoningEffort || null,
+        models:data.map(model => ({id:model.id,reasoningEfforts:model.reasoningEfforts.map(effort => effort.reasoningEffort)}))};
+    },
     hasNativeWork(project) {
       return Boolean(knownNativeWork.get(project.id, JSON.stringify(project.cwd)));
     },
@@ -432,7 +443,7 @@ export function createOperations(directory, native, execution, {prepareHandover,
       return {activity: {id: row.id, kind: 'codex', phase: isTerminal || isRecent || currentPhase === 'cancelling' ? currentPhase : 'unconfirmed',
         observedAt: row.updatedAt, createdAt: row.createdAt, startedAt: row.startedAt, terminal: isTerminal}};
     },
-    async start(project, input) {
+    async start(project, input, {expectedRevision, replayOnly = false, canDispatch} = {}) {
       const handover = input?.handover;
       const beginsHandover = handover !== undefined;
       const threadTarget = input?.expectedThreadId;
@@ -474,6 +485,7 @@ export function createOperations(directory, native, execution, {prepareHandover,
       };
       let row = duplicate();
       if (row) return {operation: response(row)};
+      if (replayOnly) throw problem(409,'元の受付を確認できません。','TASK_ID_CONFLICT');
       if (!resumeIsCurrent()) throw resumeUnavailable();
       const stage = input.stage ?? previous?.stage ?? 'implementation';
       const route = input.route ?? previous?.explicitRoute ?? null;
@@ -490,6 +502,9 @@ export function createOperations(directory, native, execution, {prepareHandover,
         selection = execution ? await execution.authorize(project, {stage, route, model: input.model, effort: input.effort, handoverReceipt,
           ...(attachment ? {imageRequired: true} : {})})
           : {model: input.model, effort: input.effort};
+        if (expectedRevision !== undefined && selection.revision !== expectedRevision) {
+          throw problem(409,'案件の実行設定が変わりました。','EXECUTION_SETTINGS_CHANGED');
+        }
         if (!execution) {
           const selected = await configureModel(selection.model, selection.effort, Boolean(attachment));
           if (attachment) {
@@ -513,12 +528,24 @@ export function createOperations(directory, native, execution, {prepareHandover,
         throw error;
       }
       try {
-        if (!resumeIsCurrent()) throw resumeUnavailable();
-        const chatConversationId = reference ? chatConversationForHandoff?.(project, reference) ?? null : null;
-        if (!freshUsage(admissionObservedAt)) throw usageProblem('CODEX_SUBSCRIPTION_USAGE_UNCONFIRMED');
-        if (!insert.run(project.id, input.id, expected, digest, timestamp(), timestamp(), stage, route, handoverReceipt,
-          handover?.review ?? null, input.resume ?? null, previous?.threadId ?? null, chatConversationId).changes) {
-          throw resumeUnavailable();
+        db.exec('BEGIN IMMEDIATE');
+        try {
+          if (canDispatch && !canDispatch()) throw problem(401,'サインインが必要です。');
+          if (!resumeIsCurrent()) throw resumeUnavailable();
+          if (execution?.store?.getWork(project.id,input.id).operation) {
+            throw problem(409,'受付番号が別の経路で使われています。','TASK_ID_CONFLICT');
+          }
+          if (expectedRevision !== undefined && !execution.isCurrent(project, expectedRevision, stage, expected, route, handoverReceipt)) {
+            throw problem(409,'案件の実行設定が変わりました。','EXECUTION_SETTINGS_CHANGED');
+          }
+          const chatConversationId = reference ? chatConversationForHandoff?.(project, reference) ?? null : null;
+          if (!freshUsage(admissionObservedAt)) throw usageProblem('CODEX_SUBSCRIPTION_USAGE_UNCONFIRMED');
+          if (!insert.run(project.id, input.id, expected, digest, timestamp(), timestamp(), stage, route, handoverReceipt,
+            handover?.review ?? null, input.resume ?? null, previous?.threadId ?? null, chatConversationId).changes) throw resumeUnavailable();
+          db.exec('COMMIT');
+        } catch (error) {
+          db.exec('ROLLBACK');
+          throw error;
         }
       }
       catch (error) {
@@ -528,7 +555,8 @@ export function createOperations(directory, native, execution, {prepareHandover,
         throw error;
       }
       row = byId.get(project.id, input.id);
-      const maySubmit = () => !closed && byId.get(project.id, input.id)?.phase === 'reserved' && resumeIsCurrent() && !alreadyLaunched() &&
+      const maySubmit = () => !closed && (!canDispatch || canDispatch()) &&
+        byId.get(project.id, input.id)?.phase === 'reserved' && resumeIsCurrent() && !alreadyLaunched() &&
         (!execution || execution.isCurrent(project, selection.revision, stage, expected, route, handoverReceipt));
       let usageObservedAt;
       let stillCurrent;

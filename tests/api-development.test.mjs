@@ -5,6 +5,7 @@ import {createHash} from 'node:crypto';
 import {once} from 'node:events';
 import {writeFileSync} from 'node:fs';
 import {copyFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile} from 'node:fs/promises';
+import {request} from 'node:http';
 import {dirname, join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {setTimeout as wait} from 'node:timers/promises';
@@ -29,7 +30,7 @@ async function authenticatedRequests(app) {
       ...(data ? {body: JSON.stringify(data)} : {})});
 }
 
-async function fixture(t, fetchImpl, {handover = false, auxiliary = [], codex = {}, realtimeConnect, verifyInSandbox} = {}) {
+async function fixture(t, fetchImpl, {handover = false, auxiliary = [], codex = {}, realtimeConnect, verifyInSandbox, tailnet} = {}) {
   const directory = await realpath(await mkdtemp(join(tmpdir(), 'hq-api-app-')));
   let app, requests;
   const servers = new Set();
@@ -81,7 +82,7 @@ test('answer equals the required value', () => assert.equal(answer, 2));\n`);
   async function open(enableExecution) {
     await app?.close();
     servers.delete(app);
-    app = await startOwnerApp({directory, port: 0, codex, apiDevelopment: enableExecution && {
+    app = await startOwnerApp({directory, port: 0, codex, tailnet, apiDevelopment: enableExecution && {
       getKey: () => 'fixture-only', fetchImpl, realtimeConnect, verifyInSandbox,
     }});
     servers.add(app);
@@ -99,7 +100,8 @@ test('answer equals the required value', () => assert.equal(answer, 2));\n`);
     git('commit', '--quiet', '-m', 'Fixture checkout change');
   };
   const commitSource = text => commitFiles([{path: 'source.mjs', text}]);
-  return {call: (...args) => requests(...args), source, requirements, portfolio, directory, store, ledgerFile, commitFiles, commitSource, open, openReader};
+  return {call: (...args) => requests(...args), source, requirements, portfolio, directory, store, ledgerFile, commitFiles, commitSource, open, openReader,
+    get tailnetTarget() { return app.tailnetTarget; }};
 }
 
 async function waitFor(call, target, taskId = instruction.id) {
@@ -112,6 +114,247 @@ async function waitFor(call, target, taskId = instruction.id) {
   }
   assert.fail('Timed out waiting for API job');
 }
+
+const dispatchPath = '/api/execution/dispatch';
+
+function dispatchCodex(sends, beforeCatalog = () => {}) {
+  return {canWrite: true, subscriptionReady: async () => true,
+    async models() {
+      beforeCatalog();
+      return {accountType: 'chatgpt', data: [{id: 'fixture-codex', isDefault: true, reasoningEfforts: []}]};
+    },
+    usage: async () => ({observedAt: new Date().toISOString(), ordinaryUsageAllowed: true, windows: [{usedPercent: 20}]}),
+    async submit(input) {
+      assert.equal(input.beforeThread(), true);
+      await input.beforeTurn();
+      assert.equal(input.onThread('dispatch-fixture-thread'), true);
+      sends.push(input.requestId);
+      return {turn: {id: 'dispatch-fixture-turn', status: 'completed'}};
+    }};
+}
+
+async function waitForDispatch(call, id, expected = 'completed') {
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    const reply = await call(dispatchPath, {query: {id}});
+    assert.equal(reply.status, 200);
+    const result = await reply.json();
+    if (result.operation?.phase === expected) return result;
+    if (['completed', 'failed', 'interrupted', 'unconfirmed'].includes(result.operation?.phase)) {
+      assert.equal(result.operation.phase, expected);
+    }
+    await wait(20);
+  }
+  assert.fail('Project dispatch did not reach the expected phase');
+}
+
+test('project-selected dispatch uses only authorized fallback and preserves the subscription receipt', {skip: process.platform !== 'darwin'}, async t => {
+  let providerCalls = 0;
+  const nativeSends = [];
+  const {call, open} = await fixture(t, () => { providerCalls++; return providerAnswer(2); }, {codex:dispatchCodex(nativeSends)});
+  const set = (revision, settings) => call('/api/execution/settings', {data: {revision, settings}});
+  const send = (data = instruction) => call(dispatchPath, {data});
+  const read = () => call(dispatchPath, {query: {id: instruction.id}});
+  await open(false);
+  assert.equal((await call(dispatchPath, {data: instruction, auth: false})).status, 401);
+  assert.equal((await call(dispatchPath, {query: {id: instruction.id}, auth: false})).status, 401);
+  assert.equal((await set(0, {mode: 'auto', preference: 'api-first', allowFallback: false})).status, 200);
+  assert.equal((await send()).status, 409);
+  assert.equal((await set(1, {mode: 'api-only', apiBudgetUsd: 1})).status, 200);
+  assert.equal((await send()).status, 409);
+  assert.equal((await send({...instruction, route: 'subscription'})).status, 409);
+  assert.deepEqual(await (await read()).json(), {route: null, operation: null});
+  assert.deepEqual(nativeSends, []);
+
+  assert.equal((await set(2, {mode: 'auto', preference: 'api-first', allowFallback: true, apiBudgetUsd: 1})).status, 200);
+  assert.equal((await send({...instruction, route: 'api'})).status, 409);
+  const submitted = await send();
+  assert.equal(submitted.status, 202);
+  assert.equal((await submitted.json()).fallback, true);
+  const completed = await waitForDispatch(call, instruction.id);
+  assert.equal(completed.route, 'subscription');
+  assert.equal(completed.operation.id, instruction.id);
+  assert.equal(completed.operation.threadId, 'dispatch-fixture-thread');
+
+  await open(true);
+  assert.equal((await set(3, {mode: 'api-only', apiBudgetUsd: 1})).status, 200);
+  const replay = await send();
+  assert.equal(replay.status, 202);
+  assert.deepEqual(await replay.json(), completed);
+  assert.deepEqual(await (await read()).json(), completed);
+  assert.equal((await send({...instruction, route: 'api'})).status, 409);
+  assert.equal((await send({...instruction, prompt: 'Changed intent'})).status, 409);
+  const separate = {id: 'native-history-next', prompt: 'Follow the previous work'};
+  const blocked = await send(separate);
+  assert.equal(blocked.status, 409);
+  assert.match((await blocked.json()).error, /照合/u);
+  assert.deepEqual(await (await call(dispatchPath, {query: {id: separate.id}})).json(), {route: null, operation: null});
+  assert.deepEqual(nativeSends, [instruction.id]);
+  assert.equal(providerCalls, 0);
+});
+
+test('project-selected dispatch uses approved API once and reads it after settings and availability change', {skip: process.platform !== 'darwin'}, async t => {
+  let providerCalls = 0;
+  const nativeSends = [];
+  const {call, open} = await fixture(t, () => { providerCalls++; return providerAnswer(2); }, {codex:dispatchCodex(nativeSends)});
+  const set = (revision, settings) => call('/api/execution/settings', {data: {revision, settings}});
+  const send = (data = instruction) => call(dispatchPath, {data});
+  assert.equal((await set(0, {mode: 'auto', preference: 'api-first', allowFallback: true, apiBudgetUsd: 1})).status, 200);
+  const concurrent = await Promise.all([send(), send()]);
+  assert.deepEqual(concurrent.map(response => response.status), [202, 202]);
+  for (const response of concurrent) {
+    const body = await response.json();
+    assert.equal(body.route, 'api');
+    assert.equal(body.operation.id, instruction.id);
+  }
+  const completed = await waitForDispatch(call, instruction.id);
+  assert.equal(completed.route, 'api');
+  assert.equal(completed.operation.artifactCount, 1);
+  assert.equal(completed.operation.verification.passed, true);
+  assert.equal((await set(1, {mode: 'subscription-only'})).status, 200);
+  await open(false);
+  const replay = await send();
+  assert.equal(replay.status, 202);
+  assert.deepEqual(await replay.json(), completed);
+  assert.equal((await send({...instruction, route: 'subscription'})).status, 409);
+  assert.equal((await send({...instruction, prompt: 'Changed intent'})).status, 409);
+  const query = {id: instruction.id};
+  assert.deepEqual(await (await call(dispatchPath, {query})).json(), completed);
+  assert.deepEqual(await (await call(dispatchPath, {query, project: 'other-fixture'})).json(), {route: null, operation: null});
+  const blocked = await send({id: 'api-history-next', prompt: 'Follow the previous work'});
+  assert.equal(blocked.status, 409);
+  assert.match((await blocked.json()).error, /照合/u);
+  assert.equal(providerCalls, 1);
+  assert.deepEqual(nativeSends, []);
+});
+
+test('project-selected dispatch preserves an unconfirmed API operation without falling back', {skip: process.platform !== 'darwin'}, async t => {
+  let providerCalls = 0;
+  const nativeSends = [];
+  const {call, open, store} = await fixture(t, () => { providerCalls++; throw new Error('Fixture transport broke after send'); },
+    {codex:dispatchCodex(nativeSends)});
+  const send = (data = instruction) => call(dispatchPath, {data});
+  assert.equal((await call('/api/execution/settings', {data: {revision: 0,
+    settings: {mode: 'auto', preference: 'api-first', allowFallback: true, apiBudgetUsd: 1}}})).status, 200);
+  assert.equal((await send()).status, 202);
+  const unconfirmed = await waitForDispatch(call, instruction.id, 'unconfirmed');
+  assert.equal(unconfirmed.route, 'api');
+  assert.ok(store.getWork(id).busy);
+  await open(false);
+  const replay = await send();
+  assert.equal(replay.status, 202);
+  assert.deepEqual(await replay.json(), unconfirmed);
+  assert.equal((await send({...instruction, route: 'subscription'})).status, 409);
+  assert.equal((await send({...instruction, id: 'unknown-effect-next'})).status, 409);
+  assert.equal(providerCalls, 1);
+  assert.deepEqual(nativeSends, []);
+});
+
+test('project-selected dispatch rejects a policy revision changed during capability checking', {skip: process.platform !== 'darwin'}, async t => {
+  const nativeSends = [];
+  let changeSettings;
+  const {call, store, open} = await fixture(t, () => assert.fail('No provider should run'),
+    {codex:dispatchCodex(nativeSends, () => changeSettings?.())});
+  await open(false);
+  changeSettings = () => store.updateSettings(id, 0, {mode: 'subscription-only'});
+  const response = await call(dispatchPath, {data: instruction});
+  assert.equal(response.status, 409);
+  assert.match((await response.json()).error, /設定/u);
+  assert.deepEqual(nativeSends, []);
+  assert.deepEqual(await (await call(dispatchPath, {query: {id: instruction.id}})).json(), {route: null, operation: null});
+});
+
+function remoteDispatchRequest(target, tailnet, path, {data, cookie} = {}) {
+  assert.equal(new URL(target).hostname, '127.0.0.1');
+  const host = new URL(tailnet.origin).host;
+  const body = data && JSON.stringify(data);
+  return new Promise((resolve, reject) => {
+    const outgoing = request(target + path, {method: body ? 'POST' : 'GET', agent: false,
+      headers: {Host: host, 'X-Forwarded-Host': host, 'X-Forwarded-Proto': 'https', 'Tailscale-User-Login': tailnet.login,
+        ...(cookie && {Cookie: cookie}), ...(body && {Origin: tailnet.origin, 'Content-Type': 'application/json'})}}, async response => {
+      try {
+        let text = '';
+        for await (const chunk of response) text += chunk;
+        resolve({status: response.statusCode, headers: response.headers, data: JSON.parse(text)});
+      } catch (error) { reject(error); }
+    });
+    outgoing.setTimeout(3000, () => outgoing.destroy(new Error('Local proxy fixture timed out')));
+    outgoing.once('error', reject);
+    outgoing.end(body);
+  });
+}
+
+test('project-selected dispatch cancels an API reservation revoked through the remote owner session', {skip: process.platform !== 'darwin'}, async t => {
+  const tailnet = {origin: 'https://workstation.example.ts.net', login: 'owner@example.invalid', port: 0};
+  const entered = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  let providerCalls = 0;
+  const env = await fixture(t, () => { providerCalls++; return providerAnswer(2); }, {tailnet,
+    async verifyInSandbox() {
+      entered.resolve(true);
+      await release.promise;
+      return {passed: true, exitCode: 0, output: 'Fixture workspace verified'};
+    }});
+  const {call, store} = env;
+  const remote = (path, options) => remoteDispatchRequest(env.tailnetTarget, tailnet, path, options);
+  assert.equal((await call('/api/execution/settings', {data: {revision: 0, settings: {mode: 'api-only', apiBudgetUsd: 1}}})).status, 200);
+  const pair = await call('/api/access/pair', {data: {}});
+  assert.equal(pair.status, 200);
+  const {code} = await pair.json();
+  const signed = await remote('/api/access/redeem', {data: {code}});
+  assert.equal(signed.status, 200);
+  const cookie = signed.headers['set-cookie'][0].split(';')[0];
+  const route = dispatchPath + '?project=' + id;
+  try {
+    const accepted = await remote(route, {data: instruction, cookie});
+    assert.equal(accepted.status, 202);
+    assert.equal(accepted.data.route, 'api');
+    assert.ok(await Promise.race([entered.promise, wait(2000, false, {ref: false})]));
+    assert.equal(store.getWork(id, instruction.id).operation.status, 'reserved');
+    assert.equal((await call('/api/access/revoke', {data: {}})).status, 200);
+    assert.equal((await remote(route + '&id=' + instruction.id, {cookie})).status, 401);
+  } finally { release.resolve(); }
+  const {operation} = await waitForDispatch(call, instruction.id, 'interrupted');
+  assert.equal(operation.result, 'SIGN_IN_REQUIRED');
+  assert.equal(operation.startedAt, null);
+  assert.equal(providerCalls, 0);
+  const work = store.getWork(id, instruction.id);
+  assert.equal(work.operation.status, 'cancelled');
+  assert.equal(work.busy, false);
+  assert.equal(work.settledApiMicros, 0);
+});
+
+test('project-selected dispatch rechecks workspace scope when a native receipt read finishes', {skip: process.platform !== 'darwin'}, async t => {
+  t.mock.timers.enable({apis: ['Date']});
+  const entered = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const nativeSends = [];
+  const codex = dispatchCodex(nativeSends);
+  const originalSubmit = codex.submit;
+  codex.submit = async input => {
+    const result = await originalSubmit(input);
+    return {turn: {...result.turn, status: 'inProgress'}};
+  };
+  codex.findSubmission = async (_workspace, thread, clientId, turnId) => {
+    assert.deepEqual([thread, clientId, turnId], ['dispatch-fixture-thread', instruction.id, 'dispatch-fixture-turn']);
+    entered.resolve(true);
+    await release.promise;
+    return {id: turnId, status: 'completed'};
+  };
+  const {call, portfolio} = await fixture(t, () => assert.fail('No API provider should run'), {codex});
+  assert.equal((await call(dispatchPath, {data: instruction})).status, 202);
+  await waitForDispatch(call, instruction.id, 'running');
+  t.mock.timers.tick(16_000);
+  const pending = call(dispatchPath, {query: {id: instruction.id}});
+  try {
+    assert.ok(await Promise.race([entered.promise, wait(2000, false, {ref: false})]));
+    const directory = JSON.parse(await readFile(portfolio, 'utf8'));
+    delete directory.projects.find(project => project.id === id).cwd;
+    await writeFile(portfolio, JSON.stringify(directory));
+  } finally { release.resolve(); }
+  assert.equal((await pending).status, 404);
+  assert.deepEqual(nativeSends, [instruction.id]);
+});
 
 test('the checked Codex result anchors a Realtime conversation without changing the existing development checkpoint',
   {skip: process.platform !== 'darwin', timeout: 20000}, async t => {

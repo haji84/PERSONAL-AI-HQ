@@ -31,6 +31,7 @@ import {createTailnetAccess, tailnetCookieName} from './tailnet-access.mjs';
 import {validatedDocument} from './text-attachment.mjs';
 import {chatConversationForHandoff, readChatHandoff} from './chat-handoff.mjs';
 import {readCodexChatContext} from './codex-chat-context.mjs';
+import {createWorkRouting} from './work-routing.mjs';
 
 const root = fileURLToPath(new URL('../public/', import.meta.url));
 const assets = new Map([['/', ['index.html', 'text/html']], ['/app.mjs', ['app.mjs', 'text/javascript']],
@@ -48,6 +49,7 @@ const nativeObservationTimeout = 4000;
 const nativeActivityWatch = /^([a-z0-9_-]{1,160}):([a-z0-9_-]{1,160})$/i;
 const error = (status, message) => Object.assign(new Error(message), {status});
 const apiMessages = {
+  SIGN_IN_REQUIRED: 'サインインが必要です。',
   API_AUTHORIZATION_REQUIRED: 'この端末の通常API実行は認証が保留中です。',
   API_RUNTIME_UNSUPPORTED: 'この端末で通常APIの隔離実行を確認できません。',
   API_AUTHORITY_MISSING: '本人が確認したAPIの費用・組織設定がありません。',
@@ -233,8 +235,10 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
   });
   const apiWork = createApiDevelopment({...apiOptions,
     directory, store: execution.store, conversations: chats, hasNativeWork: operations.hasNativeWork, hasActiveWork: operations.hasActiveWork,
+    hasNativeReceipt: operations.hasReceipt,
     completedNativeSource: operations.completedSource, readHandoverTurn: (...args) => native.readHandoverTurn?.(...args),
     withProjectWorkLock});
+  const routing = createWorkRouting({directory, operations, store:execution.store, apiWork, apiEnabled});
   const realtime = createRealtimeExecution({directory, store: execution.store, conversations: chats, withProjectWorkLock,
     hasNativeWork: operations.hasNativeWork, prepareNativeHandover: apiWork.prepareRealtimeNativeHandover,
     getKey: apiOptions.getKey, readAuthority: apiOptions.readAuthority,
@@ -639,6 +643,22 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
         'Content-Disposition': `attachment; filename*=UTF-8''${encoded}`});
       response.end(bytes);
       return;
+    }
+    if (route === '/api/execution/dispatch') {
+      const params = target.searchParams;
+      if (params.getAll('project').length !== 1 || params.size !== (get ? 2 : 1) || (get && !params.has('id'))) {
+        throw error(400,'案件と受付番号を確認してください。');
+      }
+      if (get || post) {
+        const result = get ? await routing.read(project,params.get('id')) :
+          await routing.start(project,await jsonBody(request,64000),signedIn);
+        if (!signedIn()) throw error(401,'サインインが必要です。');
+        const current = readCurrentProject(directory,project.id);
+        if (!current || current.cwd.length !== project.cwd.length || current.cwd.some(cwd => !project.cwd.includes(cwd))) {
+          throw error(404,'この案件の作業先を確認できません。');
+        }
+        return send(response,get ? 200 : 202,result);
+      }
     }
     if (route.startsWith('/api/execution/api')) {
       if (!apiEnabled) throw error(409, apiMessages.API_AUTHORIZATION_REQUIRED);

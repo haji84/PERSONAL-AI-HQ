@@ -413,6 +413,15 @@ export class ExecutionStore {
     return result.allowed ? {allowed: true, reservedMicros: moneyMicros(result.decision.maxCostUsd, 'ceil')} : result;
   }
 
+  previewDispatch(projectId, task, context) {
+    const data = this.#read();
+    const project = this.#project(data, projectId, {includeInitial: true});
+    if (Object.values(project.operations).some(operation => active.has(operation.status))) return denial('PROJECT_BUSY');
+    const result = this.#prepareAdmission(data, project, task, context, false);
+    return result.allowed ? {allowed:true, route:result.decision.route, revision:project.revision,
+      fallback:result.decision.fallback} : result;
+  }
+
   prepareDispatch(request, context) {
     id(request.projectId); id(request.taskId);
     if (!hashPattern.test(request.instructionDigest ?? '')) error('INVALID_INSTRUCTION_DIGEST');
