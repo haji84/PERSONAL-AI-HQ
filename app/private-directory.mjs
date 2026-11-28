@@ -60,8 +60,8 @@ if (-not (Test-Private ([IO.Directory]::GetAccessControl($directory.FullName))) 
 
 const windowsUserProtection = `
 $ErrorActionPreference = 'Stop'
-[Console]::Error.WriteLine('hq-dpapi:startup')
-Add-Type -AssemblyName System.Security
+[Console]::Error.WriteLine('hq-dpapi:assembly')
+[void][Reflection.Assembly]::Load('System.Security, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a')
 $scope = [Security.Cryptography.DataProtectionScope]::CurrentUser
 $entropy = [Text.Encoding]::UTF8.GetBytes('Personal AI HQ ChatGPT credentials v1')
 [Console]::Error.WriteLine('hq-dpapi:input')
@@ -206,7 +206,7 @@ function windowsProtection(data, destination = '') {
     }, (problem, stdout, stderr) => {
       // Never expose child output or errors, since stdout can contain decrypted data.
       if (problem) {
-        const phase = [...(stderr ?? '').matchAll(/^hq-dpapi:(startup|input|cryptography|file)\r?$/gmu)].at(-1)?.[1];
+        const phase = [...(stderr ?? '').matchAll(/^hq-dpapi:(assembly|input|cryptography|file)\r?$/gmu)].at(-1)?.[1];
         rejectOutput(unavailable(phase, problem.killed === true));
       } else resolveOutput(stdout);
     });
