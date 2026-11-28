@@ -3070,6 +3070,8 @@ function planComposer(project, onConversation) {
       if (isImage) {
         if (!imageAllowed(selectedModel)) throw new Error('画像入力に対応する相談経路とモデルを確認してください。');
         if (!file.size || file.size > codexImageLimit) throw new Error('512 KiB以下の画像を選んでください。');
+      } else if (file.name === 'codex-result.json') {
+        throw new Error('Codexの作業結果は、作業詳細で照合してから下書きに添付してください。');
       } else if (!file.size || file.size > textDocumentLimit || !textDocumentExtensions.includes(ext)) {
         throw new Error('16 KiB以下のテキスト、Markdown、CSV、JSONを選んでください。');
       }
@@ -3205,24 +3207,45 @@ function planComposer(project, onConversation) {
     attachmentStatus.textContent = readingAttachment ? '添付を照合しています。' : attachmentError ||
       (wrongConversation ? '元の会話を引き継ぐか、添付を外してください。' :
         imageBlocked ? '画像に対応する相談経路とモデルを確認してください。' :
-          needsFile ? (pending.imageSha256 ? '再送するには最初と同じ画像を選んでください。' : '再送するには最初と同じ資料を選んでください。') :
+          needsFile ? (pending.codexResult ? 'Codexの添付を選び直す前に「前の応答を確認」で受付を照合してください。' :
+            pending.imageSha256 ? '再送するには最初と同じ画像を選んでください。' : '再送するには最初と同じ資料を選んでください。') :
             attachment?.file?.name ?? attachment?.document?.name ?? '');
   }
+  const staleResultMessage = '送信を止めました。作業詳細でCodexの結果をもう一度確認し、添付し直してください。';
   function showTurn(turn, selectConversation = true) {
     if (!turn) { status.textContent = 'この受付番号の応答はまだ確認できません。'; return; }
+    const intent = ui.chatIntents.get(project);
+    if (turn.code === 'CODEX_RESULT_STALE') {
+      if (intent?.id === turn.id && intent.codexResult) rejectStaleResult(intent, attached());
+      else status.textContent = staleResultMessage;
+      return;
+    }
     status.textContent = phaseText[turn.status] ?? '応答の状態を確認できません。';
     output.textContent = typeof turn.text === 'string' ? turn.text : '';
     const terminal = turn.status !== 'in_progress' && Object.hasOwn(phaseText, turn.status);
-    const intent = ui.chatIntents.get(project);
     if (terminal && intent?.id === turn.id) {
       ui.chatIntents.delete(project);
       if ((intent.documentDigest || intent.imageSha256) && matchesAttachment(intent, attached())) ui.attachmentDrafts.delete(draftKey);
       storeTab();
     }
-    if (selectConversation && turn.conversationId && terminal) {
+    if (selectConversation && turn.conversationId && terminal && !(intent?.codexResult && turn.status === 'failed')) {
       reference.checked = true;
       onConversation(turn.conversationId);
     }
+  }
+  function rejectStaleResult(intent, attachment) {
+    if (ui.chatIntents.get(project) !== intent) return;
+    ui.chatIntents.delete(project);
+    if (ui.chatTurns.get(project) === intent.id) ui.chatTurns.delete(project);
+    if (attachment?.codexReview && attached() === attachment && matchesAttachment(intent, attachment)) {
+      ui.attachmentDrafts.delete(draftKey);
+    }
+    if (!ui.drafts.has(draftKey)) {
+      ui.drafts.set(draftKey, intent.prompt);
+      if (currentAttachmentField()) draft.value = intent.prompt;
+    }
+    storeTab();
+    status.textContent = staleResultMessage;
   }
   async function readPrevious() {
     const id = ui.chatTurns.get(project);
@@ -3246,6 +3269,7 @@ function planComposer(project, onConversation) {
     const id = crypto.randomUUID();
     const attachment = attached();
     ui.chatIntents.set(project, {id, conversationId, model: model.value, prompt,
+      ...(attachment?.codexReview && {codexResult: true}),
       ...(attachment?.file ? {imageSha256: attachment.digest} : attachment ? {documentDigest: attachment.digest} : {})});
     ui.chatTurns.set(project, id);
     storeTab();
@@ -3254,7 +3278,7 @@ function planComposer(project, onConversation) {
   async function submitIntent() {
     const intent = ui.chatIntents.get(project);
     if (!currentAttachmentField() || !intent || !canSend || chatStreams.has(project) || readingAttachment || camera?.active || attachmentError) return;
-    const {documentDigest, imageSha256, ...payload} = intent;
+    const {documentDigest, imageSha256, codexResult, ...payload} = intent;
     const attachment = attached();
     if (!matchesAttachment(intent, attachment)) {
       status.textContent = imageSha256 ? '最初と同じ画像を選んでから再送してください。' : '最初と同じ資料を選んでから再送してください。';
@@ -3274,6 +3298,7 @@ function planComposer(project, onConversation) {
     controls();
     try {
       if (documentDigest) payload.document = attachment.document;
+      if (codexResult) payload.codexReview = attachment.codexReview;
       if (imageSha256) {
         const bytes = new Uint8Array(await attachment.file.arrayBuffer());
         if (!currentAttachmentField()) return;
@@ -3290,8 +3315,12 @@ function planComposer(project, onConversation) {
         signal: controller.signal});
       if (response.status === 401) endSession();
       if (!response.ok) {
-        const message = (await response.json().catch(() => null))?.error;
-        throw new Error(text(message, httpMessages[response.status] ?? '応答を開始できませんでした。'));
+        const problem = await response.json().catch(() => null);
+        if (codexResult && response.status === 409 && problem?.code === 'CODEX_RESULT_STALE') {
+          rejectStaleResult(intent, attachment);
+          return;
+        }
+        throw new Error(text(problem?.error, httpMessages[response.status] ?? '応答を開始できませんでした。'));
       }
       let done = false;
       await chatEvents(response, event => {
@@ -3307,7 +3336,8 @@ function planComposer(project, onConversation) {
           controls();
         } else if (event.type === 'done') {
           done = true;
-          showTurn(event.turn, ui.chatIds.get(project) === selected);
+          if (codexResult && event.code === 'CODEX_RESULT_STALE') rejectStaleResult(intent, attachment);
+          else showTurn(event.turn, ui.chatIds.get(project) === selected);
         }
       });
       if (!done) status.textContent = '応答が途切れました。前の応答を確認してください。';
@@ -3353,11 +3383,11 @@ function planComposer(project, onConversation) {
     }
   })();
   const conversationChanged = () => { closeCamera(); controls(); };
-  function stageCodexResult({document, digest, sourceConversationId}) {
+  function stageCodexResult({document, digest, sourceConversationId, codexReview}) {
     if (!currentAttachmentField() || ui.chatIds.get(project) !== sourceConversationId || readingAttachment ||
         attached() || ui.chatIntents.has(project) || chatStreams.has(project)) return false;
     closeCamera();
-    ui.attachmentDrafts.set(draftKey, {document, digest, sourceConversationId});
+    ui.attachmentDrafts.set(draftKey, {document, digest, sourceConversationId, codexReview});
     reference.checked = true;
     attachmentError = '';
     controls();
@@ -3575,6 +3605,8 @@ function linkedCodexWork(project, conversation, isCurrent, stageResult) {
     preview.tabIndex = 0;
     preview.hidden = true;
     preview.setAttribute('aria-label', '照合済みのCodex作業結果');
+    const record = node('div', 'stack');
+    record.hidden = true;
     const downloads = node('div','stack');
     const actions = node('div', 'run-actions');
     let verified, reviewedConnection;
@@ -3593,6 +3625,8 @@ function linkedCodexWork(project, conversation, isCurrent, stageResult) {
       if (!current() || read.disabled) return;
       read.disabled = true;
       preview.hidden = true;
+      record.hidden = true;
+      record.replaceChildren();
       downloads.replaceChildren();
       verified = undefined;
       if (attach) attach.hidden = true;
@@ -3608,6 +3642,8 @@ function linkedCodexWork(project, conversation, isCurrent, stageResult) {
         reviewedConnection = generation;
         const [commands, files, artifacts] = result.counts;
         confirmation.textContent = `照合済み · 実行記録 ${commands}件 · 変更ファイル ${files}件 · 成果物 ${artifacts}件`;
+        record.replaceChildren(...result.recordLinks);
+        record.hidden = result.recordLinks.length === 0;
         preview.textContent = JSON.stringify(result.packet, null, 2);
         preview.hidden = false;
         linkedArtifactDownloads(downloads,result,project,work.id);
@@ -3618,7 +3654,7 @@ function linkedCodexWork(project, conversation, isCurrent, stageResult) {
     });
     actions.append(read);
     if (attach) actions.append(attach);
-    row.append(actions, confirmation, downloads, preview);
+    row.append(actions, confirmation, record, downloads, preview);
     return row;
   }
 
@@ -5078,9 +5114,11 @@ const codexHistoryPages = new WeakMap();
 async function verifiedCodexChatResult(project, threadId, turn, {candidate, historyCursor, receipt, requireLinked = false, signal}) {
   const result = await api(apiPath('/api/codex/chat-context', {project, id: threadId, turn, conversation: candidate, historyCursor, receipt}),
     {signal});
-  const {document, conversation, sha256, summary} = result ?? {};
+  const {document, conversation, sha256, summary, codexReview} = result ?? {};
   const counts = [summary?.commands, summary?.files, summary?.artifacts];
   if (result?.threadId !== threadId || result.turnId !== turn || document?.name !== 'codex-result.json' ||
+      codexReview?.threadId !== threadId || codexReview.turnId !== turn ||
+      codexReview.historyCursor !== historyCursor || codexReview.receipt !== receipt ||
       typeof document.text !== 'string' || counts.some(count => !Number.isSafeInteger(count) || count < 0) ||
       (conversation !== null && (typeof conversation?.id !== 'string' || !conversation.id ||
         typeof conversation.linked !== 'boolean' || (!conversation.linked && conversation.id !== candidate))) ||
@@ -5092,13 +5130,16 @@ async function verifiedCodexChatResult(project, threadId, turn, {candidate, hist
     throw new Error('添付資料が照合結果と一致しません。');
   }
   const packet = JSON.parse(document.text);
-  if (packet.project?.id !== project || packet.threadId !== threadId || packet.turnId !== turn || packet.status !== 'completed' ||
+  const sourceConversationId = conversation?.id ?? null;
+  if (packet?.project?.id !== project || packet.threadId !== threadId || packet.turnId !== turn || packet.status !== 'completed' ||
+      packet.conversationId !== sourceConversationId ||
       ['commands', 'files', 'artifacts'].some((key, index) => asArray(packet[key]).length !== counts[index])) {
     throw new Error('収録した結果を確認できませんでした。');
   }
   const digest = await attachmentDigest(bytes, document.name);
+  const recordLinks = Object.hasOwn(packet.project, 'record') ? handoffRecordLinks(packet.project.record) : [];
   return {document, conversation, counts, packet, digest, artifactDownloads:result.artifactDownloads,
-    sourceConversationId:conversation?.id??null};
+    sourceConversationId, codexReview, recordLinks};
 }
 
 function codexResultChatHandoff(project, threadId, selector, isCurrent) {
@@ -5106,6 +5147,7 @@ function codexResultChatHandoff(project, threadId, selector, isCurrent) {
   const actions = node('div', 'run-actions');
   const status = node('p', 'small muted');
   status.setAttribute('role', 'status');
+  const record = node('div', 'stack');
   const preview = node('pre', 'run-output');
   preview.tabIndex = 0;
   preview.setAttribute('data-chat-context', '');
@@ -5117,13 +5159,15 @@ function codexResultChatHandoff(project, threadId, selector, isCurrent) {
   const selectedTurn = () => selector.selectedOptions[0];
   const eligible = () => selectedTurn()?.dataset.status === 'completed';
   actions.append(prepareButton, attach);
-  root.append(actions, status, preview);
+  root.append(actions, status, record, preview);
 
   function reset() {
     generation++;
     prepared = undefined;
     root.hidden = !eligible();
     preview.hidden = true;
+    record.hidden = true;
+    record.replaceChildren();
     preview.textContent = status.textContent = '';
     attach.disabled = true;
     prepareButton.disabled = false;
@@ -5137,18 +5181,20 @@ function codexResultChatHandoff(project, threadId, selector, isCurrent) {
     const turn = selector.value;
     const historyCursor = selectedTurn()?.dataset.historyCursor;
     const selected = ui.chatIds.get(project);
-    const candidate = selected && !/^(?:api|codex)\//.test(selected) ? selected : undefined;
+    const candidate = selected && !/^(?:api|codex|realtime)\//.test(selected) ? selected : undefined;
     const current = () => visit === generation && isCurrent() && eligible() && selector.value === turn;
     status.textContent = 'このターンの結果と共有先を照合しています…';
     try {
-      const {document, conversation, counts, digest, sourceConversationId} = await verifiedCodexChatResult(project, threadId, turn,
+      const {document, conversation, counts, digest, sourceConversationId, codexReview, recordLinks} = await verifiedCodexChatResult(project, threadId, turn,
         {candidate, historyCursor, signal: AbortSignal.timeout(12000)});
       if (!current()) return;
       const target = conversation ? text(conversation.title, '保存済みの会話') : 'この案件の新しい相談';
       status.textContent = [`共有先 ${target}`, `実行記録${counts[0]}件・変更ファイル${counts[1]}件・成果物${counts[2]}件`].join(' · ');
+      record.replaceChildren(...recordLinks);
+      record.hidden = recordLinks.length === 0;
       preview.textContent = document.text;
       preview.hidden = false;
-      prepared = {turn, document, digest, sourceConversationId};
+      prepared = {turn, document, digest, sourceConversationId, codexReview};
       attach.disabled = false;
     } catch (error) {
       if (current()) status.textContent = error.message;
@@ -5163,8 +5209,8 @@ function codexResultChatHandoff(project, threadId, selector, isCurrent) {
       status.textContent = 'チャットの保留中の応答と現在の添付を確認してから追加してください。';
       return;
     }
-    const {document, digest, sourceConversationId} = prepared;
-    ui.attachmentDrafts.set(draftKey, {document, digest, sourceConversationId});
+    const {document, digest, sourceConversationId, codexReview} = prepared;
+    ui.attachmentDrafts.set(draftKey, {document, digest, sourceConversationId, codexReview});
     if (sourceConversationId) ui.chatIds.set(project, sourceConversationId);
     storeTab();
     location.hash = 'chat';

@@ -4,6 +4,7 @@ import {join} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
 import {chatInputLimit, chatMessageLimit, chatModelPattern, chatOutputLimit} from './chatgpt-responses.mjs';
 import {validatedImage} from './image-attachment.mjs';
+import {codexResultDocumentName, codexResultStaleCode} from './text-attachment.mjs';
 import {apiAdviceMaxLength} from './api-response.mjs';
 import {realtimeArchiveId, realtimeArchiveReview, realtimeReceiptId, validRealtimeContinuation} from './realtime-history.mjs';
 
@@ -166,7 +167,8 @@ function boundedHistory(messages, budget = chatInputLimit) {
     const text = message.text.slice(0, Math.min(budget, 6000));
     if (!text.trim()) continue;
     budget -= text.length;
-    const attachmentLength = document ? documentText(document).length : 0;
+    // A reviewed Codex result is shared only on its explicitly confirmed turn.
+    const attachmentLength = document && document.name !== codexResultDocumentName ? documentText(document).length : 0;
     const includeDocument = attachmentLength > 0 && attachmentLength <= budget;
     if (includeDocument) budget -= attachmentLength;
     result.push({...message, text, ...(includeDocument ? {document} : {})});
@@ -198,7 +200,7 @@ export function createChatStore(directory, {now = Date.now} = {}) {
       project TEXT NOT NULL, id TEXT NOT NULL, conversation_id TEXT NOT NULL,
       requested_conversation_id TEXT, model TEXT NOT NULL, prompt TEXT NOT NULL, text TEXT NOT NULL, document TEXT,
       status TEXT NOT NULL CHECK (status IN ('in_progress','completed','failed','incomplete','aborted','interrupted')),
-      created_at TEXT NOT NULL, updated_at TEXT NOT NULL, lease_until INTEGER NOT NULL,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL, lease_until INTEGER NOT NULL, failure_code TEXT,
       PRIMARY KEY(project,id),
       FOREIGN KEY(project,conversation_id) REFERENCES live_conversations(project,id)
     );
@@ -209,8 +211,12 @@ export function createChatStore(directory, {now = Date.now} = {}) {
       if (!db.prepare('PRAGMA table_info(conversations)').all().some(({name}) => name === 'source')) {
         db.exec("ALTER TABLE conversations ADD COLUMN source TEXT NOT NULL DEFAULT 'chatgpt-export'");
       }
-      if (!db.prepare('PRAGMA table_info(live_turns)').all().some(({name}) => name === 'document')) {
+      const liveColumns = new Set(db.prepare('PRAGMA table_info(live_turns)').all().map(({name}) => name));
+      if (!liveColumns.has('document')) {
         db.exec('ALTER TABLE live_turns ADD COLUMN document TEXT');
+      }
+      if (!liveColumns.has('failure_code')) {
+        db.exec('ALTER TABLE live_turns ADD COLUMN failure_code TEXT');
       }
     });
   } catch (error) {
@@ -255,7 +261,8 @@ export function createChatStore(directory, {now = Date.now} = {}) {
   const insertLive = db.prepare(`INSERT INTO live_conversations(project,id,title,updated_at,source_id,history) VALUES(?,?,?,?,?,?)`);
   const touchLive = db.prepare(`UPDATE live_conversations SET updated_at=? WHERE project=? AND id=?`);
   const getTurn = db.prepare(`SELECT id,conversation_id AS conversationId,requested_conversation_id AS requestedConversationId,
-    model,prompt,text,document,status,created_at AS createdAt,updated_at AS updatedAt FROM live_turns WHERE project=? AND id=?`);
+    model,prompt,text,document,status,failure_code AS failureCode,created_at AS createdAt,updated_at AS updatedAt
+    FROM live_turns WHERE project=? AND id=?`);
   const addTurn = db.prepare(`INSERT INTO live_turns(project,id,conversation_id,requested_conversation_id,model,prompt,document,text,status,created_at,updated_at,lease_until)
     VALUES(?,?,?,?,?,?,?,'','in_progress',?,?,?)`);
   const activeTurn = db.prepare(`SELECT 1 FROM live_turns WHERE project=? AND conversation_id=? AND status='in_progress'`);
@@ -263,7 +270,8 @@ export function createChatStore(directory, {now = Date.now} = {}) {
   const hasStaleTurns = db.prepare(`SELECT 1 FROM live_turns WHERE project=? AND status='in_progress' AND lease_until<=? LIMIT 1`);
   const staleTurns = db.prepare(`UPDATE live_turns SET status='interrupted',updated_at=?
     WHERE project=? AND status='in_progress' AND lease_until<=?`);
-  const saveTurn = db.prepare(`UPDATE live_turns SET status=?,text=?,updated_at=? WHERE project=? AND id=? AND status='in_progress'`);
+  const saveTurn = db.prepare(`UPDATE live_turns SET status=?,text=?,updated_at=?,failure_code=?
+    WHERE project=? AND id=? AND status='in_progress'`);
   const recentTurns = db.prepare(`SELECT prompt,text,
     CASE WHEN json_type(document,'$.image')='object' THEN NULL ELSE document END AS document
     FROM live_turns WHERE project=? AND conversation_id=? AND status='completed' ORDER BY rowid DESC LIMIT 8`);
@@ -296,7 +304,8 @@ export function createChatStore(directory, {now = Date.now} = {}) {
 
   function turnView(row) {
     if (!row) return null;
-    const {requestedConversationId, document: saved, ...turn} = row;
+    const {requestedConversationId, document: saved, failureCode, ...turn} = row;
+    if (turn.status === 'failed' && failureCode === codexResultStaleCode) turn.code = failureCode;
     const {document, image} = storedAttachment(saved);
     if (image) return {...turn, image: imageMetadata(image)};
     return document ? {...turn, document: {name: document.name}} : turn;
@@ -306,7 +315,7 @@ export function createChatStore(directory, {now = Date.now} = {}) {
     if (hasStaleTurns.get(project, time)) staleTurns.run(new Date(time).toISOString(), project, time);
   }
 
-  function updateTurn(project, id, status, text) {
+  function updateTurn(project, id, status, text, failureCode = null) {
     if (typeof text !== 'string' || text.length > chatOutputLimit) {
       throw storeError(400, 'INVALID_CHAT_TEXT', '回答の形式が正しくありません。');
     }
@@ -319,7 +328,7 @@ export function createChatStore(directory, {now = Date.now} = {}) {
       if (!text.startsWith(row.text)) throw storeError(409, 'CHAT_TEXT_CONFLICT', '保存済みの応答を上書きできません。');
       if (row.status === status && row.text === text) return turnView(row);
       const updatedAt = new Date(time).toISOString();
-      saveTurn.run(status, text, updatedAt, project, id);
+      saveTurn.run(status, text, updatedAt, failureCode, project, id);
       touchLive.run(updatedAt, project, row.conversationId);
       return turnView(getTurn.get(project, id));
     });
@@ -509,9 +518,12 @@ export function createChatStore(directory, {now = Date.now} = {}) {
       }
     },
     persistLiveText: (project, id, text) => updateTurn(project, id, 'in_progress', text),
-    finishLive(project, id, {status, text}) {
+    finishLive(project, id, {status, text, code}) {
       if (!liveStatuses.has(status)) throw storeError(400, 'INVALID_CHAT_STATUS', '応答の状態が正しくありません。');
-      return updateTurn(project, id, status, text);
+      if (code !== undefined && (status !== 'failed' || code !== codexResultStaleCode)) {
+        throw storeError(400, 'INVALID_CHAT_STATUS', '応答の状態が正しくありません。');
+      }
+      return updateTurn(project, id, status, text, code);
     },
     import(project, json) {
       const rows = Array.isArray(json) ? json : json?.conversations;

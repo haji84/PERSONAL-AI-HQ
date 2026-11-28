@@ -10,6 +10,7 @@ import {setTimeout as delay} from 'node:timers/promises';
 import {prepareArtifactEvidenceReadback, readCommittedEvidence, readPublishedArtifactEvidence} from '../app/api-workspace.mjs';
 import {startOwnerApp} from '../app/server.mjs';
 import {createChatStore} from '../app/chat-store.mjs';
+import {createChatGPTResponses} from '../app/chatgpt-responses.mjs';
 import {ExecutionStore} from '../app/execution-store.mjs';
 import {ensurePrivateDirectory} from '../app/private-directory.mjs';
 
@@ -1744,6 +1745,147 @@ test('Codex chat context reads confirmed same-scope turns and exports only resul
   assert.ok(limited.coverage.omitted.files>0);
   assert.equal(bounded.summary.files+limited.coverage.omitted.files,80);
   assert.equal((await get({id:'revoked'})).status,404);
+});
+
+test('a Codex result reaches the ChatGPT adapter only with the current scope, record, evidence and destination', async t => {
+  const {directory, start} = await runtimeFixture(t);
+  const scope = seed.projects[0].cwd;
+  const checkout = join(directory, 'record');
+  const initiative = 'docs/initiatives/chatgpt-codex-integration';
+  const ownerPath = initiative + '/OWNER_REQUEST_20261127.txt';
+  const timelinePath = initiative + '/DELIVERY.md';
+  const repository = 'https://github.com/example/approved-source';
+  const portFile = join(directory, 'portfolio.json');
+  await mkdir(join(checkout, initiative), {recursive:true, mode:0o700});
+  const git = (...args) => execFileSync('git', args, {cwd:checkout, encoding:'utf8', stdio:['ignore','pipe','pipe']}).trim();
+  git('init','-q');
+  git('remote','add','origin',repository+'.git');
+  const requirements = '# Original test requirements\nPreserve the return route.\n';
+  await writeFile(join(checkout,ownerPath), requirements);
+  async function advance(label) {
+    await writeFile(join(checkout,timelinePath), '### Next action\n- 次は '+label+'\n');
+    git('add','--',ownerPath,timelinePath);
+    git('-c','user.name=Fixture','-c','user.email=test@example.invalid','commit','-qm','Update record');
+    return git('rev-parse','HEAD');
+  }
+  const anchor = await advance('記録を準備する。');
+  const revision = await advance('同じ案件で確認する。');
+  const requirementsSha = createHash('sha256').update(requirements).digest('hex');
+  const deliverySource = {kind:'integration-milestone',repository,checkout,ref:git('symbolic-ref','HEAD'),
+    ownerRequestRevision:anchor,ownerRequestSha256:requirementsSha};
+  const definition = {...seed,projects:[{...seed.projects[0],deliverySource}]};
+  const writePortfolio = value => writeFile(portFile, JSON.stringify(value), {mode:0o600});
+  await writePortfolio(definition);
+  let evidencePath = 'verified.txt';
+  let duringTokenRead;
+  let modelLists = 0;
+  const providerInputs = [];
+  const auth = {async accessToken() {
+    const run = duringTokenRead;
+    duringTokenRead = undefined;
+    await run?.();
+    return 'fixture-access-token';
+  }};
+  const responses = createChatGPTResponses({auth, async fetchImpl(url, options) {
+    if (options.method === 'GET') {
+      modelLists++;
+      return Response.json({models:[{slug:'fixture-model',display_name:'Fixture',visibility:'list'}]});
+    }
+    providerInputs.push(JSON.parse(options.body));
+    const events = [{type:'response.output_text.delta',delta:'Accepted fixture'},
+      {type:'response.completed',response:{status:'completed'}}];
+    return new Response(events.map(event=>'data: '+JSON.stringify(event)+'\n\n').join(''),
+      {headers:{'Content-Type':'text/event-stream'}});
+  }});
+  const options = {plan:{auth,responses},codex:{
+    async readThread(paths,id,cursor) {
+      assert.deepEqual(paths,[scope]);
+      assert.equal(cursor,'older');
+      return {thread:{id},turns:[{id:'done',status:'completed'}],nextCursor:null};
+    },
+    async readTurnEvidence(_scope,id,turnId) {
+      return {threadId:id,turnId,entries:[{type:'files',id:'change',status:'completed',
+        changes:[{path:evidencePath,kind:'update',diff:'EXCLUDED_RAW'}]}],nextCursor:null};
+    },
+  }};
+  let app = await start(options);
+  let cookie = await login(app);
+  const call = (route, params={}, body) => fetch(app.url+route+'?'+new URLSearchParams({project:'example',...params}), {
+    method:body?'POST':'GET', headers:{cookie,...(body&&{Origin:app.url,'Content-Type':'application/json'})},
+    ...(body&&{body:JSON.stringify(body)}),
+  });
+  const archive = id => ({id,title:id,update_time:1,current_node:'m',mapping:{m:{parent:null,
+    message:{author:{role:'user'},content:{parts:['Original conversation']}}}}});
+  assert.equal((await call('/api/chat/import',{},[archive('original'),archive('different')])).status,200);
+  const preview = () => call('/api/codex/chat-context',
+    {id:'thread',turn:'done',conversation:'original',historyCursor:'older'}).then(reply=>reply.json());
+  const initial = await preview();
+  const payload = {id:'reverse-fixture',model:'fixture-model',prompt:'Read the confirmed result.',conversationId:'original',
+    document:initial.document,codexReview:initial.codexReview};
+  async function rejected(input) {
+    const reply = await call('/api/chat/live',{},input);
+    assert.equal(reply.status,409);
+    assert.equal((await reply.json()).code,'CODEX_RESULT_STALE');
+    assert.equal((await (await call('/api/chat/live',{id:input.id})).json()).turn,null);
+    assert.equal(providerInputs.length,0);
+  }
+  await rejected({...payload,conversationId:'different'});
+  await rejected({...payload,codexReview:undefined});
+  await rejected({...payload,document:{...initial.document,text:initial.document.text+' '}});
+  const packet = JSON.parse(initial.document.text);
+  assert.equal(packet.conversationId,'original');
+  assert.deepEqual(initial.codexReview,{threadId:'thread',turnId:'done',historyCursor:'older'});
+  assert.deepEqual(packet.project.record,{
+    requirements:{url:`${repository}/blob/${anchor}/${ownerPath}`,revision:anchor,sha256:requirementsSha},
+    progress:{url:`${repository}/blob/${revision}/${timelinePath}`,revision,nextAction:'同じ案件で確認する。'},
+  });
+  assert.equal(initial.document.text.includes('EXCLUDED_RAW'),false);
+  assert.equal(initial.document.text.includes('historyCursor'),false);
+  await advance('照合後に記録を更新する。');
+  await rejected(payload);
+  const fresh = await preview();
+  const freshPayload = {...payload,document:fresh.document,codexReview:fresh.codexReview};
+  evidencePath = 'changed.txt';
+  await rejected(freshPayload);
+  evidencePath = 'verified.txt';
+  duringTokenRead = () => { duringTokenRead = () => { evidencePath = 'changed-at-send.txt'; }; };
+  const late = await call('/api/chat/live',{},freshPayload);
+  assert.equal(late.status,200);
+  const events = (await late.text()).trim().split('\n\n').map(line=>JSON.parse(line.slice(6)));
+  assert.deepEqual(events.map(event=>event.type),['done']);
+  assert.equal(events[0].code,'CODEX_RESULT_STALE');
+  assert.equal(events[0].turn.status,'failed');
+  assert.equal(providerInputs.length,0);
+  const stored = (await (await call('/api/chat/live',{id:payload.id})).json()).turn;
+  assert.equal(stored.status,'failed');
+  assert.equal(stored.code,'CODEX_RESULT_STALE');
+  await app.close();
+  app = await start(options);
+  cookie = await login(app);
+  assert.deepEqual((await (await call('/api/chat/live',{id:payload.id})).json()).turn,stored);
+  const priorCalls = modelLists;
+  const replay = await call('/api/chat/live',{},freshPayload);
+  const replayEvent = JSON.parse((await replay.text()).trim().slice(6));
+  assert.equal(replayEvent.turn.status,'failed');
+  assert.equal(replayEvent.turn.code,'CODEX_RESULT_STALE');
+  assert.equal(modelLists,priorCalls);
+  assert.equal(providerInputs.length,0);
+  const confirmed = await preview();
+  const known = {...payload,id:'accepted-result',document:confirmed.document,codexReview:confirmed.codexReview};
+  const accepted = await call('/api/chat/live',{},known);
+  const acceptedEvents = (await accepted.text()).trim().split('\n\n').map(line=>JSON.parse(line.slice(6)));
+  assert.deepEqual(acceptedEvents.map(event=>event.type),['started','delta','done']);
+  const conversationId = acceptedEvents.at(-1).turn.conversationId;
+  assert.equal(acceptedEvents.at(-1).turn.status,'completed');
+  assert.equal(providerInputs.length,1);
+  assert.ok(JSON.stringify(providerInputs[0]).includes('changed-at-send.txt'));
+  assert.equal(JSON.stringify(providerInputs[0]).includes('codexReview'),false);
+  const followUp = await call('/api/chat/live',{},
+    {id:'ordinary-follow-up',model:payload.model,prompt:'Follow-up without attachments',conversationId});
+  assert.match(await followUp.text(),/"status":"completed"/);
+  assert.equal(providerInputs.length,2);
+  assert.equal(JSON.stringify(providerInputs[1]).includes('codex-result.json'),false);
+  assert.ok(JSON.stringify(providerInputs[1]).includes('Accepted fixture'));
 });
 
 test('Codex chat context pins only exact existing conversation handoffs and preserves legacy receipts', async t => {

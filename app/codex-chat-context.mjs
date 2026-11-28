@@ -1,5 +1,5 @@
 import {validEvidenceCursor, validEvidenceTarget} from './codex.mjs';
-import {validatedDocument} from './text-attachment.mjs';
+import {codexResultDocumentName, codexResultStaleCode, validatedDocument} from './text-attachment.mjs';
 
 const problem = (status, message) => Object.assign(new Error(message), {status});
 const missingThread = () => problem(404, 'この案件のCodex作業を確認できません。');
@@ -12,6 +12,28 @@ const statuses = new Set(['completed', 'failed', 'declined', 'inProgress']);
 const kinds = new Set(['add', 'update', 'delete']);
 const maxPages = 4;
 const maxDocumentBytes = 16 * 1024;
+export const codexResultStale = () => Object.assign(problem(409, 'Codexの実行結果または案件の記録が変わりました。結果をもう一度確認して添付してください。'),
+  {code:codexResultStaleCode});
+
+export function codexResultReviewParams(project, review, destination) {
+  if (!review || typeof review !== 'object' || Array.isArray(review) ||
+      Object.keys(review).some(key => !['threadId','turnId','historyCursor','receipt'].includes(key)) ||
+      !validEvidenceTarget(review.threadId) || !validEvidenceTarget(review.turnId) ||
+      (destination !== null && (typeof destination !== 'string' || !conversationId.test(destination)))) throw codexResultStale();
+  const {threadId, turnId, historyCursor, receipt} = review;
+  const params = new URLSearchParams({project, id:threadId, turn:turnId});
+  if (destination !== null) params.set('conversation',destination);
+  if (historyCursor !== undefined) {
+    if (!validEvidenceCursor(historyCursor)) throw codexResultStale();
+    params.set('historyCursor',historyCursor);
+  }
+  if (receipt !== undefined) {
+    if (typeof receipt !== 'string' || !receiptId.test(receipt)) throw codexResultStale();
+    params.set('receipt',receipt);
+  }
+  return params;
+}
+
 const relativeFile = value => typeof value === 'string' && value.length > 0 && value.length <= 2048 &&
   !/[\\:\x00-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2060-\u206f]/u.test(value) &&
   value.split('/').every(part => part && part !== '.' && part !== '..') &&
@@ -112,12 +134,12 @@ function createDocument(origin, evidence) {
       omitted[name]--;
     }
   }
-  const {document, digest} = validatedDocument({name: 'codex-result.json', text: JSON.stringify(packet)});
+  const {document, digest} = validatedDocument({name: codexResultDocumentName, text: JSON.stringify(packet)});
   const summary = {commands: packet.commands.length, files: packet.files.length, artifacts: packet.artifacts.length};
   return {document, sha256: digest, summary};
 }
 
-export async function readCodexChatContext({chats, operations, native, nativeArtifacts, project, params}) {
+export async function readCodexChatContext({chats, operations, native, nativeArtifacts, project, params, record}) {
   const id = params.get('id');
   const turnId = params.get('turn');
   const candidate = params.get('conversation');
@@ -159,7 +181,8 @@ export async function readCodexChatContext({chats, operations, native, nativeArt
   const conversation = saved ? conversationView(chats, project, candidate, true) :
     selectConversation(chats, operations, project, id, turnId, candidate);
   if (saved && (!conversation || readReceipt()?.snapshot !== saved.snapshot)) throw missingThread();
-  const origin = {schemaVersion: 1, project: {id: project.id}, threadId: id, turnId, status: 'completed',
+  const origin = {schemaVersion: 1, project:{id:project.id, ...(record && {record})}, threadId:id, turnId, status:'completed',
+    conversationId:conversation?.id ?? null,
     ...(exactDate(turn.completedAt) && {completedAt: turn.completedAt}),
     coverage: {turnPages: turn.pages, evidencePages: evidence.pages, moreEvidence: evidence.more,
       sourceTruncated: evidence.truncated || artifacts.length < published.length,
@@ -167,5 +190,6 @@ export async function readCodexChatContext({chats, operations, native, nativeArt
   const document = createDocument(origin,{...evidence,artifacts});
   const artifactDownloads = verified.slice(0,document.summary.artifacts)
     .map(({title:path,sha256,href,evidence})=>({path,sha256,href,evidence}));
-  return {threadId:id,turnId,conversation,...document,...(artifactDownloads.length && {artifactDownloads})};
+  const codexReview = {threadId:id,turnId, ...(historyCursor !== null && {historyCursor}), ...(receipt !== null && {receipt})};
+  return {threadId:id,turnId,conversation,codexReview,...document,...(artifactDownloads.length && {artifactDownloads})};
 }

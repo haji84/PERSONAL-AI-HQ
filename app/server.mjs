@@ -29,9 +29,9 @@ import {createGithubProjects} from './github-projects.mjs';
 import {createCodexPeerVerifier} from './codex-peer.mjs';
 import {localSpeechAvailable, localSpeechMaxChars, synthesizeLocalSpeech} from './local-speech.mjs';
 import {createTailnetAccess, tailnetCookieName} from './tailnet-access.mjs';
-import {validatedDocument} from './text-attachment.mjs';
+import {codexResultDocumentName, codexResultStaleCode, validatedDocument} from './text-attachment.mjs';
 import {chatHandoffReviewParams, chatHandoffStale, readChatHandoff} from './chat-handoff.mjs';
-import {readCodexChatContext} from './codex-chat-context.mjs';
+import {codexResultReviewParams, codexResultStale, readCodexChatContext} from './codex-chat-context.mjs';
 import {createWorkRouting} from './work-routing.mjs';
 
 const root = fileURLToPath(new URL('../public/', import.meta.url));
@@ -260,6 +260,38 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
     prepareHandover: (...args) => apiWork.prepareNativeHandover(...args),
   });
   const nativeArtifacts = createNativeArtifacts(directory, operations.completedArtifactSource);
+  async function bindCodexResult(project, params, signedIn) {
+    const scoped = currentHandoffProject(project,signedIn);
+    const checkpoint = JSON.stringify(scoped.nativeHandover);
+    const source = readProjectDeliverySource(directory,project.id);
+    const binding = JSON.stringify(source);
+    const record = await readChatProjectRecord(source).catch(() => { throw codexResultStale(); });
+    const assertCurrent = () => {
+      const current = currentHandoffProject(project,signedIn);
+      if (checkpoint !== JSON.stringify(current.nativeHandover) ||
+          binding !== JSON.stringify(readProjectDeliverySource(directory,project.id)) ||
+          !chatProjectRecordIsCurrent(source, record)) throw codexResultStale();
+    };
+    try {
+      const result = await readCodexChatContext({chats,operations,native,nativeArtifacts,project:scoped,params,record});
+      return {result,assertCurrent};
+    } finally {
+      assertCurrent();
+    }
+  }
+
+  async function verifyCodexResult(project, input, sha256, signedIn) {
+    const destination = input.conversationId === undefined ? null : input.conversationId;
+    const params = codexResultReviewParams(project.id,input.codexReview,destination);
+    let review;
+    try { review = await bindCodexResult(project,params,signedIn); }
+    catch (cause) {
+      if ([400,404,409,413,503].includes(cause?.status)) throw codexResultStale();
+      throw cause;
+    }
+    if ((review.result.conversation?.id ?? null) !== destination || review.result.sha256 !== sha256) throw codexResultStale();
+    return review;
+  }
   let bufferedCodexArtifactBytes = 0;
   let codexHistorySearches = 0;
   const apiEnabled = Boolean(apiDevelopment);
@@ -294,13 +326,16 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
   let host;
   let closing;
 
-  async function liveChat(project, input, response) {
+  async function liveChat(project, input, response, signedIn) {
     if (!plan) throw error(503, 'ChatGPTプランの接続が設定されていません。');
     if (typeof input?.model !== 'string' || !input.model || input.model.length > 160 ||
         typeof input.id !== 'string' || typeof input.prompt !== 'string' || !input.prompt.trim() || input.prompt.length > 16000) {
       throw error(400, '会話の入力とモデルを指定してください。');
     }
     const attachment = validatedDocument(input.document);
+    const generated = attachment?.document.name === codexResultDocumentName;
+    if (!signedIn()) throw error(401, 'サインインが必要です。');
+    if (!generated && input.codexReview !== undefined) throw codexResultStale();
     if (attachment && input.image !== undefined) throw error(400, '添付を1件だけ選んでください。');
     const controller = new AbortController();
     liveRequests.add(controller);
@@ -313,10 +348,13 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       if (response.destroyed) return;
       if (!response.write(`data: ${JSON.stringify(event)}\n\n`)) await once(response, 'drain', {signal});
     }
+    const publishDone = turn => publish({type:'done',turn,...(turn?.code && {code:turn.code})});
     try {
       let selection;
+      let review;
       if (!chats.readLive(project.id, input.id)) {
         execution.preflight(project, 'consultation');
+        if (generated) review = await verifyCodexResult(project,input,attachment.digest,signedIn);
         const entries = await plan.responses.models({signal});
         const catalog = {accountType: 'chatgpt', data: entries.map((value, index) => ({id: value.slug,
           isDefault: index === 0, reasoningEfforts: []}))};
@@ -327,22 +365,40 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       }
       signal.throwIfAborted();
       const confirmRoute = () => {
+        if (!signedIn()) throw error(401, 'サインインが必要です。');
         if (!selection || !execution.isCurrent(project, selection.revision, 'consultation')) {
           throw error(409, '実行経路が更新されました。もう一度確認してください。');
         }
       };
-      request = chats.beginLive(project.id, {...input, document: attachment?.document}, confirmRoute);
+      const beforeSend = review ? async () => {
+        confirmRoute();
+        const fresh = await verifyCodexResult(project,input,attachment.digest,signedIn);
+        signal.throwIfAborted();
+        confirmRoute();
+        fresh.assertCurrent();
+      } : confirmRoute;
+      request = chats.beginLive(project.id, {...input, document: attachment?.document}, () => {
+        confirmRoute();
+        review?.assertCurrent();
+      });
       response.writeHead(200, {'Content-Type': 'text/event-stream; charset=utf-8'});
       if (request.duplicate) {
-        await publish({type: 'done', turn: request.turn});
+        await publishDone(request.turn);
         return;
       }
-      await publish({type: 'started', turn: request.turn});
+      const started = () => publish({type:'started', turn:request.turn});
+      let startedPublished = !review;
+      if (startedPublished) await started();
       let status = 'completed';
+      let blocked;
       let savedAt = Date.now();
       try {
         confirmRoute();
-        for await (const delta of plan.responses.stream({model: selection.model, messages: request.messages, signal, beforeSend: confirmRoute})) {
+        for await (const delta of plan.responses.stream({model: selection.model, messages: request.messages, signal, beforeSend})) {
+          if (!startedPublished) {
+            await started();
+            startedPublished = true;
+          }
           text += delta;
           if (Date.now() - savedAt >= 500) {
             chats.persistLiveText(project.id, input.id, text);
@@ -350,13 +406,14 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
           }
           await publish({type: 'delta', text: delta});
         }
+        if (!startedPublished) await started();
       } catch (cause) {
         status = controller.signal.aborted ? 'aborted' : signal.aborted ? 'interrupted' :
           cause.code === 'CHATGPT_PLAN_INCOMPLETE' ? 'incomplete' :
           cause.code === 'CHATGPT_PLAN_INTERRUPTED' ? 'interrupted' : 'failed';
+        if (status === 'failed' && cause.code === codexResultStaleCode) blocked = cause.code;
       }
-      chats.finishLive(project.id, input.id, {status, text});
-      await publish({type: 'done', turn: chats.readLive(project.id, input.id)});
+      await publishDone(chats.finishLive(project.id, input.id, {status, text, code:blocked}));
     } catch (cause) {
       if (request && !request.duplicate) chats.finishLive(project.id, input.id, {status: 'interrupted', text});
       if (!response.headersSent && !response.destroyed) throw cause.code?.startsWith('CHATGPT_PLAN_')
@@ -823,7 +880,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
     }
     if (route === '/api/chat/live') {
       if (get) return send(response, 200, {turn: chats.readLive(project.id, target.searchParams.get('id'))});
-      if (post) return liveChat(project, await jsonBody(request, 768 * 1024), response);
+      if (post) return liveChat(project, await jsonBody(request, 768 * 1024), response, signedIn);
     }
     if (route === '/api/chat/realtime' || route === '/api/chat/realtime/interrupt') {
       const conversations = target.searchParams.getAll('conversation');
@@ -927,16 +984,8 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       return send(response, 200, {...view, managed, ...(!remote && !managed && desktopThreadId === id ? {desktopThreadId} : {})});
     }
     if (get && route === '/api/codex/chat-context') {
-      let result;
-      try {
-        result = await readCodexChatContext({chats, operations, native, nativeArtifacts, project, params: target.searchParams});
-      } finally {
-        if (!signedIn()) throw error(401, 'サインインが必要です。');
-        const current = readCurrentProject(directory, project.id);
-        if (!current || current.cwd.length !== project.cwd.length || current.cwd.some(cwd => !project.cwd.includes(cwd))) {
-          throw error(404, 'この案件のCodex接続情報がありません。');
-        }
-      }
+      const {result,assertCurrent} = await bindCodexResult(project,target.searchParams,signedIn);
+      assertCurrent();
       return send(response, 200, result);
     }
     if (get && route === '/api/codex/evidence') {
@@ -971,7 +1020,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       if (response.headersSent) { response.destroy(); return; }
       const status = typeof problem?.status === 'number' ? problem.status : 500;
       send(response, status, {error: status === 500 ? '状態を読み取れませんでした。' : apiMessages[problem.code] ?? problem.message,
-        ...(['CHAT_HANDOFF_STALE', 'CODEX_IMAGE_MODEL_UNAVAILABLE', 'CODEX_RESUME_TARGET_UNAVAILABLE', 'CODEX_SUBSCRIPTION_LIMIT_REACHED',
+        ...(['CHAT_HANDOFF_STALE', codexResultStaleCode, 'CODEX_IMAGE_MODEL_UNAVAILABLE', 'CODEX_RESUME_TARGET_UNAVAILABLE', 'CODEX_SUBSCRIPTION_LIMIT_REACHED',
           'CODEX_SUBSCRIPTION_USAGE_UNCONFIRMED'].includes(problem.code) ||
           problem.code?.startsWith('REALTIME_VOICE_') ? {code: problem.code} : {})});
     });

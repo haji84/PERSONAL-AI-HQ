@@ -6,6 +6,9 @@ const unsafeDocumentName = /[/\\<>:"|?*\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
 const binaryDocumentText = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/u;
 const documentError = (status, message) => Object.assign(new Error(message), {status});
 
+export const codexResultDocumentName = 'codex-result.json';
+export const codexResultStaleCode = 'CODEX_RESULT_STALE';
+
 export function validatedDocument(value) {
   if (value === undefined) return null;
   const invalid = () => documentError(400, 'UTF-8のテキスト、Markdown、CSV、JSONの文書を1件指定してください。');

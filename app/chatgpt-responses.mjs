@@ -102,7 +102,8 @@ export function createChatGPTResponses({auth, fetchImpl = globalThis.fetch}) {
     }
     checkAbort(signal);
     if (typeof token !== 'string' || !token.trim()) throw new ChatGPTPlanError('CHATGPT_PLAN_AUTH_REQUIRED');
-    beforeSend?.();
+    if (beforeSend) await beforeSend();
+    checkAbort(signal);
     let response;
     try {
       response = await fetchImpl(base + path, {
