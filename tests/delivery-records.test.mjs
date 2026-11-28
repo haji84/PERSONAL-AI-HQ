@@ -609,7 +609,8 @@ test('unmatched shared local records remain visible without joining the project 
   const {directory,checkout,commit,configure,portfolioPath}=await fixture(t);
   const observedAt=new Date().toISOString();
   const task={id:'verify-package',title:'Waiting for a real machine',status:'pending',actionable:true,
-    remainingMinutes:{optimistic:5,standard:10,cautious:20},estimate:{basis:'Saved test conditions',confidence:'medium'}};
+    remainingMinutes:{optimistic:5,standard:10,cautious:20},estimate:{basis:'Saved test conditions',confidence:'medium'},
+    evidence:[{label:'Other host signed link',url:'https://fixture.invalid/file?token=fixture-capability'}]};
   const requirement={id:'check',implemented:true,review:{independent:true,status:'accepted'},
     validation:{status:'passed',source:'Recorded elsewhere'},artifact:{usable:true}};
   const localProjects=[
@@ -651,6 +652,7 @@ test('unmatched shared local records remain visible without joining the project 
   assert.deepEqual([shared[0].tasks[1].status,shared[0].tasks[1].progress,shared[0].tasks[1].remainingMinutes],['unknown',null,null]);
   assert.deepEqual([shared[1].tasks[0].status,shared[1].tasks[0].externalWait],['waiting',true]);
   assert(!JSON.stringify(shared).includes('/private/not-a-binding'));
+  assert(!JSON.stringify(shared).includes('fixture-capability'));
   assert.deepEqual(await readFile(portfolioPath),original);
 
   await commit({[observation]:JSON.stringify({taskProgress:{observedAt,projects:[],localProjects:[localProjects[2]]}})});

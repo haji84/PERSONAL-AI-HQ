@@ -55,7 +55,7 @@ function apiCreditObservation(value) {
   return {balanceUsd, observedFrom, observedUntil, expiresOn: value.expiresOn};
 }
 
-function taskProgress(delivery, verifiedForecast) {
+function taskProgress(delivery, verifiedForecast, {includeEvidence = true} = {}) {
   const tasks = delivery?.tasks;
   if (!Array.isArray(tasks) || tasks.length > 400) return [];
   const ids = tasks.map(task => task?.id);
@@ -77,7 +77,8 @@ function taskProgress(delivery, verifiedForecast) {
     return {id: task.id, title: text(task.title, 120) || task.id, status, progress, remainingMinutes,
       ...(device && {device}),
       observedAt: date(task.observedAt) ?? observedAt, remaining: strings(task.remaining),
-      blocker: text(task.blocker, 360), externalWait: task.externalWait === 'unknown', evidence: evidence(task.evidence)};
+      blocker:text(task.blocker,360), externalWait:task.externalWait==='unknown',
+      ...(includeEvidence && {evidence:evidence(task.evidence)})};
   });
 }
 
@@ -87,7 +88,8 @@ function sharedLocalProgress(record, registration) {
   const forecast = developmentForecast(delivery,{status:'unknown',workspaceUnconfirmed:true,verifiedTaskIds:new Set()});
   return {id, name:text(record.name,100) || id, sameIdRegistration:registration?.name ?? null,
     observedAt:date(observationAt), stage:text(delivery.stage,160), nextAction:text(delivery.nextAction,360),
-    tasks:taskProgress(delivery,forecast).map(task=>task.status === 'active' ? {...task,status:'unknown'} : task)};
+    tasks:taskProgress(delivery,forecast,{includeEvidence:false})
+      .map(task=>task.status === 'active' ? {...task,status:'unknown'} : task)};
 }
 
 function normalizeProject(row, observedAt) {
