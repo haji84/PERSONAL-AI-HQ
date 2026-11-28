@@ -7,6 +7,27 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { ensurePrivateDirectory, readPrivateRuntimeToken } from '../app/private-directory.mjs';
 
+function windowsAcl(command, env) {
+  const powershell = path.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  return promisify(execFile)(powershell, ['-NoProfile', '-NonInteractive', '-Command', command], {
+    windowsHide: true, env: { ...process.env, ...env },
+  });
+}
+
+async function applyWindowsFixtureOwner(filename) {
+  if (process.platform !== 'win32') return;
+  await windowsAcl(`
+    $ErrorActionPreference = 'Stop'
+    $file = $env:HQ_TEST_PRIVATE_TOKEN_PATH
+    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    $acl = [IO.File]::GetAccessControl($file)
+    if ($acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $identity.User.Value) {
+      $acl.SetOwner($identity.User)
+      [IO.File]::SetAccessControl($file, $acl)
+    }
+  `, { HQ_TEST_PRIVATE_TOKEN_PATH: filename });
+}
+
 async function fixture(t) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'hq-private-test-'));
   t.after(async () => {
@@ -26,6 +47,42 @@ test('a new runtime is private under the actual host permission model and can be
   assert.equal(await fs.readFile(path.join(directory, 'receipt.txt'), 'utf8'), 'private fixture');
   if (process.platform !== 'win32') assert.equal((await fs.stat(directory)).mode & 0o077, 0);
 });
+
+test('Windows binds a new runtime to the user and leaves an existing admin-owned runtime unchanged',
+  { skip: process.platform !== 'win32' }, async t => {
+    const root = await fixture(t);
+    const existing = path.join(root, 'existing'), runtime = path.join(root, 'runtime');
+    await fs.mkdir(existing);
+    async function acl(directory) {
+      const { stdout } = await windowsAcl(`
+        $ErrorActionPreference = 'Stop'
+        $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        $acl = [IO.Directory]::GetAccessControl($env:HQ_TEST_ACL_DIRECTORY)
+        [Console]::Out.Write((@{user=$identity.User.Value; defaultOwner=$identity.Owner.Value;
+          owner=$acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value;
+          protected=$acl.AreAccessRulesProtected; sddl=$acl.Sddl} | ConvertTo-Json -Compress))
+      `, { HQ_TEST_ACL_DIRECTORY: directory });
+      return JSON.parse(stdout);
+    }
+    const adminSid = 'S-1-5-32-544';
+    const baseline = await acl(existing);
+    if (baseline.owner === adminSid && baseline.user !== adminSid) {
+      await assert.rejects(ensurePrivateDirectory(existing), /private runtime/i);
+      assert.deepEqual(await acl(existing), baseline);
+      assert.deepEqual(await fs.readdir(existing), []);
+    }
+    assert.equal(await ensurePrivateDirectory(runtime), runtime);
+    const hardened = await acl(runtime);
+    assert.equal(hardened.owner, hardened.user);
+    if (baseline.defaultOwner === adminSid && baseline.owner === adminSid && baseline.user !== adminSid) {
+      assert.equal(hardened.protected, true);
+      const backup = JSON.parse(await fs.readFile(path.join(runtime, '.runtime-acl-backup.json'), 'utf8'));
+      assert.equal(backup.scope, 'new-runtime-directory-only');
+      assert.equal(backup.afterSddl, hardened.sddl);
+    }
+    await ensurePrivateDirectory(runtime);
+    assert.deepEqual(await acl(runtime), hardened);
+  });
 
 test('an existing file is rejected without replacing its contents', async t => {
   const root = await fixture(t), file = path.join(root, 'existing');
@@ -48,6 +105,7 @@ test('WS credentials read only an owner file in the runtime directory, without c
   const filename = path.join(directory, 'local.token');
   const token = 'abC_'.repeat(16);
   await fs.writeFile(filename, token + '\r\n', {mode: 0o600});
+  await applyWindowsFixtureOwner(filename);
   assert.equal(await readPrivateRuntimeToken(directory, filename), token);
   assert.equal(await fs.readFile(filename, 'utf8'), token + '\r\n');
   const outside = path.join(root, 'outside.token');
@@ -105,6 +163,8 @@ test('Windows rejects a token with a broadly readable file ACL while preserving 
   await ensurePrivateDirectory(directory);
   const filename = path.join(directory, 'local.token');
   await fs.writeFile(filename, 'abcD'.repeat(16));
+  await applyWindowsFixtureOwner(filename);
+  assert.equal(await readPrivateRuntimeToken(directory, filename), 'abcD'.repeat(16));
   const powershell = path.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
   const execute = promisify(execFile);
   const run = command => execute(powershell, ['-NoProfile', '-NonInteractive', '-Command', command], {

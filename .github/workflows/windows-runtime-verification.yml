@@ -30,5 +30,25 @@ jobs:
           git rev-parse HEAD:public
       - name: Install the locked public dependency
         run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Observe the runner's default ownership on a temporary directory
+        run: |
+          $target = Join-Path $env:RUNNER_TEMP ("hq-owner-" + [guid]::NewGuid().ToString("N"))
+          $probe = New-Item -Path $target -ItemType Directory
+          try {
+            $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+            $owner = (Get-Acl -LiteralPath $probe.FullName).GetOwner([Security.Principal.SecurityIdentifier])
+            @{ ownerIsCurrentUser = $owner.Value -eq $identity.User.Value
+               tokenOwnerIsAdministrators = $identity.Owner.Value -eq 'S-1-5-32-544'
+               ownerMatchesToken = $owner.Value -eq $identity.Owner.Value } | ConvertTo-Json -Compress
+          } finally {
+            Remove-Item -LiteralPath $probe.FullName
+          }
+      - name: Verify the loopback peer before the concurrent suite
+        id: cold_peer
+        continue-on-error: true
+        run: node --test tests/codex-peer.test.mjs
       - name: Run the application regression suite
         run: npm test
+      - name: Require a successful initial loopback verification
+        if: steps.cold_peer.outcome == 'failure'
+        run: exit 1

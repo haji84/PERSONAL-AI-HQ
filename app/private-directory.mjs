@@ -10,7 +10,8 @@ const powershell = () => join(process.env.SystemRoot ?? 'C:\\Windows', 'System32
 const windowsOwnerACL = `
 $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
 $currentSid = $identity.User.Value
-$trusted = @($currentSid, 'S-1-5-18', 'S-1-5-32-544')
+$administratorsSid = 'S-1-5-32-544'
+$trusted = @($currentSid, 'S-1-5-18', $administratorsSid)
 function Test-Private($acl) {
   if ($acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $currentSid) { return $false }
   $descriptor = [System.Security.AccessControl.RawSecurityDescriptor]::new($acl.GetSecurityDescriptorBinaryForm(), 0)
@@ -33,7 +34,15 @@ if (-not $item.Exists -or ($item.Attributes -band [IO.FileAttributes]::ReparsePo
 $before = [IO.Directory]::GetAccessControl($directory)
 $changed = $false
 if (-not (Test-Private $before)) {
-  if ($env:PERSONAL_AI_HQ_DIRECTORY_CREATED -ne '1' -or $before.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $currentSid) { throw 'Runtime is not private' }
+  if ($env:PERSONAL_AI_HQ_DIRECTORY_CREATED -ne '1') { throw 'Runtime is not private' }
+  $observedOwner = $before.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+  # The token default can assign the Administrators group to a directory just created by this user.
+  if ($observedOwner -ne $currentSid -and
+      ($observedOwner -ne $administratorsSid -or $identity.Owner.Value -ne $administratorsSid)) { throw 'Runtime is not private' }
+  for ($entry = $item; $null -ne $entry; $entry = $entry.Parent) {
+    $entry.Refresh()
+    if (-not $entry.Exists -or ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Invalid runtime' }
+  }
   $restricted = [System.Security.AccessControl.DirectorySecurity]::new()
   $restricted.SetOwner($identity.User)
   $restricted.SetAccessRuleProtection($true, $false)
@@ -41,11 +50,15 @@ if (-not (Test-Private $before)) {
     $rule = [System.Security.AccessControl.FileSystemAccessRule]::new([System.Security.Principal.SecurityIdentifier]::new($sid), [System.Security.AccessControl.FileSystemRights]::FullControl, [System.Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit', [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow)
     $restricted.AddAccessRule($rule)
   }
-  try {
-    [IO.Directory]::SetAccessControl($directory, $restricted)
-    if (-not (Test-Private ([IO.Directory]::GetAccessControl($directory)))) { throw 'Runtime remains accessible' }
-    $changed = $true
-  } catch { [IO.Directory]::SetAccessControl($directory, $before); throw }
+  $entries = $item.EnumerateFileSystemInfos().GetEnumerator()
+  try { if ($entries.MoveNext()) { throw 'New runtime is not empty' } }
+  finally { $entries.Dispose() }
+  $item.Refresh()
+  if (-not $item.Exists -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+      ([IO.Directory]::GetAccessControl($directory)).Sddl -cne $before.Sddl) { throw 'Runtime changed during setup' }
+  [IO.Directory]::SetAccessControl($directory, $restricted)
+  if (-not (Test-Private ([IO.Directory]::GetAccessControl($directory)))) { throw 'Runtime remains accessible' }
+  $changed = $true
 }
 [Console]::Out.Write((@{private=$true; changed=$changed; beforeSddl=$before.Sddl; afterSddl=([IO.Directory]::GetAccessControl($directory)).Sddl} | ConvertTo-Json -Compress))
 `;
