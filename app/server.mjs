@@ -45,6 +45,7 @@ const defaultRuntime = process.platform === 'win32'
   ? join(process.env.LOCALAPPDATA ?? join(homedir(), 'AppData', 'Local'), 'PersonalAIHQ', 'integration')
   : join(homedir(), 'Library', 'Application Support', 'Personal AI HQ', 'integration');
 const browserPolicy = "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; media-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
+const defaultOwnerPort = 4328;
 const sessionAge = 8 * 60 * 60;
 const nativeObservationTimeout = 4000;
 const maxBufferedCodexArtifactBytes = 64 * 1024 * 1024;
@@ -176,7 +177,7 @@ function sameKey(expected, actual) {
     timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(actual, 'hex'));
 }
 
-function cookieKey(header, name = 'personal_hq') {
+function cookieKey(header, name) {
   const prefix = `${name}=`;
   const matches = (header ?? '').split(';').map(item => item.trim()).filter(item => item.startsWith(prefix));
   return matches.length === 1 ? matches[0].slice(prefix.length) : null;
@@ -222,7 +223,7 @@ async function checkedSocket(socket) {
   return target;
 }
 
-export async function startOwnerApp({directory = defaultRuntime, port = 4328, socket, codex, plan, apiDevelopment = false, speech,
+export async function startOwnerApp({directory = defaultRuntime, port = defaultOwnerPort, socket, codex, plan, apiDevelopment = false, speech,
   loopbackUrl, loopbackTokenFile, tailnet, githubProjects} = {}) {
   const access = createTailnetAccess(tailnet, sessionAge);
   directory = resolve(directory);
@@ -339,6 +340,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
   let session = '';
   let expires = 0;
   let signInFile;
+  let localCookieName;
   let url;
   let host;
   let closing;
@@ -520,7 +522,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
     const target = new URL(request.url, origin);
     if (target.origin !== origin) throw error(403, 'このホストからはアクセスできません。');
     const route = target.pathname;
-    const cookie = cookieKey(request.headers.cookie, remote ? tailnetCookieName : undefined);
+    const cookie = cookieKey(request.headers.cookie, remote ? tailnetCookieName : localCookieName);
     const signedIn = () => remote ? access.authenticated(cookie) : Date.now() < expires && sameKey(session, cookie);
     const authenticated = signedIn();
     const get = request.method === 'GET';
@@ -561,7 +563,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       await unlink(signInFile).catch(() => {});
       session = randomBytes(32).toString('hex');
       expires = Date.now() + sessionAge * 1000;
-      response.writeHead(303, {Location: '/', 'Set-Cookie': `personal_hq=${session}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${sessionAge}`});
+      response.writeHead(303, {Location: '/', 'Set-Cookie': `${localCookieName}=${session}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${sessionAge}`});
       response.end();
       return;
     }
@@ -1089,7 +1091,10 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
   }
   try {
     await listen(server, port);
-    host = `127.0.0.1:${server.address().port}`;
+    const localPort = server.address().port;
+    // A browser cookie for 127.0.0.1 is shared across ports.
+    localCookieName = localPort === defaultOwnerPort ? 'personal_hq' : `personal_hq_${localPort}`;
+    host = `127.0.0.1:${localPort}`;
     url = `http://${host}`;
     signInFile = await writeSignIn(directory, url, key);
     if (!proxyServer) return {url, signInFile, close};
@@ -1102,7 +1107,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
   const {HQ_TAILNET_ORIGIN: origin, HQ_TAILNET_LOGIN: login, HQ_TAILNET_PROXY_PORT: proxyPort} = process.env;
   const tailnet = [origin, login, proxyPort].some(value => value !== undefined)
     ? {origin, login, port: /^[1-9]\d{0,4}$/.test(proxyPort ?? '') ? Number(proxyPort) : NaN} : undefined;
-  const app = await startOwnerApp({directory: process.env.HQ_PRIVATE_DIRECTORY, port: Number(process.env.HQ_PORT ?? 4328),
+  const app = await startOwnerApp({directory: process.env.HQ_PRIVATE_DIRECTORY, port: Number(process.env.HQ_PORT ?? defaultOwnerPort),
     socket: process.env.HQ_CODEX_SOCKET, plan: process.env.HQ_CHATGPT_PLAN === '1', apiDevelopment: process.env.HQ_API_EXECUTION === '1',
     loopbackUrl: process.env.HQ_CODEX_LOOPBACK_URL, loopbackTokenFile: process.env.HQ_CODEX_LOOPBACK_TOKEN_FILE, tailnet,
     githubProjects: process.env.HQ_GITHUB_PORTFOLIO_OWNER && {owner:process.env.HQ_GITHUB_PORTFOLIO_OWNER}});

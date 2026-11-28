@@ -101,6 +101,28 @@ test('owner credentials are one-use and private API calls never expose the works
   assert.equal(reads(), 1);
 });
 
+test('loopback listeners keep owner sessions separate in one browser cookie jar', async t => {
+  const [{app: first}, {app: second}] = await Promise.all([fixture(t), fixture(t)]);
+  assert.equal(new URL(first.url).hostname, new URL(second.url).hostname);
+  assert.notEqual(new URL(first.url).port, new URL(second.url).port);
+  const credentials = new Map();
+  const keep = cookie => credentials.set(cookie.split('=')[0], cookie);
+  const authenticated = async (app, cookies = [...credentials.values()].join('; ')) => {
+    const response = await fetch(app.url+'/api/session', {headers:{cookie:cookies}});
+    assert.equal(response.status,200);
+    return (await response.json()).authenticated;
+  };
+  const firstCookie = await login(first);
+  keep(firstCookie);
+  assert.equal(await authenticated(first),true);
+  const secondCookie = await login(second);
+  keep(secondCookie);
+  assert.equal(await authenticated(first),true);
+  assert.equal(await authenticated(second),true);
+  assert.equal(await authenticated(first,secondCookie),false);
+  assert.equal(await authenticated(second,firstCookie),false);
+});
+
 test('Codex history search checks owner and project scope before and after a read', async t => {
   const {directory, start} = await runtimeFixture(t);
   const registry = join(directory, 'portfolio.json');
