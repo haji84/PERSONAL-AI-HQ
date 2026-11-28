@@ -3894,8 +3894,8 @@ function codex() {
 function artifacts() {
   const registered = asArray(ui.portfolio?.artifacts);
   const sources = [
-    {label: '通常API', name: undefined, files: new Map(), offset: 0},
-    {label: 'Codex', name: 'codex', files: new Map(), offset: 0},
+    {label: '通常API', name: undefined, files: new Map(), offset: 0, pages: 0},
+    {label: 'Codex', name: 'codex', files: new Map(), offset: 0, pages: 0},
   ];
   const openProof = new Set();
   let generation = 0;
@@ -3943,12 +3943,18 @@ function artifacts() {
     return details;
   }
 
-  function filter(query) {
+  function filter(query, preserveReading = false) {
     const visible = [...registered, ...sources.flatMap(source => [...source.files.values()])]
       .filter(item => (only.value !== 'project' || item.project === ui.project) &&
         matches(query, item.title, item.description, item.observedAt, time(item.observedAt),
           projectList().find(candidate => candidate.id === item.project)?.name))
       .sort((a, b) => (Date.parse(b.observedAt) || 0) - (Date.parse(a.observedAt) || 0));
+    const anchor = preserveReading ? [...list.children].find(row => {
+      const {top, bottom} = row.getBoundingClientRect();
+      return top < innerHeight && bottom > 0;
+    }) : null;
+    const anchorTop = anchor?.getBoundingClientRect().top;
+    let restoredAnchor;
     list.replaceChildren();
     for (const artifact of visible) {
       const item = node('div', 'artifact-row');
@@ -3968,8 +3974,12 @@ function artifacts() {
         link(artifact.kind === 'file' ? '取得' : '開く', artifact.href, true, true);
       if (action) item.append(action);
       else item.append(chip('unknown', '取得先未確認'));
-      list.append(listItem(item));
+      const row = listItem(item);
+      row.dataset.artifactKey = JSON.stringify([artifact.workSource ?? '', artifact.project, artifact.href]);
+      if (row.dataset.artifactKey === anchor?.dataset.artifactKey) restoredAnchor = row;
+      list.append(row);
     }
+    if (restoredAnchor) window.scrollBy(0, restoredAnchor.getBoundingClientRect().top - anchorTop);
     empty.hidden = visible.length > 0;
     empty.textContent = query ? '一致する成果物がありません。' : '表示できる確認済みの成果物はありません。';
   }
@@ -3977,7 +3987,7 @@ function artifacts() {
   for (const source of sources) {
     source.more = button('以前の' + source.label + '成果物を表示', () => loadWork(source));
     source.more.hidden = true;
-    source.retry = button(source.label + 'の成果物を再取得', () => loadWork(source));
+    source.retry = button(source.label + 'の成果物を再取得', () => loadWork(source, {refresh: source.refreshFailed}));
     source.retry.hidden = true;
     source.status = node('p', 'muted small');
     source.status.setAttribute('role', 'status');
@@ -3985,35 +3995,61 @@ function artifacts() {
     controls.append(source.more, source.status, source.retry);
   }
 
-  async function loadWork(source) {
-    if (source.request || source.offset === null) return;
+  function canRefreshWork() {
+    const selected = document.getSelection();
+    const copying = selected && !selected.isCollapsed && (list.contains(selected.anchorNode) || list.contains(selected.focusNode));
+    return section.root.isConnected && !dom.shell.hidden && !document.hidden && connectionState === 'connected' &&
+      !dom['refresh-button'].disabled && !controls.contains(document.activeElement) && !list.contains(document.activeElement) && !copying;
+  }
+
+  async function loadWork(source, {refresh = false, automatic = false} = {}) {
+    if (source.request || (!refresh && source.offset === null)) return;
     const generationAtStart = generation;
-    const current = () => section.root.isConnected && generationAtStart === generation;
-    const offset = source.offset;
+    const connection = connectionGeneration;
+    const sameScope = () => section.root.isConnected && !dom.shell.hidden && generationAtStart === generation;
+    const current = () => sameScope() && connection === connectionGeneration;
     const request = new AbortController();
+    const signal = AbortSignal.any([request.signal, AbortSignal.timeout(10000)]);
     source.request = request;
     source.more.disabled = source.retry.disabled = true;
     try {
-      const result = await api(apiPath('/api/artifacts/work', {
-        project: only.value === 'project' ? ui.project : undefined, source: source.name, offset,
-      }), {signal: request.signal});
-      if (!current()) return;
-      if (!Array.isArray(result?.artifacts)) throw new Error('Invalid artifact response');
-      for (const file of result.artifacts) {
-        if (typeof file?.href !== 'string' || (source.name && file.kind !== 'file')) continue;
-        source.files.set(file.href, {...file, workSource: source.name});
+      let offset = refresh ? 0 : source.offset;
+      const pages = refresh ? Math.max(1, source.pages) : 1;
+      const files = refresh ? new Map() : new Map(source.files);
+      let loaded = 0;
+      for (; loaded < pages && offset !== null; loaded++) {
+        const result = await api(apiPath('/api/artifacts/work', {
+          project: only.value === 'project' ? ui.project : undefined, source: source.name, offset,
+        }), {signal});
+        if (!current()) return;
+        if (!Array.isArray(result?.artifacts)) throw new Error('Invalid artifact response');
+        for (const file of result.artifacts) {
+          if (typeof file?.href !== 'string' || (source.name && file.kind !== 'file')) continue;
+          files.set(file.href, {...file, workSource: source.name});
+        }
+        offset = Number.isSafeInteger(result.nextOffset) && result.nextOffset > offset ? result.nextOffset : null;
       }
-      source.offset = Number.isSafeInteger(result.nextOffset) && result.nextOffset > offset ? result.nextOffset : null;
+      const changed = JSON.stringify([...files.values()]) !== JSON.stringify([...source.files.values()]);
+      if (automatic && changed && !canRefreshWork()) return;
+      source.files = files;
+      source.offset = offset;
+      source.pages = (refresh ? 0 : source.pages) + loaded;
       source.more.hidden = source.offset === null;
       source.status.hidden = source.retry.hidden = true;
-      filter(search.value);
-    } catch {
+      if (changed) filter(search.value, refresh);
+    } catch (error) {
       if (!current()) return;
-      source.status.textContent = source.label + 'の成果物を読み取れませんでした。';
+      if (error.status === 403 || error.status === 404) {
+        source.files.clear();
+        source.offset = source.pages = 0;
+        filter(search.value, refresh);
+      }
+      source.refreshFailed = refresh;
+      source.status.textContent = source.label + (refresh ? 'の成果物を更新できませんでした。' : 'の成果物を読み取れませんでした。');
       source.status.hidden = source.retry.hidden = false;
       source.more.hidden = true;
     } finally {
-      if (current()) {
+      if (sameScope()) {
         source.request = null;
         source.more.disabled = source.retry.disabled = false;
       }
@@ -4027,7 +4063,8 @@ function artifacts() {
     for (const source of sources) {
       source.request?.abort();
       source.request = null;
-      source.offset = 0;
+      source.offset = source.pages = 0;
+      source.refreshFailed = false;
       source.more.hidden = source.status.hidden = source.retry.hidden = true;
       source.files.clear();
     }
@@ -4040,6 +4077,16 @@ function artifacts() {
   dom.content.append(section.root);
   filter(search.value);
   for (const source of sources) void loadWork(source);
+  const interval = window.setInterval(() => {
+    if (canRefreshWork()) for (const source of sources) void loadWork(source, {refresh: true, automatic: true});
+  }, 30000);
+  const cleanup = () => {
+    generation++;
+    window.clearInterval(interval);
+    for (const source of sources) source.request?.abort();
+    runViewCleanups.delete(cleanup);
+  };
+  runViewCleanups.add(cleanup);
 }
 function emptyProject() {
   dom.content.append(node('p', 'empty panel', '上のプロジェクト欄から対象を選んでください。'));
