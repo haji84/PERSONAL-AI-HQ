@@ -1841,36 +1841,52 @@ test('Codex chat context includes only committed artifacts attested for the exac
     assert.equal(reply.status,200);
     const result = await reply.json();
     assert.equal(JSON.stringify(result).includes('PRIVATE_'),false);
-    return JSON.parse(result.document.text);
+    assert.doesNotMatch(result.document.text,/\/api\/artifacts\/work\/file|artifactDownloads|"href"/);
+    return {result,context:JSON.parse(result.document.text)};
   };
-  const correct = await read('verified-turn');
+  const {result:published,context:correct} = await read('verified-turn');
   assert.equal(correct.coverage.artifactEvidence,'verified');
   assert.deepEqual(correct.artifacts,[{path:'artifact.txt',sha256:digest(fixture['artifact.txt']),observedAt:now}]);
+  assert.equal(published.artifactDownloads?.length,1);
+  const [downloadItem] = published.artifactDownloads;
+  const {evidence,...artifactFile} = downloadItem;
+  assert.deepEqual(Object.keys(evidence).sort(),['requirements','verification']);
+  const files = [[artifactFile,'artifact.txt'],[evidence.requirements,'requirements.txt'],
+    [evidence.verification,'verification.txt']];
+  for (const [item,name] of files) {
+    assert.deepEqual(item,{path:name,sha256:digest(fixture[name]),href:item.href});
+    assert.match(item.href,/^\/api\/artifacts\/work\/file\?/);
+    const fileUrl = app.url+item.href;
+    assert.equal((await fetch(fileUrl)).status,401);
+    const response = await fetch(fileUrl,{headers:{cookie}});
+    assert.equal(response.status,200);
+    assert.equal(await response.text(),fixture[name]);
+  }
   const listPath=app.url+'/api/artifacts/work?source=codex&project=example';
   assert.equal((await fetch(listPath)).status,401);
   const list=await fetch(listPath,{headers:{cookie}});
   assert.equal(list.status,200);
   const {artifacts}=await list.json();
   assert.equal(artifacts.length,1);
-  const artifactUrl=app.url+artifacts[0].href;
-  const download=await fetch(artifactUrl,{headers:{cookie}});
-  assert.equal(download.status,200);
-  assert.equal(await download.text(),fixture['artifact.txt']);
+  assert.equal(artifacts[0].href,downloadItem.href);
+  const artifactUrl=app.url+downloadItem.href;
   await writeFile(join(checkout,'.hq-owned-workspace'),'other-project\n');
   assert.equal((await fetch(artifactUrl,{headers:{cookie}})).status,404);
   await writeFile(join(checkout,'.hq-owned-workspace'),fixture['.hq-owned-workspace']);
-  const other = await read('other-turn');
+  const {result:otherResult,context:other} = await read('other-turn');
   assert.equal(other.coverage.artifactEvidence,'unpublished');
   assert.deepEqual(other.artifacts,[]);
+  assert.equal(Object.hasOwn(otherResult,'artifactDownloads'),false);
   const readback = await prepareArtifactEvidenceReadback({checkout,head:project.nativeHandover.checkoutHead,
     files:project.nativeHandover.artifacts,workspaceProject:'example',signal:AbortSignal.timeout(12000)});
   assert.equal(readback?.(),true);
   await writeFile(join(checkout,'artifact.txt'),'Changed without attestation');
   assert.equal(readback(),false);
   assert.equal((await fetch(artifactUrl,{headers:{cookie}})).status,404);
-  const changed = await read('verified-turn');
+  const {result:changedResult,context:changed} = await read('verified-turn');
   assert.equal(changed.coverage.artifactEvidence,'unverified');
   assert.deepEqual(changed.artifacts,[]);
+  assert.equal(Object.hasOwn(changedResult,'artifactDownloads'),false);
 
   git(['rm','--','verification.txt']);
   git(['add','--','artifact.txt']);
@@ -1881,13 +1897,14 @@ test('Codex chat context includes only committed artifacts attested for the exac
   assert.equal(after.artifacts.length,1);
   assert.equal(after.artifacts[0].href,artifacts[0].href);
   assert.match(after.artifacts[0].description,/保存時の版/);
-  for (const [item, name] of [[artifacts[0],'artifact.txt'], [artifacts[0].evidence.requirements,'requirements.txt'],
-    [artifacts[0].evidence.verification,'verification.txt']]) {
+  for (const [item,name] of files) {
     const original = await fetch(app.url+item.href,{headers:{cookie}});
     assert.equal(original.status,200);
     assert.equal(await original.text(),fixture[name]);
   }
-  assert.equal((await read('verified-turn')).coverage.artifactEvidence,'verified');
+  const retained = await read('verified-turn');
+  assert.equal(retained.context.coverage.artifactEvidence,'verified');
+  assert.deepEqual(retained.result.artifactDownloads,published.artifactDownloads);
   assert.equal(await readFile(join(checkout,'artifact.txt'),'utf8'),'Changed without attestation');
   assert.equal(git(['rev-parse','HEAD']),next);
   assert.equal(git(['status','--porcelain']),'?? .hq-owned-workspace');
@@ -1897,7 +1914,8 @@ test('Codex chat context includes only committed artifacts attested for the exac
 
   const definition = {...seed,projects:[{...project,nativeHandover:{...project.nativeHandover,shareArtifacts:false}}]};
   await writeFile(join(directory,'portfolio.json'),JSON.stringify(definition),{mode:0o600});
-  assert.equal((await fetch(artifactUrl,{headers:{cookie}})).status,404);
+  for (const [item] of files) assert.equal((await fetch(app.url+item.href,{headers:{cookie}})).status,404);
+  assert.equal(Object.hasOwn((await read('verified-turn')).result,'artifactDownloads'),false);
   assert.deepEqual((await (await fetch(listPath,{headers:{cookie}})).json()).artifacts,[]);
   await writeFile(join(directory,'portfolio.json'),JSON.stringify({...seed,projects:[project]}),{mode:0o600});
   const unrelated = git([...identity,'commit-tree',next+'^{tree}','-m','separate Git history']);

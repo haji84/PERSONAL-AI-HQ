@@ -151,11 +151,11 @@ export async function readCodexChatContext({chats, operations, native, nativeArt
     throw unavailable();
   }
   const checkpoint = project.nativeHandover;
-  const inspectArtifacts = checkpoint?.threadId === id && checkpoint?.turnId === turnId && checkpoint.shareArtifacts === true;
+  const inspectArtifacts = checkpoint?.threadId === id && checkpoint?.turnId === turnId &&
+    (!saved || checkpoint.operationId === receipt) && checkpoint.shareArtifacts === true;
   const published = inspectArtifacts ? (await nativeArtifacts.list([project], 0)).artifacts : [];
-  const artifacts = published.flatMap(item =>
-    relativeFile(item.title) && hexDigest.test(item.sha256) && exactDate(item.observedAt)
-      ? [{path: item.title, sha256: item.sha256, observedAt: item.observedAt}] : []);
+  const verified = published.filter(item=>relativeFile(item.title) && hexDigest.test(item.sha256) && exactDate(item.observedAt));
+  const artifacts = verified.map(({title:path,sha256,observedAt})=>({path,sha256,observedAt}));
   const conversation = saved ? conversationView(chats, project, candidate, true) :
     selectConversation(chats, operations, project, id, turnId, candidate);
   if (saved && (!conversation || readReceipt()?.snapshot !== saved.snapshot)) throw missingThread();
@@ -164,5 +164,8 @@ export async function readCodexChatContext({chats, operations, native, nativeArt
     coverage: {turnPages: turn.pages, evidencePages: evidence.pages, moreEvidence: evidence.more,
       sourceTruncated: evidence.truncated || artifacts.length < published.length,
       artifactEvidence: artifacts.length ? 'verified' : inspectArtifacts ? 'unverified' : 'unpublished'}};
-  return {threadId: id, turnId, conversation, ...createDocument(origin, {...evidence, artifacts})};
+  const document = createDocument(origin,{...evidence,artifacts});
+  const artifactDownloads = verified.slice(0,document.summary.artifacts)
+    .map(({title:path,sha256,href,evidence})=>({path,sha256,href,evidence}));
+  return {threadId:id,turnId,conversation,...document,...(artifactDownloads.length && {artifactDownloads})};
 }

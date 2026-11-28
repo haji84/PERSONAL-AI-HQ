@@ -163,6 +163,12 @@ function link(text, url, local = false, asButton = false) {
   }
   return element;
 }
+function codexDownload(label, href, asButton = false) {
+  const action = link(label,href,true,asButton);
+  if (!action || new URL(action.href).origin !== location.origin) return null;
+  action.download = '';
+  return action;
+}
 function asArray(value) {
   return Array.isArray(value) ? value : [];
 }
@@ -3405,6 +3411,36 @@ function syncChatDevelopment() {
   if (visible) refreshEstimateReadouts();
 }
 
+function linkedArtifactDownloads(container, result, project, receipt) {
+  const rows = node('ul','marked-list');
+  const selected = new Map(asArray(result.packet.artifacts).filter(file=>typeof file?.path==='string')
+    .map(file=>[file.path,file.sha256]));
+  for (const item of asArray(result.artifactDownloads)) {
+    if (typeof item?.path !== 'string' || typeof item.sha256 !== 'string' || selected.get(item.path) !== item.sha256 ||
+        typeof item.href !== 'string' || !item.href.startsWith('/api/artifacts/work/file?')) continue;
+    const itemUrl = new URL(item.href,location.origin);
+    const query = itemUrl.searchParams;
+    if (itemUrl.hash || query.size !== 6 || query.get('source') !== 'codex' || query.get('project') !== project ||
+        query.get('id') !== receipt || query.get('part') !== 'artifact' ||
+        !/^\d{1,2}$/.test(query.get('index') ?? '') || !/^[a-f0-9]{64}$/.test(query.get('review') ?? '')) continue;
+    const file = codexDownload(item.path,item.href);
+    if (!file) continue;
+    const group = node('div','run-actions');
+    group.append(file);
+    for (const [part,label] of [['requirements','要件'],['verification','検証記録']]) {
+      const proof = item.evidence?.[part];
+      const expected = new URL(itemUrl);
+      expected.searchParams.set('part',part);
+      if (typeof proof?.path !== 'string' || proof.href !== expected.pathname + expected.search) continue;
+      const download = codexDownload(label + ' · ' + proof.path,proof.href);
+      if (download) group.append(download);
+    }
+    rows.append(listItem(group));
+  }
+  container.replaceChildren();
+  if (rows.childElementCount) container.append(node('p','strong','検証済み成果物'),rows);
+}
+
 function linkedCodexWork(project, conversation, isCurrent, stageResult) {
   const details = node('details', 'scope-info');
   const status = node('p', 'small muted');
@@ -3435,6 +3471,7 @@ function linkedCodexWork(project, conversation, isCurrent, stageResult) {
     preview.tabIndex = 0;
     preview.hidden = true;
     preview.setAttribute('aria-label', '照合済みのCodex作業結果');
+    const downloads = node('div','stack');
     const actions = node('div', 'run-actions');
     let verified, reviewedConnection;
     const attach = stageResult && button('Codex結果をこの会話の下書きに添付', () => {
@@ -3452,6 +3489,7 @@ function linkedCodexWork(project, conversation, isCurrent, stageResult) {
       if (!current() || read.disabled) return;
       read.disabled = true;
       preview.hidden = true;
+      downloads.replaceChildren();
       verified = undefined;
       if (attach) attach.hidden = true;
       confirmation.textContent = '元の会話と実行結果を照合しています…';
@@ -3468,6 +3506,7 @@ function linkedCodexWork(project, conversation, isCurrent, stageResult) {
         confirmation.textContent = `照合済み · 実行記録 ${commands}件 · 変更ファイル ${files}件 · 成果物 ${artifacts}件`;
         preview.textContent = JSON.stringify(result.packet, null, 2);
         preview.hidden = false;
+        linkedArtifactDownloads(downloads,result,project,work.id);
         if (attach) attach.hidden = false;
       } catch (error) {
         if (canApply()) confirmation.textContent = error.message;
@@ -3475,7 +3514,7 @@ function linkedCodexWork(project, conversation, isCurrent, stageResult) {
     });
     actions.append(read);
     if (attach) actions.append(attach);
-    row.append(actions, confirmation, preview);
+    row.append(actions, confirmation, downloads, preview);
     return row;
   }
 
@@ -4790,7 +4829,8 @@ async function verifiedCodexChatResult(project, threadId, turn, {candidate, hist
     throw new Error('収録した結果を確認できませんでした。');
   }
   const digest = await attachmentDigest(bytes, document.name);
-  return {document, conversation, counts, packet, digest, sourceConversationId: conversation?.id ?? null};
+  return {document, conversation, counts, packet, digest, artifactDownloads:result.artifactDownloads,
+    sourceConversationId:conversation?.id??null};
 }
 
 function codexResultChatHandoff(project, threadId, selector, isCurrent) {
@@ -5368,13 +5408,6 @@ function artifacts() {
   const list = node('ul', 'rows');
   const empty = node('p', 'empty');
   const searchWrap = node('div', 'search-wrap');
-  function codexDownload(label, href, asButton = false) {
-    const action = link(label, href, true, asButton);
-    if (!action || new URL(action.href).origin !== location.origin) return null;
-    action.download = '';
-    return action;
-  }
-
   function proofFor(artifact) {
     const actions = [['要件', artifact.evidence?.requirements], ['検証記録', artifact.evidence?.verification]]
       .flatMap(([label, proof]) => {
