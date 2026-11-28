@@ -3471,6 +3471,7 @@ const apiWorkMessages = {
   API_CANDIDATE_HANDOVER_REQUIRED: '前回の検証済み成果物と今回の作業先を照合してください。',
   API_SETTLEMENT_UNKNOWN: 'API応答と費用が未確認です。同じ作業の追加実行は保留中です。',
   API_VERIFICATION_FAILED: '隔離環境の検証を通過しませんでした。',
+  API_ISOLATION_UNAVAILABLE: '隔離テストを確認できず、通常APIへの送信前に停止しました。',
   API_WORKSPACE_FAILED: '分離作業先または検証条件を確認してください。',
   API_OUTPUT_UNUSABLE: 'API応答から適用可能な変更を確認できませんでした。',
   API_NO_WORKSPACE_CHANGE: '検証対象に変更がありませんでした。',

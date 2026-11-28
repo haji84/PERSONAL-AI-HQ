@@ -1,7 +1,7 @@
 import { execFile, execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { closeSync, constants, fstatSync, openSync, readSync, realpathSync } from 'node:fs';
-import { access, lstat, mkdir, open, readdir, realpath, writeFile } from 'node:fs/promises';
+import { access, lstat, mkdir, open, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { assertWindowsPrivateWorkspace, isOrdinaryWindowsPathComponent } from './private-directory.mjs';
@@ -389,6 +389,17 @@ process.stdout.write(JSON.stringify(status));
 if (status.some(result => !result.passed)) process.exitCode = 1;
 `;
 
+const READINESS_TEST = `
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import test from 'node:test';
+
+test('isolated test child can read its workspace and cannot read the outer runner', () => {
+  assert.ok(readFileSync(new URL(import.meta.url)).length > 0);
+  assert.throws(() => readFileSync(new URL('../run-tests.mjs', import.meta.url)), {code: 'ERR_ACCESS_DENIED'});
+});
+`;
+
 function sandboxProfile(node, runner, candidate) {
   const quote = (text) => JSON.stringify(text);
   const ancestors = [];
@@ -525,7 +536,7 @@ export async function readAdvisoryWorkspace({ checkout, files, testPaths, priorC
     ({ path: entry.name, text: entry.original, writable: false })) };
 }
 
-export async function prepareApiWorkspace({ checkout, jobRoot, files, testPaths, priorChanges, signal }) {
+export async function prepareApiWorkspace({ checkout, jobRoot, files, testPaths, priorChanges, signal }, verifyInSandbox = runVerification) {
   if (process.platform !== 'darwin' || Number(process.versions.node.split('.')[0]) < 24) {
     throw new Error('Isolated API development requires a macOS Node 24 sandbox');
   }
@@ -540,7 +551,22 @@ export async function prepareApiWorkspace({ checkout, jobRoot, files, testPaths,
   signal?.throwIfAborted();
   await mkdir(jobRoot, { mode: 0o700 });
   const runner = path.join(jobRoot, 'run-tests.mjs');
-  await writeFile(runner, RUNNER, { flag: 'wx', mode: 0o400 });
+  const readiness = path.join(jobRoot, 'readiness');
+  const probe = path.join(readiness, 'readiness.test.mjs');
+  try {
+    await writeFile(runner, RUNNER, { flag: 'wx', mode: 0o400 });
+    await mkdir(readiness, { mode: 0o700 });
+    await writeFile(probe, READINESS_TEST, { flag: 'wx', mode: 0o400 });
+    const result = await verifyInSandbox({node, runner, candidate: readiness, tests: [path.basename(probe)], signal});
+    signal?.throwIfAborted();
+    if (result?.passed !== true || result.exitCode !== 0) throw new Error('Isolated test did not complete successfully');
+    await rm(readiness, {recursive: true});
+    signal?.throwIfAborted();
+  } catch (cause) {
+    await rm(jobRoot, {recursive: true, force: true});
+    signal?.throwIfAborted();
+    throw Object.assign(new Error('Isolated workspace verification is unavailable', {cause}), {code: 'API_ISOLATION_UNAVAILABLE'});
+  }
   let contents = new Map([...entries].map(([name, entry]) => [name, entry.original]));
   const tests = [...testPaths];
   let sequence = 0;
@@ -591,7 +617,7 @@ export async function prepareApiWorkspace({ checkout, jobRoot, files, testPaths,
         await assertCandidate(candidatePath, contents);
         const runnerBytes = await diskBytes(await exactFile(jobRoot, 'run-tests.mjs'));
         if (!runnerBytes.equals(Buffer.from(RUNNER))) throw new Error('API test runner content changed');
-        const result = await runVerification({ node, runner, candidate: candidatePath, tests, signal: verifySignal, jobSignal: signal });
+        const result = await verifyInSandbox({ node, runner, candidate: candidatePath, tests, signal: verifySignal, jobSignal: signal });
         if (result.passed) {
           await assertCandidate(candidatePath, contents);
           if (signal?.aborted || verifySignal?.aborted) return { passed: false, exitCode: null, output: 'Verification cancelled' };

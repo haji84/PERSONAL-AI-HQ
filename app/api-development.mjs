@@ -41,7 +41,7 @@ function latestApiActivity(store, projectId, localJob) {
 
 export function createApiDevelopment({directory, store, conversations, withProjectWorkLock, hasNativeWork, hasActiveWork,
   completedNativeSource, readHandoverTurn,
-  getKey = () => process.env.OPENAI_API_KEY, fetchImpl, readAuthority = readApiAuthority}) {
+  getKey = () => process.env.OPENAI_API_KEY, fetchImpl, readAuthority = readApiAuthority, verifyInSandbox}) {
   const jobs = new Map();
   const artifacts = join(directory, 'api-work');
   let closing = false;
@@ -201,7 +201,7 @@ export function createApiDevelopment({directory, store, conversations, withProje
       }
       const workspace = {checkout: scope.checkout, jobRoot, files: scope.enrollment.files,
         testPaths: scope.enrollment.testPaths, priorChanges: previousChanges, signal};
-      const candidate = advice ? null : await prepareApiWorkspace(workspace);
+      const candidate = advice ? null : await prepareApiWorkspace(workspace, verifyInSandbox);
       const advisoryContext = advice ? await readAdvisoryWorkspace(workspace) : null;
       if (advice) await mkdir(jobRoot, {mode: 0o700});
       baseSha = advisoryContext?.baseSha ?? candidate.context().baseSha;

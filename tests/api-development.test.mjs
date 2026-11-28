@@ -29,7 +29,7 @@ async function authenticatedRequests(app) {
       ...(data ? {body: JSON.stringify(data)} : {})});
 }
 
-async function fixture(t, fetchImpl, {handover = false, auxiliary = [], codex = {}, realtimeConnect} = {}) {
+async function fixture(t, fetchImpl, {handover = false, auxiliary = [], codex = {}, realtimeConnect, verifyInSandbox} = {}) {
   const directory = await realpath(await mkdtemp(join(tmpdir(), 'hq-api-app-')));
   let app, requests;
   const servers = new Set();
@@ -81,7 +81,9 @@ test('answer equals the required value', () => assert.equal(answer, 2));\n`);
   async function open(enableExecution) {
     await app?.close();
     servers.delete(app);
-    app = await startOwnerApp({directory, port: 0, codex, apiDevelopment: enableExecution && {getKey: () => 'fixture-only', fetchImpl, realtimeConnect}});
+    app = await startOwnerApp({directory, port: 0, codex, apiDevelopment: enableExecution && {
+      getKey: () => 'fixture-only', fetchImpl, realtimeConnect, verifyInSandbox,
+    }});
     servers.add(app);
     requests = await authenticatedRequests(app);
   }
@@ -317,6 +319,30 @@ test('the checked Codex result anchors a Realtime conversation without changing 
     ['user','今回の音声の指示'],['assistant','今回の音声の回答']]);
   assert.equal(wires.length, 4);
   assert.deepEqual(store.getWork(id).checkpoint, before.checkpoint);
+});
+
+test('unavailable API isolation releases the reservation before provider dispatch', {skip: process.platform !== 'darwin'}, async t => {
+  let requests = 0;
+  const {call, source, store} = await fixture(t, async () => {
+    requests++;
+    return providerAnswer(2);
+  }, {verifyInSandbox: async () => ({passed: false, exitCode: null, output: 'Fixture sandbox failed to start'})});
+
+  const settings = await call('/api/execution/settings', {data: {revision: 0, settings: {mode: 'api-only', apiBudgetUsd: 1}}});
+  assert.equal(settings.status, 200);
+  assert.equal((await call('/api/execution/api', {data: instruction})).status, 202);
+  const operation = await waitFor(call, 'interrupted');
+  assert.equal(operation.result, 'API_ISOLATION_UNAVAILABLE');
+  assert.equal(operation.startedAt, null);
+  assert.equal(requests, 0);
+  assert.equal(operation.artifactCount, 0);
+  assert.deepEqual(operation.providerReceipts ?? [], []);
+  assert.deepEqual((await (await call('/api/artifacts/work')).json()).artifacts, []);
+  assert.equal(await readFile(source, 'utf8'), 'export const answer = 1;\n');
+  const work = store.getWork(id, instruction.id);
+  assert.equal(work.operation.status, 'cancelled');
+  assert.equal(work.busy, false);
+  assert.equal(work.settledApiMicros, 0);
 });
 
 test('owner API-only work repairs actual source in an isolated Mac and returns a verified artifact', {skip: process.platform !== 'darwin'}, async t => {

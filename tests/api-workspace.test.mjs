@@ -56,6 +56,7 @@ async function fixture(t, extra = '', expected = 2) {
 macTest('tests real candidate edits while preserving the original checkout', async (t) => {
   const { checkout, options, initial, baseSha } = await fixture(t);
   const job = await prepareApiWorkspace(options);
+  await assert.rejects(lstat(path.join(options.jobRoot, 'readiness')), {code: 'ENOENT'});
   assert.deepEqual(job.context(), { baseSha, files: [{ path: 'value.mjs', writable: true, text: initial }] });
   assert.equal((await job.verify()).passed, false);
   await assert.rejects(async () => job.finish(), /verified/i);
@@ -65,6 +66,7 @@ macTest('tests real candidate edits while preserving the original checkout', asy
   assert.equal((await job.verify()).passed, true);
   const finished = await job.finish();
   assert.equal(finished.baseSha, baseSha);
+  assert.equal(path.basename(finished.candidatePath), 'candidate-2');
   assert.deepEqual(finished.changes, [{
     path: 'value.mjs', beforeSha256: digest(initial), sha256: digest(text), bytes: Buffer.byteLength(text),
   }]);
@@ -72,6 +74,31 @@ macTest('tests real candidate edits while preserving the original checkout', asy
   assert.equal(await readFile(path.join(checkout, 'value.mjs'), 'utf8'), initial);
   assert.equal((await lstat(options.jobRoot)).mode & 0o777, 0o700);
   assert.equal((await lstat(path.join(finished.candidatePath, 'value.mjs'))).mode & 0o777, 0o600);
+});
+
+macTest('requires a working isolated verifier before preparing an editable job', async (t) => {
+  const { checkout, options, initial } = await fixture(t);
+  let attempts = 0;
+  await assert.rejects(prepareApiWorkspace(options, async ({candidate, tests}) => {
+    attempts++;
+    assert.equal(path.dirname(candidate), options.jobRoot);
+    assert.equal(tests.length, 1);
+    assert.match(await readFile(path.join(candidate, tests[0]), 'utf8'), /node:test/);
+    return {passed: false, exitCode: null, output: 'Fixture sandbox could not start'};
+  }), {code: 'API_ISOLATION_UNAVAILABLE'});
+  assert.equal(attempts, 1);
+  await assert.rejects(lstat(options.jobRoot), {code: 'ENOENT'});
+  assert.equal(await readFile(path.join(checkout, 'value.mjs'), 'utf8'), initial);
+});
+
+macTest('cleans up a workspace cancelled during verifier readiness', async (t) => {
+  const { options } = await fixture(t);
+  const controller = new AbortController();
+  await assert.rejects(prepareApiWorkspace({...options, signal: controller.signal}, async () => {
+    controller.abort();
+    return {passed: true, exitCode: 0, output: 'Fixture completed as cancellation arrived'};
+  }), {name: 'AbortError'});
+  await assert.rejects(lstat(options.jobRoot), {code: 'ENOENT'});
 });
 
 macTest('rejects unauthorized replacements, aliases, immutable tests and stale authorized sources', async (t) => {
