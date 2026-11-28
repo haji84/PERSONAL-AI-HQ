@@ -1,4 +1,4 @@
-import {randomUUID} from 'node:crypto';
+import {createHash, randomUUID} from 'node:crypto';
 import {chmodSync, lstatSync} from 'node:fs';
 import {join} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
@@ -10,6 +10,23 @@ import {realtimeArchiveId, realtimeArchiveReview, realtimeReceiptId, validRealti
 const date = value => Number.isFinite(value) && value >= 0 && value < 253402300800 ? new Date(value * 1000).toISOString() : null;
 const title = value => typeof value === 'string' && value.trim() ? value.trim().slice(0, 240) : '無題の会話';
 const idPattern = /^[a-z0-9_.:-]{1,160}$/i;
+export const chatHistoryPageSize = 40;
+export const chatHistoryLastOffset = 5000;
+const exportedTextPartSize = 30000;
+const exportedTextDigest = text => createHash('sha256').update(JSON.stringify(text)).digest('hex');
+const unshownExportTypes = new Set(['thoughts','reasoning','reasoning_recap','model_editable_context',
+  'user_editable_context','tool_result']);
+
+function splitsCharacter(text, offset) {
+  return offset > 0 && offset < text.length &&
+    (text.charCodeAt(offset - 1) & 0xfc00) === 0xd800 && (text.charCodeAt(offset) & 0xfc00) === 0xdc00;
+}
+
+function exportedTextPart(text, offset) {
+  const boundary = Math.min(offset + exportedTextPartSize, text.length);
+  const end = splitsCharacter(text, boundary) ? boundary - 1 : boundary;
+  return {text: text.slice(offset, end), nextOffset: end < text.length ? end : null};
+}
 
 function officialConversation(value) {
   const id = value?.id ?? value?.conversation_id;
@@ -17,6 +34,8 @@ function officialConversation(value) {
       !value.mapping || typeof value.mapping !== 'object' || Array.isArray(value.mapping)) return null;
   const visited = new Set();
   const messages = [];
+  const legacy = [];
+  let differsFromLegacy = false;
   let key = value.current_node;
   while (key !== null) {
     const node = Object.hasOwn(value.mapping, key) ? value.mapping[key] : null;
@@ -26,13 +45,24 @@ function officialConversation(value) {
     const role = message?.author?.role;
     if (role === 'user' || role === 'assistant') {
       const parts = message.content?.parts;
-      const string = Array.isArray(parts) ? parts.filter(part => typeof part === 'string').join('\n').trim() : '';
-      if (string) messages.push({role, text: string.slice(0, 30000), createdAt: date(message.create_time)});
+      const text = Array.isArray(parts) ? parts.filter(part => typeof part === 'string').join('\n') : '';
+      const oldText = text.trim().slice(0, 30000);
+      if (oldText) {
+        const createdAt = date(message.create_time);
+        const hidden = message.metadata?.is_visually_hidden_from_conversation === true ||
+          message.metadata?.is_user_system_message === true || message.channel === 'analysis' ||
+          (message.recipient != null && message.recipient !== 'all') ||
+          unshownExportTypes.has(message.content?.content_type);
+        legacy.push({role, text: oldText, createdAt});
+        if (!hidden) messages.push({role, text, createdAt});
+        differsFromLegacy ||= hidden || text !== oldText;
+      }
     }
     key = typeof node.parent === 'string' ? node.parent : null;
   }
   const modified = Number.isFinite(value.update_time) && value.update_time >= 0 ? value.update_time : 0;
-  return messages.length ? {id, title: title(value.title), modified, messages: messages.reverse()} : null;
+  return legacy.length ? {id, title: title(value.title), modified, messages: messages.reverse(),
+    legacy: differsFromLegacy ? legacy.reverse() : null} : null;
 }
 
 const liveIdPattern = /^live\/[a-f0-9-]{36}$/;
@@ -64,8 +94,17 @@ function archiveView(row, offset = 0) {
   const parsed = JSON.parse(saved);
   const structured = row.source === developmentSource || row.source === voiceSource;
   const {model, outcome, messages} = structured ? parsed : {messages: parsed};
-  return {conversation: {...details, ...(structured ? {model, outcome} : {}), messages: messages.slice(offset, offset + 40)},
-    nextOffset: offset + 40 < messages.length ? offset + 40 : null};
+  const through = offset + chatHistoryPageSize;
+  const page = messages.slice(offset, through);
+  const display = row.source === 'chatgpt-export' ? page.map(({exportedTextVersion, ...message}, index) => {
+    if (message.text.length <= exportedTextPartSize) return message;
+    const preview = exportedTextPart(message.text, 0);
+    return {...message, text: preview.text, original: {
+      index: offset + index, sha256: exportedTextDigest(message.text), nextOffset: preview.nextOffset,
+    }};
+  }) : page;
+  return {conversation: {...details, ...(structured ? {model, outcome} : {}), messages: display},
+    nextOffset: through < messages.length ? through : null};
 }
 
 function readRealtimeArchive(row) {
@@ -182,6 +221,8 @@ export function createChatStore(directory, {now = Date.now} = {}) {
     VALUES (?,?,?,?,?,?) ON CONFLICT(project,id) DO UPDATE SET title=excluded.title,
       imported_at=excluded.imported_at, modified=excluded.modified, messages=excluded.messages
     WHERE conversations.source='chatgpt-export' AND excluded.modified > conversations.modified`);
+  const recoverExport = db.prepare(`UPDATE conversations SET imported_at=?, messages=?
+    WHERE project=? AND id=? AND source='chatgpt-export' AND modified=? AND title=? AND messages=?`);
   const insertDevelopment = db.prepare(`INSERT INTO conversations (project,id,title,imported_at,modified,messages,source)
     VALUES (?,?,?,?,?,?,'api-development')`);
   const insertVoice = db.prepare(`INSERT INTO conversations (project,id,title,imported_at,modified,messages,source)
@@ -192,7 +233,12 @@ export function createChatStore(directory, {now = Date.now} = {}) {
     WHERE project=? AND id=? AND source='api-development'`);
   const list = db.prepare(`SELECT id,title,importedAt,source FROM (
     SELECT id,title,imported_at AS importedAt,source FROM conversations
-      WHERE project=?1 AND (?2='' OR instr(lower(title),lower(?2))>0 OR instr(lower(messages),lower(?2))>0)
+      WHERE project=?1 AND (source<>'chatgpt-export' OR CASE WHEN json_valid(messages) THEN json_array_length(messages)>0 ELSE 0 END)
+        AND (?2='' OR instr(lower(title),lower(?2))>0 OR
+        CASE WHEN source='chatgpt-export' THEN EXISTS(
+          SELECT 1 FROM json_each(CASE WHEN json_valid(messages) THEN messages ELSE '[]' END) AS item
+          WHERE CASE WHEN item.type='object' THEN instr(lower(json_extract(item.value,'$.text')),lower(?2))>0 ELSE 0 END
+        ) ELSE instr(lower(messages),lower(?2))>0 END)
     UNION ALL
     SELECT c.id,c.title,c.updated_at,'chatgpt-live' FROM live_conversations c
       WHERE c.project=?1 AND (?2='' OR instr(lower(c.title),lower(?2))>0 OR instr(lower(c.history),lower(?2))>0 OR
@@ -281,6 +327,18 @@ export function createChatStore(directory, {now = Date.now} = {}) {
 
   return {
     list: (project, query = '') => ({conversations: list.all({1: project, 2: query})}),
+    readExportText(project, id, index, sha256, offset) {
+      const row = get.get(project,id);
+      const text = row?.source === 'chatgpt-export' ? JSON.parse(row.messages)[index]?.text : null;
+      if (typeof text !== 'string' || text.length <= exportedTextPartSize) return null;
+      if (exportedTextDigest(text) !== sha256) {
+        throw storeError(409,'CHAT_EXPORT_CHANGED','会話が更新されました。履歴を読み直してください。');
+      }
+      if (offset >= text.length || splitsCharacter(text,offset)) {
+        throw storeError(400,'CHAT_EXPORT_POSITION_INVALID','原文の位置を確認してください。');
+      }
+      return exportedTextPart(text,offset);
+    },
     read(project, id, offset, {reconcile = true} = {}) {
       const row = get.get(project, id);
       if (row) return archiveView(row, offset);
@@ -460,11 +518,29 @@ export function createChatStore(directory, {now = Date.now} = {}) {
       if (!Array.isArray(rows) || rows.length === 0 || rows.length > 3000) return null;
       const conversations = rows.map(officialConversation).filter(Boolean);
       if (!conversations.length) return null;
-      inTransaction(() => {
+      return inTransaction(() => {
         const importedAt = new Date(now()).toISOString();
-        for (const row of conversations) add.run(project, row.id, row.title, importedAt, row.modified, JSON.stringify(row.messages));
+        let imported = 0;
+        let unchanged = 0;
+        let skipped = rows.length - conversations.length;
+        for (const row of conversations) {
+          const recover = saved => row.legacy && recoverExport.run(importedAt,saved,project,row.id,
+            row.modified,row.title,JSON.stringify(row.legacy)).changes;
+          if (!row.messages.length) {
+            if (recover('[]')) imported++;
+            else skipped++;
+            continue;
+          }
+          // Keep the existing archive array format and distinguish exact text from the
+          // pre-upgrade representation when a file with the same version is imported.
+          const [first, ...remainder] = row.messages;
+          const saved = JSON.stringify([{...first, exportedTextVersion:1}, ...remainder]);
+          const result = add.run(project,row.id,row.title,importedAt,row.modified,saved);
+          if (result.changes || recover(saved)) imported++;
+          else unchanged++;
+        }
+        return {imported, unchanged, skipped};
       });
-      return {imported: conversations.length, skipped: rows.length - conversations.length};
     },
     hasProjectHistory: id => Boolean(projectHistory.get(id)),
     withWriteLock: inTransaction,

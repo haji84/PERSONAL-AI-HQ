@@ -2048,11 +2048,57 @@ function chatHistoryImage(item, scope) {
   });
   return details;
 }
-function messageBubble(item, imageScope) {
+function archiveOriginalControl(body, item, scope) {
+  const original = item.original;
+  if (!scope || typeof item.text !== 'string' || !Number.isSafeInteger(original?.index) || original.index < 0 ||
+      !/^[a-f0-9]{64}$/.test(original.sha256 ?? '') || original.nextOffset !== item.text.length || !original.nextOffset) return null;
+  const {project, id, signal, isCurrent} = scope;
+  const {index, sha256} = original;
+  let offset = original.nextOffset;
+  let loading = false;
+  const current = () => body.isConnected && !signal.aborted && isCurrent();
+  const controls = node('div', 'stack');
+  const status = node('p', 'small muted');
+  status.setAttribute('role', 'status');
+  status.tabIndex = -1;
+  const next = button('原文の続きを読む', async () => {
+    if (!current() || loading || offset === null) return;
+    loading = true;
+    next.setAttribute('aria-disabled', 'true');
+    status.textContent = '原文を読み込んでいます。';
+    try {
+      const chunk = await api(apiPath('/api/chat/original', {project, id, index, sha256, offset}), {signal});
+      if (!current()) return;
+      if (typeof chunk?.text !== 'string' || !chunk.text.length ||
+          (chunk.nextOffset !== null && chunk.nextOffset !== offset + chunk.text.length)) {
+        throw new Error('原文の続きの位置を確認できませんでした。');
+      }
+      body.append(chunk.text);
+      offset = chunk.nextOffset;
+      status.textContent = offset === null ? '原文の最後まで表示しました。' : '原文の続きを表示しました。';
+      if (offset === null) {
+        const focused = document.activeElement === next;
+        next.hidden = true;
+        if (focused) status.focus({preventScroll:true});
+      }
+    } catch (error) {
+      if (current()) status.textContent = error.message;
+    } finally {
+      loading = false;
+      if (current()) next.setAttribute('aria-disabled', 'false');
+    }
+  });
+  controls.append(next, status);
+  return controls;
+}
+function messageBubble(item, scope) {
   const user = item.role === 'user';
   const box = node('div', 'message' + (user ? ' user' : ''));
   const label = (user ? 'あなた' : 'AI') + (item.createdAt ? ' · ' + time(item.createdAt) : '');
-  box.append(node('span', 'small muted strong', label), node('p', '', text(item.text, '')));
+  const body = node('p', '', scope?.original && typeof item.text === 'string' ? item.text : text(item.text, ''));
+  box.append(node('span', 'small muted strong', label), body);
+  const originalControl = archiveOriginalControl(body, item, scope?.original);
+  if (originalControl) box.append(originalControl);
   const attachment = item.document ?? item.reference;
   if (user && typeof attachment?.name === 'string' && typeof attachment.text === 'string') {
     const reference = node('details', 'scope-info');
@@ -2062,7 +2108,7 @@ function messageBubble(item, imageScope) {
     box.append(reference);
   }
   if (user) {
-    const image = chatHistoryImage(item, imageScope);
+    const image = chatHistoryImage(item, scope?.image);
     if (image) box.append(image);
   }
   if (!user && ui.view === 'chat' && ui.capabilities.localSpeech === true && typeof item.text === 'string' && item.text.trim()) {
@@ -2091,9 +2137,9 @@ function showApiReceipts(destination, receipts) {
   details.append(node('summary', '', apiReceiptSummary(receipts)), responses);
   destination.append(details);
 }
-function messagesInto(parent, items, onTop, imageScope) {
+function messagesInto(parent, items, onTop, scope) {
   const payload = asArray(items).filter(item => ['user', 'assistant', 'agent'].includes(item?.role));
-  const nodes = payload.map(item => messageBubble(item, imageScope));
+  const nodes = payload.map(item => messageBubble(item, scope));
   if (onTop) parent.prepend(...nodes);
   else parent.append(...nodes);
   return nodes.length;
@@ -3288,7 +3334,7 @@ function planComposer(project, onConversation) {
 function importSection(project) {
   const box = node('div', 'import-box');
   const label = node('label', 'picker');
-  label.append(node('span', '', 'ChatGPTの書き出し（conversations.json）'));
+  label.append(node('span', '', 'ChatGPTの書き出し（会話JSON）'));
   const file = node('input');
   file.type = 'file';
   file.accept = '.json,application/json';
@@ -3314,7 +3360,7 @@ function importSection(project) {
       if (!Array.isArray(parsed) && !Array.isArray(parsed?.conversations)) {
         throw new Error('会話一覧を含むJSONファイルを選んでください。');
       }
-      await api(apiPath('/api/chat/import', {project}), {
+      const {imported, unchanged, skipped} = await api(apiPath('/api/chat/import', {project}), {
         method: 'POST', headers: {'Content-Type': 'application/json'}, body,
       });
       evictChats(project);
@@ -3322,7 +3368,9 @@ function importSection(project) {
         const anchor = scrollY;
         render(false);
         scrollTo(0, anchor);
-        setNotice('会話の取り込みが終わりました。');
+        const counted = [imported, unchanged, skipped].every(value => Number.isSafeInteger(value) && value >= 0);
+        setNotice(counted ? `保存 ${imported}件・変更なし ${unchanged}件・取り込めず ${skipped}件` :
+          '会話の取り込みが終わりました。件数を確認できませんでした。');
       }
     } catch (error) {
       if (ui.view === 'chat' && ui.project === project) setNotice(error.message, true);
@@ -3640,6 +3688,7 @@ function chat() {
   let plan;
   let realtime;
   let previousConversation;
+  let detailRead;
   function showAdvice(nativeId) {
     if (ui.capabilities.apiDevelopment !== true || advisoryThread === nativeId) return;
     advisoryThread = nativeId;
@@ -3653,6 +3702,9 @@ function chat() {
     cleanupAdvice = advice.cleanup;
   }
   function showChatDetails(revealMatch = false) {
+    detailRead?.abort();
+    detailRead = new AbortController();
+    const {signal} = detailRead;
     abortLocalDictation();
     stopSpeech();
     cleanupHandoff?.();
@@ -3674,7 +3726,7 @@ function chat() {
       return;
     }
     const detail = (offset, cursor) => nativeId ? apiPath('/api/codex/thread', {project, id: nativeId, cursor}) : apiPath('/api/chat', {project, id, offset});
-    const detailSelectionCurrent = () => chatIsCurrent() && ui.chatIds.get(project) === id &&
+    const detailSelectionCurrent = () => !signal.aborted && chatIsCurrent() && ui.chatIds.get(project) === id &&
       ui.chatNativeLocations.get(project) === savedLocation;
     const key = memoryKey('chat-detail', project, id, initialCursor);
     if (revealMatch && match) resources.delete(key);
@@ -3700,8 +3752,10 @@ function chat() {
       const messages = node('div', 'messages messages-embedded');
       destination.append(messages);
       const empty = node('p', 'muted', '表示できる発言がありません。');
-      const imageScope = conversation.source === 'chatgpt-live' ? {project, id, reuseImage: plan?.reuseImage} : undefined;
-      if (!messagesInto(messages, conversation.messages, false, imageScope)) messages.append(empty);
+      const detailIsCurrent = () => messages.isConnected && detailSelectionCurrent();
+      const historyScope = conversation.source === 'chatgpt-export' ? {original:{project, id, signal, isCurrent:detailIsCurrent}} :
+        conversation.source === 'chatgpt-live' ? {image:{project, id, reuseImage:plan?.reuseImage}} : undefined;
+      if (!messagesInto(messages, conversation.messages, false, historyScope)) messages.append(empty);
       if (match) {
         let index = 0;
         let target;
@@ -3730,7 +3784,6 @@ function chat() {
       }
       let offset = result.nextOffset;
       let cursor = result.nextCursor;
-      const detailIsCurrent = () => messages.isConnected && detailSelectionCurrent();
       if (conversation.source === 'openai-realtime' && ui.capabilities.realtimeVoice === true && realtimeConversationId.test(id) &&
           asArray(conversation.messages).some(message => typeof message.turnId === 'string')) {
         const continueVoice = button(realtimeContinueLabel, () => {
@@ -3768,7 +3821,7 @@ function chat() {
             messages.prepend(load);
           } else {
             const added = asArray(page.conversation?.messages);
-            if (messagesInto(messages, added, false, imageScope)) empty.remove();
+            if (messagesInto(messages, added, false, historyScope)) empty.remove();
             conversation.messages = [...asArray(conversation.messages), ...added];
             updateTransfer();
             result.nextOffset = page.nextOffset;
@@ -3920,6 +3973,7 @@ function chat() {
     clearTimeout(debounce);
     bodySearchRequest?.abort();
     bodySearchRequest = undefined;
+    detailRead?.abort();
     runViewCleanups.delete(stopHistorySearch);
   }
   runViewCleanups.add(stopHistorySearch);

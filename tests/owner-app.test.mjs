@@ -1086,6 +1086,160 @@ test('an imported conversation survives restart and rejected cross-origin reques
   assert.deepEqual(conversation.messages.map(message => message.text), ['選択した会話', '保存した回答']);
 });
 
+test('ChatGPT export keeps long original text, searches its tail, and pages it only within its project', async t => {
+  const {directory,start} = await runtimeFixture(t);
+  const other = {...seed.projects[0],id:'other',cwd:resolve(tmpdir(),'other-workspace')};
+  await writeFile(join(directory,'portfolio.json'),JSON.stringify({...seed,projects:[...seed.projects,other]}),{mode:0o600});
+  const app = await start({codex:{}});
+  const cookie = await login(app);
+  const needle = '後半の"確認"と記録';
+  const first = ' \n' + 'あ'.repeat(29997) + '🧪';
+  const completeText = first + 'い'.repeat(33000) + '\n' + needle + '\n ';
+  const id = 'complete-export-example';
+  const payload = [{id,title:'保存済みの検証用会話',current_node:'reply',update_time:1700010000,mapping:{
+    user:{parent:null,message:{author:{role:'user'},content:{parts:['質問']}}},
+    private:{parent:'user',message:{author:{role:'assistant'},metadata:{is_visually_hidden_from_conversation:true},
+      content:{parts:['Unshown local record']}}},
+    reply:{parent:'private',message:{author:{role:'assistant'},content:{parts:[completeText]}}},
+  }}];
+  const details = params => app.url + '/api/chat?' + new URLSearchParams({project:'example', ...params});
+  const original = params => app.url + '/api/chat/original?' + new URLSearchParams({project:'example', id, ...params});
+  const signed = url => fetch(url,{headers:{cookie}});
+  const upload = await fetch(app.url + '/api/chat/import?project=example',{method:'POST',
+    headers:{cookie,Origin:app.url,'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  assert.equal(upload.status,200);
+  const readback = await signed(details({id}));
+  const {conversation} = await readback.json();
+  const message = conversation.messages.at(-1);
+  assert.ok(message.original, 'the archived preview must reference the original');
+  assert.deepEqual(await upload.json(),{imported:1,unchanged:0,skipped:0});
+  assert.equal(conversation.messages.length,2);
+  assert.equal(message.text.length,29999);
+  assert.equal(message.text.isWellFormed(),true);
+  assert.equal(message.original.nextOffset,message.text.length);
+  const hits = await (await signed(details({q:needle}))).json();
+  assert.deepEqual(hits.conversations.map(item=>item.id),[id]);
+  assert.deepEqual((await (await signed(details({q:'Unshown local record'}))).json()).conversations,[]);
+  const reference = {index:message.original.index,sha256:message.original.sha256};
+  const source = original({...reference,offset:message.original.nextOffset});
+  assert.equal((await fetch(source)).status,401);
+  assert.equal((await signed(original({...reference,offset:message.original.nextOffset,project:'other'}))).status,404);
+  assert.equal((await signed(original({...reference,offset:30000}))).status,400);
+  assert.equal((await signed(original({...reference,sha256:'0'.repeat(64),offset:0}))).status,409);
+  let restored = message.text;
+  let offset = message.original.nextOffset;
+  let pages = 0;
+  while (offset !== null && pages < 3) {
+    const page = await signed(original({...reference,offset}));
+    assert.equal(page.status,200);
+    const data = await page.json();
+    assert.equal(data.text.isWellFormed(),true);
+    restored += data.text;
+    offset = data.nextOffset;
+    pages++;
+  }
+  assert.equal(offset,null);
+  assert.equal(pages,2);
+  assert.equal(restored === completeText,true);
+});
+
+test('reimport recovers a matching legacy clipped transcript once without overwriting equal-version content', async t => {
+  const {directory, start} = await runtimeFixture(t);
+  await writeFile(join(directory,'portfolio.json'),JSON.stringify(seed),{mode:0o600});
+  const app = await start({codex:{}});
+  const cookie = await login(app);
+  const title = '過去に取り込んだ会話';
+  const id = 'legacy-clipped';
+  const modified = 1700010000;
+  const clip = 'あ'.repeat(30000);
+  const transcript = '   ' + clip + ' 確定した末尾 \n';
+  const db = new DatabaseSync(join(directory,'conversations.sqlite'));
+  try {
+    db.prepare('INSERT INTO conversations (project,id,title,imported_at,modified,messages) VALUES (?,?,?,?,?,?)')
+      .run('example',id,title,'2026-11-27T05:00:00.000Z',modified,JSON.stringify([{role:'user',text:clip,createdAt:null}]));
+  } finally { db.close(); }
+  const upload = async (text, updateTime=modified) => {
+    const body = [{id,title,current_node:'only',update_time:updateTime,mapping:{
+      only:{parent:null,message:{author:{role:'user'},content:{parts:[text]}}},
+    }}];
+    const response = await fetch(app.url + '/api/chat/import?project=example',{method:'POST',headers:{
+      cookie, Origin:app.url,'Content-Type':'application/json'},body:JSON.stringify(body)});
+    assert.equal(response.status,200);
+    return response.json();
+  };
+  const imported = await upload(transcript);
+  const store = new DatabaseSync(join(directory,'conversations.sqlite'),{readOnly:true});
+  const storedText = () => JSON.parse(store.prepare('SELECT messages FROM conversations WHERE project=? AND id=?')
+    .get('example',id).messages)[0].text;
+  try {
+    assert.equal(storedText() === transcript,true,'reimport must recover the exact text dropped by the old projection');
+    assert.deepEqual(imported,{imported:1,unchanged:0,skipped:0});
+    assert.deepEqual(await upload(transcript),{imported:0,unchanged:1,skipped:0});
+    assert.deepEqual(await upload(clip + '異なる末尾'),{imported:0,unchanged:1,skipped:0});
+    assert.deepEqual(await upload('古い版',modified - 1),{imported:0,unchanged:1,skipped:0});
+    assert.equal(storedText() === transcript,true);
+  } finally { store.close(); }
+});
+
+test('tool-directed and analysis records stay outside searchable and reusable ChatGPT text', async t => {
+  const {directory,start} = await runtimeFixture(t);
+  await writeFile(join(directory,'portfolio.json'),JSON.stringify(seed),{mode:0o600});
+  const app = await start({codex:{}});
+  const cookie = await login(app);
+  const id = 'previously-imported-private-only';
+  const db = new DatabaseSync(join(directory,'conversations.sqlite'));
+  try {
+    db.prepare('INSERT INTO conversations (project,id,title,imported_at,modified,messages) VALUES (?,?,?,?,?,?)')
+      .run('example',id,'旧版の会話','2026-11-27T05:00:00.000Z',100,
+        JSON.stringify([{role:'assistant',text:'Internal fixture analysis',createdAt:null}]));
+  } finally { db.close(); }
+  const body = [
+    {id,title:'旧版の会話',update_time:100,current_node:'analysis',mapping:{
+      analysis:{parent:null,message:{author:{role:'assistant'},channel:'analysis',recipient:'all',
+        content:{parts:['Internal fixture analysis']}}},
+    }},
+    {id:'visible-export',title:'表示用の会話',update_time:100,current_node:'final',mapping:{
+      request:{parent:null,message:{author:{role:'user'},content:{parts:['Visible fixture request']}}},
+      tool:{parent:'request',message:{author:{role:'assistant'},channel:'commentary',recipient:'functions.test',
+        content:{parts:['Tool-directed fixture text']}}},
+      final:{parent:'tool',message:{author:{role:'assistant'},channel:'final',recipient:'all',
+        content:{parts:['Visible fixture response']}}},
+    }},
+  ];
+  const response = await fetch(app.url+'/api/chat/import?project=example',{method:'POST',headers:{
+    cookie, Origin:app.url,'Content-Type':'application/json'},body:JSON.stringify(body)});
+  assert.equal(response.status,200);
+  const lookup = async params => (await fetch(app.url+'/api/chat?'+new URLSearchParams({project:'example',...params}),{headers:{cookie}})).json();
+  assert.deepEqual((await lookup({id:'visible-export'})).conversation.messages.map(item=>item.text),
+    ['Visible fixture request','Visible fixture response']);
+  assert.deepEqual((await lookup({id})).conversation.messages,[]);
+  assert.deepEqual((await lookup({q:'fixture analysis'})).conversations,[]);
+  assert.deepEqual((await lookup({q:'Tool-directed fixture text'})).conversations,[]);
+  assert.deepEqual((await lookup({})).conversations.map(item=>item.id),['visible-export']);
+});
+
+test('original text opens for the final message reachable through the existing archive viewer', async t => {
+  const {directory,start} = await runtimeFixture(t);
+  await writeFile(join(directory,'portfolio.json'),JSON.stringify(seed),{mode:0o600});
+  const app = await start({codex:{}});
+  const cookie = await login(app);
+  const id = 'legacy-max-view';
+  const db = new DatabaseSync(join(directory,'conversations.sqlite'));
+  try {
+    const messages = Array.from({length:5040},()=>({role:'user',text:'通常の発言',createdAt:null}));
+    messages[5039].text = 'あ'.repeat(30000) + '最終発言の末尾';
+    db.prepare('INSERT INTO conversations (project,id,title,imported_at,modified,messages) VALUES (?,?,?,?,?,?)')
+      .run('example',id,'旧版の会話','2026-11-27T05:00:00.000Z',100,JSON.stringify(messages));
+  } finally { db.close(); }
+  const read = (route,params) => fetch(app.url+route+'?'+new URLSearchParams({project:'example',id,...params}),{headers:{cookie}});
+  const last = await (await read('/api/chat',{offset:5000})).json();
+  const {index,sha256,nextOffset} = last.conversation.messages.at(-1).original;
+  assert.equal(index,5039);
+  const original = await read('/api/chat/original',{index,sha256,offset:nextOffset});
+  assert.equal(original.status,200);
+  assert.deepEqual(await original.json(),{text:'最終発言の末尾',nextOffset:null});
+});
+
 test('project execution settings block native dispatch in API-only mode and stay fixed while running', async t => {
   const {directory, start} = await runtimeFixture(t);
   const work = join(directory, 'workspaces', 'example');

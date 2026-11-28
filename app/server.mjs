@@ -11,7 +11,7 @@ import {pipeline} from 'node:stream/promises';
 import {readCurrentProject, readPortfolio, readProjectDeliverySource, readProjectEstimateBinding, registerProject} from './portfolio.mjs';
 import {normalizeSettings} from './execution-policy.mjs';
 import {readExecutionEstimateSource, readOwnerRequirementCoverage} from './delivery-records.mjs';
-import {createChatStore} from './chat-store.mjs';
+import {chatHistoryLastOffset, chatHistoryPageSize, createChatStore} from './chat-store.mjs';
 import {createCodexClient, emptyNativeActivity, historySearchCursorLimit, isCodexLoopbackUrl,
   validEvidenceCursor, validEvidenceTarget} from './codex.mjs';
 import {createOperations} from './operations.mjs';
@@ -596,11 +596,11 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       if (post && portfolio.discoveredProjects.has(projectId)) throw error(409, '先にこの案件の作業先と実行権限を登録してください。');
       throw error(404, '案件を見つけられませんでした。');
     }
-    const confirmCodexWorkspace = () => {
+    const confirmRegisteredProject = (missing = '案件の現在の登録を確認できません。') => {
       if (!signedIn()) throw error(401, 'サインインが必要です。');
       const current = readCurrentProject(directory, project.id);
       if (!current || current.cwd.length !== project.cwd.length || current.cwd.some(cwd => !project.cwd.includes(cwd))) {
-        throw error(404, 'この案件のCodex接続情報がありません。');
+        throw error(404, missing);
       }
     };
     if (get && route === '/api/execution/activity') {
@@ -741,10 +741,27 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
     if (get && route === '/api/chat') {
       const id = target.searchParams.get('id');
       const offset = Number(target.searchParams.get('offset') ?? 0);
-      if (!Number.isSafeInteger(offset) || offset < 0 || offset > 5000) throw error(400, '会話の位置が正しくありません。');
+      if (!Number.isSafeInteger(offset) || offset < 0 || offset > chatHistoryLastOffset) throw error(400, '会話の位置が正しくありません。');
       const result = id ? chats.read(project.id, id, offset) : chats.list(project.id, (target.searchParams.get('q') ?? '').slice(0, 200));
       if (!result) throw error(404, '会話を見つけられませんでした。');
       return send(response, 200, id ? apiWork.conversationView(project, result, offset) : result);
+    }
+    if (get && route === '/api/chat/original') {
+      const params = target.searchParams;
+      const id = params.get('id');
+      const index = Number(params.get('index'));
+      const offset = Number(params.get('offset'));
+      const sha256 = params.get('sha256');
+      if (params.size !== 5 || !['project','id','index','sha256','offset'].every(key=>params.getAll(key).length === 1) ||
+          !/^[a-z0-9_.:-]{1,160}$/i.test(id ?? '') ||
+          !/^(?:0|[1-9]\d{0,3})$/.test(params.get('index') ?? '') || index >= chatHistoryLastOffset + chatHistoryPageSize ||
+          !/^(?:0|[1-9]\d{0,7})$/.test(params.get('offset') ?? '') || !/^[0-9a-f]{64}$/.test(sha256 ?? '')) {
+        throw error(400, '会話と原文の位置を確認してください。');
+      }
+      confirmRegisteredProject();
+      const part = chats.readExportText(project.id,id,index,sha256,offset);
+      if (!part) throw error(404, 'この案件で発言の原文を確認できません。');
+      return send(response,200,part);
     }
     if (get && route === '/api/chat/handoff') {
       return send(response, 200, readChatHandoff(chats, project, target.searchParams));
@@ -834,7 +851,10 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       return speak(await jsonBody(request, 16384), response);
     }
     if (post && route === '/api/chat/import') {
-      const result = chats.import(project.id, await jsonBody(request, 16 * 1024 ** 2));
+      if (target.searchParams.size !== 1) throw error(400, '取り込み先の案件を一件指定してください。');
+      const body = await jsonBody(request, 16 * 1024 ** 2);
+      confirmRegisteredProject();
+      const result = chats.import(project.id, body);
       if (!result) throw error(400, 'ChatGPTの書き出しから conversations.json を選んでください。');
       return send(response, 200, result);
     }
@@ -865,7 +885,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
         const result = await native.searchHistory(project.cwd, query, cursor, {signal});
         if (response.destroyed) return;
         signal.throwIfAborted();
-        confirmCodexWorkspace();
+        confirmRegisteredProject('この案件のCodex接続情報がありません。');
         return send(response, 200, result);
       } catch (problem) {
         if (response.destroyed) return;
@@ -882,7 +902,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       }
       const id = target.searchParams.get('id');
       const {desktopThreadId, ...view} = await native.readThread(project.cwd, id, target.searchParams.get('cursor'));
-      confirmCodexWorkspace();
+      confirmRegisteredProject('この案件のCodex接続情報がありません。');
       const managed = operations.managesThread(project, id);
       return send(response, 200, {...view, managed, ...(!remote && !managed && desktopThreadId === id ? {desktopThreadId} : {})});
     }
