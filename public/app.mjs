@@ -2831,7 +2831,7 @@ function codexCameraRouteAllowed(settings, stage, route) {
   return settings.mode === 'subscription-only';
 }
 
-function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {handoff, advice, imageModel, cameraSettings, target} = {}) {
+function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {handoff, advice, imageModel, cameraSettings, target, mayStart} = {}) {
   const apiMode = Boolean(apiReady);
   const runKey = apiMode ? memoryKey('api-work', project) : project;
   const native = advice?.native;
@@ -3090,6 +3090,7 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
     closeSteer.hidden = !pendingSteering || !run.known || !finishedPhases.has(phase);
     recover.hidden = !intention || !reviewMatches(intention) || (run.known && run.operation?.id === intention.id);
     for (const action of [send, resume, steer, recover]) action.disabled = run.busy || run.checking || camera?.active === true;
+    if (mayStart?.() === false) send.disabled = resume.disabled = true;
     for (const action of [interrupt, cancel, check, checkSteer, closeSteer]) action.disabled = run.busy || run.checking;
     const body = text(advice ? relevantOperation?.advice :
       apiMode ? relevantOperation?.verification?.output : relevantOperation?.output, '');
@@ -3285,7 +3286,7 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
   }
 
   function submitNew(previous) {
-    if (run.busy || run.checking || !hasRoom() || !isCurrent() || previous?.phase === 'cancelled') return;
+    if (run.busy || run.checking || !hasRoom() || !isCurrent() || mayStart?.() === false || previous?.phase === 'cancelled') return;
     if (camera?.active) {
       run.message = '撮影を完了するか、カメラを閉じてから送信してください。';
       paint();
@@ -3478,6 +3479,11 @@ function modelSettings(target, back) {
   let imageModel = null;
   const projectSettings = canWrite ? viewResource(memoryKey('execution-settings', project), apiPath('/api/execution/settings', {project})) : null;
   let runChoices = {};
+  let modelReady = false;
+  const explicitChoice = () => {
+    const preference = ui.options.get(project);
+    return preference?.sendModel === true || preference?.sendEffort === true ? preference : null;
+  };
   if (canWrite) {
     const details = node('details', 'scope-info');
     const fields = node('div', 'stack');
@@ -3489,7 +3495,7 @@ function modelSettings(target, back) {
     if (ui.capabilities.executionSettings === true) area.body.append(details);
     nativeRun = mountCodexRun(area, project, draft, draftKey, () => ({...runChoices,
       ...(route.input.value ? {route: route.input.value} : {}), ...(stage.input.value ? {stage: stage.input.value} : {})}),
-    null, {imageModel: () => imageModel, cameraSettings: () => projectSettings?.value?.settings, target});
+    null, {imageModel: () => imageModel, cameraSettings: () => projectSettings?.value?.settings, target, mayStart: () => modelReady});
     route.input.addEventListener('change', nativeRun.paint);
     stage.input.addEventListener('change', nativeRun.paint);
   }
@@ -3500,9 +3506,9 @@ function modelSettings(target, back) {
   fetchView(memoryKey('models'), '/api/codex/models', form, (data, destination) => {
     const models = asArray(data?.data);
     if (!models.length) {
-      const unavailable = node('p', 'muted', '利用可能なモデルを確認できません。');
-      unavailable.className = 'muted model-status';
-      destination.append(unavailable);
+      destination.append(node('p', 'muted model-status', explicitChoice()
+        ? '選択したモデルを確認できません。設定と下書きは保存されています。'
+        : '利用可能なモデルを確認できません。'));
       return;
     }
     const model = node('select');
@@ -3513,63 +3519,60 @@ function modelSettings(target, back) {
     const effortLabel = node('label', 'picker');
     modelLabel.append(node('span', '', 'モデル'), model);
     effortLabel.append(node('span', '', '推論レベル'), effort);
-    for (const item of models) {
-      const option = node('option', '', text(item.displayName, item.id));
-      option.value = item.id;
-      model.append(option);
+    const status = node('p', 'muted model-status');
+    status.setAttribute('role', 'status');
+    function option(value, label) {
+      const item = node('option', '', label);
+      item.value = value;
+      item.disabled = !value;
+      return item;
     }
-    const configuredModel = () => projectSettings?.value?.settings?.model;
-    function applyModelDefault() {
-      const preference = ui.options.get(project);
-      const selection = preference?.sendModel ? preference.model : configuredModel();
-      model.value = models.find(item => item.id === selection)?.id ?? models.find(item => item.isDefault)?.id ?? models[0].id;
-    }
-    applyModelDefault();
-    function save({sendModel, sendEffort}) {
-      ui.options.set(project, {model: model.value, effort: effort.value, sendModel, sendEffort});
-      runChoices = {};
-      if (sendModel && model.value) runChoices.model = model.value;
-      if (sendEffort && effort.value) runChoices.effort = effort.value;
-      storePreferences();
-    }
-    function populateEffort(modelChanged = false) {
-      const entry = models.find(item => item.id === model.value);
-      const previous = ui.options.get(project);
-      const explicit = modelChanged || (previous?.sendModel === true && previous.model === entry?.id);
-      const current = configuredModel();
-      imageModel = asArray(entry?.inputModalities).includes('image') && (explicit ||
-        (projectSettings?.value && (!current ? entry.isDefault === true : current === entry.id))) ? entry.id : null;
-      const values = asArray(entry?.reasoningEfforts).map(item => item.reasoningEffort).filter(item => typeof item === 'string');
-      effort.replaceChildren();
-      for (const item of values) {
-        const option = node('option', '', effortLabels[item] ?? item);
-        option.value = item;
-        effort.append(option);
-      }
-      if (!values.length) {
-        const option = node('option', '', '選択できません');
-        option.value = '';
-        effort.append(option);
-      }
-      effort.disabled = !values.length;
-      effort.value = previous?.model === model.value && values.includes(previous.effort) ? previous.effort :
-        values.includes(entry?.defaultReasoningEffort) ? entry.defaultReasoningEffort : values[0] ?? '';
-      const sameModel = previous?.model === model.value;
-      save({sendModel: modelChanged || (sameModel && previous?.sendModel === true),
-        sendEffort: sameModel && previous?.effort === effort.value && previous?.sendEffort === true});
+    model.append(option('', '選択を確認できません'), ...models.map(item => option(item.id, text(item.displayName, item.id))));
+    function updateChoices() {
+      const preference = explicitChoice();
+      const settings = projectSettings?.value?.settings;
+      const configured = preference ? preference.model : settings?.model ?? models.find(item => item.isDefault)?.id;
+      const entry = models.find(item => item.id === configured);
+      model.value = entry?.id ?? '';
+      const levels = asArray(entry?.reasoningEfforts).map(item => item.reasoningEffort).filter(item => typeof item === 'string' && item);
+      const explicitEffort = preference?.sendEffort === true;
+      const requestedEffort = explicitEffort ? preference.effort : settings?.reasoningEffort ?? entry?.defaultReasoningEffort;
+      const missingEffort = Boolean(entry && (explicitEffort || requestedEffort) && !levels.includes(requestedEffort));
+      const selectedEffort = missingEffort ? '' : requestedEffort || '';
+      effort.replaceChildren(option('', missingEffort ? '選択を確認できません' : '既定値'),
+        ...levels.map(level => option(level, effortLabels[level] ?? level)));
+      effort.value = selectedEffort;
+      effort.disabled = !levels.length;
+      const settingsKnown = !projectSettings || Boolean(settings);
+      modelReady = Boolean(entry) && !missingEffort && settingsKnown;
+      runChoices = modelReady && preference ? {model: entry.id,
+        ...(explicitEffort ? {effort: selectedEffort} : {})} : {};
+      imageModel = modelReady && asArray(entry?.inputModalities).includes('image') ? entry.id : null;
+      status.textContent = !entry ? '選択したモデルを確認できません。利用可能なモデルを選んでください。' :
+        missingEffort ? '選択した推論レベルを確認できません。利用可能な推論レベルを選んでください。' :
+          !settingsKnown ? '案件設定を確認しています。' : '';
+      if (!settingsKnown && projectSettings?.error) status.textContent = '案件設定を確認できません。更新して再確認してください。';
+      status.hidden = !status.textContent;
       nativeRun?.paint();
     }
-    model.addEventListener('change', () => populateEffort(true));
-    effort.addEventListener('change', () => {
-      const entry = models.find(item => item.id === model.value);
-      save({sendModel: ui.options.get(project)?.sendModel === true || entry?.isDefault !== true, sendEffort: true});
+    function saveExplicit(preference) {
+      ui.options.set(project, preference);
+      storePreferences();
+      updateChoices();
+    }
+    model.addEventListener('change', () => {
+      if (models.some(item => item.id === model.value)) {
+        saveExplicit({model: model.value, sendModel: true, sendEffort: false});
+      }
     });
-    populateEffort();
-    destination.append(modelLabel, effortLabel);
+    effort.addEventListener('change', () => {
+      if (model.value && effort.value) saveExplicit({model: model.value, effort: effort.value,
+        sendModel: explicitChoice()?.sendModel === true, sendEffort: true});
+    });
+    destination.append(modelLabel, effortLabel, status);
+    updateChoices();
     if (projectSettings?.pending) void projectSettings.pending.then(() => {
-      if (!form.isConnected || !model.isConnected) return;
-      if (!ui.options.get(project)?.sendModel) applyModelDefault();
-      populateEffort();
+      if (form.isConnected && model.isConnected) updateChoices();
     });
   });
   return {root: area.root, cleanup() {
