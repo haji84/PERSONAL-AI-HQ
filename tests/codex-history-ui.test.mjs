@@ -9,6 +9,7 @@ const chatScreen = app.slice(app.indexOf('function chat() {'), app.indexOf('cons
 function chatFixture(reply) {
   const requests = [];
   const cleanups = new Set();
+  const resources = new Map();
   const ui = {view:'chat', project:'example', capabilities:{}, chatIds:new Map(),
     chatNativeLocations:new Map(), realtimeTurns:new Map()};
   function node(tag, className, text = '') {
@@ -44,7 +45,7 @@ function chatFixture(reply) {
       root.append(header,body);
       return {root,header,body};
     },
-    asArray: value => Array.isArray(value) ? value : [], api, apiPath, memoryKey:(...args) => JSON.stringify(args),
+    asArray: value => Array.isArray(value) ? value : [], api, apiPath, resources, memoryKey:(...args) => JSON.stringify(args),
     fetchView(_key, path, destination, paint, current = () => true) {
       void api(path).then(result => { if (!current()) return; destination.replaceChildren(); paint(result,destination); });
     },

@@ -3677,6 +3677,7 @@ function chat() {
     const detailSelectionCurrent = () => chatIsCurrent() && ui.chatIds.get(project) === id &&
       ui.chatNativeLocations.get(project) === savedLocation;
     const key = memoryKey('chat-detail', project, id, initialCursor);
+    if (revealMatch && match) resources.delete(key);
     fetchView(key, detail(0, initialCursor), readContainer, (result, destination) => {
       cleanupHandoff?.();
       cleanupHandoff = undefined;
@@ -3737,7 +3738,7 @@ function chat() {
         });
         destination.insertBefore(continueVoice, messages);
       }
-      const voiceTurn = nativeId && asArray(result?.turns).at(-1);
+      const voiceTurn = nativeId && initialCursor === null && asArray(result?.turns).at(-1);
       if (nativeId && result?.thread?.id === nativeId && ui.capabilities.realtimeVoice === true &&
           voiceTurn?.status === 'completed' && typeof voiceTurn.id === 'string' && voiceTurn.id) {
         const consultVoice = button(realtimeCodexLabel, () => {

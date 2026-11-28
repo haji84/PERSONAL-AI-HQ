@@ -139,6 +139,31 @@ test('Codex history search checks owner and project scope before and after a rea
   assert.equal((await inflight).status,404);
 });
 
+test('an older Codex conversation page cannot return after its workspace registration changes', async t => {
+  const {directory, start} = await runtimeFixture(t);
+  const registry = join(directory, 'portfolio.json');
+  await writeFile(registry, JSON.stringify(seed), {mode: 0o600});
+  const entered = Promise.withResolvers();
+  const pending = Promise.withResolvers();
+  const app = await start({codex:{
+    async readThread(scope, id, cursor) {
+      entered.resolve({scope,id,cursor});
+      return pending.promise;
+    },
+  }});
+  const cookie = await login(app);
+  const controller = new AbortController();
+  t.after(() => { controller.abort(); pending.resolve({}); });
+  const response = fetch(app.url + '/api/codex/thread?project=example&id=thread-one&cursor=old-page',
+    {headers:{cookie},signal:controller.signal});
+  assert.deepEqual(await entered.promise,{scope:[seed.projects[0].cwd],id:'thread-one',cursor:'old-page'});
+  await writeFile(registry,JSON.stringify({...seed, projects:[]}),{mode:0o600});
+  pending.resolve({thread:{id:'thread-one'},turns:[{messages:[{role:'user',text:'Scoped conversation text'}]}]});
+  const result = await response;
+  assert.equal(result.status,404);
+  assert.ok(!(await result.text()).includes('Scoped conversation text'));
+});
+
 test('recent work outcomes survive sign-in and restart within the current authorized workspaces', async t => {
   let receiptDatabase;
   // Close the direct handle before the fixture removes the database on Windows.

@@ -105,6 +105,7 @@ test('Codex history search resumes into older visible messages without reading a
   const older = await native.searchHistory([workspace], 'checkpoint', recent.nextCursor);
   assert.equal(older.nextCursor, null);
   assert.deepEqual(older.matches, [{id:scoped.id,title:scoped.name,updatedAt:null,turnId:'turn-7',turnCursor:'7'}]);
+  assert.ok(calls.filter(([method]) => method === 'thread/list').every(([, params]) => params.useStateDbOnly === true));
   assert.ok(!calls.some(([, params]) => params?.threadId === foreign.id));
   assert.ok(calls.every(([method]) => ['initialize','initialized','thread/list','thread/read','thread/turns/list'].includes(method)));
 });

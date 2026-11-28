@@ -604,7 +604,7 @@ export function createCodexClient({command, socket, loopback} = {}) {
         if (!selected) {
           if (scans > 0 && listPosition === null) break;
           const page = await rpc.call('thread/list', {cwd: scope, archived: false, limit: 1,
-            cursor: listPosition, sortKey: 'created_at', sortDirection: 'desc'}, undefined, signal);
+            cursor: listPosition, sortKey: 'created_at', sortDirection: 'desc', useStateDbOnly: true}, undefined, signal);
           listPosition = historyNext(page, listPosition, 1);
           const [row] = page.data;
           if (!validCodexRecordId(row?.id) || !scope.includes(row.cwd)) continue;
@@ -695,6 +695,7 @@ export function createCodexClient({command, socket, loopback} = {}) {
     async readThread(scope, id, cursor) {
       const {rpc, thread} = await scopedThread(scope, id);
       const result = await recentTurns(rpc, id, cursor);
+      await scopedThread([thread.cwd], id, rpc);
       const turns = items(result.data).map(turn => {
         const startedAt = iso(turn.startedAt);
         const completedAt = iso(turn.completedAt);

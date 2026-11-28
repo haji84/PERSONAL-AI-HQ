@@ -596,6 +596,13 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       if (post && portfolio.discoveredProjects.has(projectId)) throw error(409, '先にこの案件の作業先と実行権限を登録してください。');
       throw error(404, '案件を見つけられませんでした。');
     }
+    const confirmCodexWorkspace = () => {
+      if (!signedIn()) throw error(401, 'サインインが必要です。');
+      const current = readCurrentProject(directory, project.id);
+      if (!current || current.cwd.length !== project.cwd.length || current.cwd.some(cwd => !project.cwd.includes(cwd))) {
+        throw error(404, 'この案件のCodex接続情報がありません。');
+      }
+    };
     if (get && route === '/api/execution/activity') {
       if (target.searchParams.getAll('project').length !== 1) throw error(404, '案件を見つけられませんでした。');
       const watch = target.searchParams.getAll('native').includes('1') ? activityWatches(target.searchParams) : null;
@@ -858,11 +865,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
         const result = await native.searchHistory(project.cwd, query, cursor, {signal});
         if (response.destroyed) return;
         signal.throwIfAborted();
-        if (!signedIn()) throw error(401, 'サインインが必要です。');
-        const current = readCurrentProject(directory, project.id);
-        if (!current || current.cwd.length !== project.cwd.length || current.cwd.some(cwd => !project.cwd.includes(cwd))) {
-          throw error(404, 'この案件のCodex接続情報がありません。');
-        }
+        confirmCodexWorkspace();
         return send(response, 200, result);
       } catch (problem) {
         if (response.destroyed) return;
@@ -879,6 +882,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       }
       const id = target.searchParams.get('id');
       const {desktopThreadId, ...view} = await native.readThread(project.cwd, id, target.searchParams.get('cursor'));
+      confirmCodexWorkspace();
       const managed = operations.managesThread(project, id);
       return send(response, 200, {...view, managed, ...(!remote && !managed && desktopThreadId === id ? {desktopThreadId} : {})});
     }
