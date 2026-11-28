@@ -64,16 +64,18 @@ export function createNativeArtifacts(directory, completedArtifactSource) {
     }
   }
 
-  async function verify(claim, includeBytes = false) {
+  async function verify(claim, downloadIndex, {signal: disconnect, reserveDownload} = {}) {
     try {
-      const signal = AbortSignal.timeout(12000);
+      const timeout = AbortSignal.timeout(12000);
+      const signal = disconnect ? AbortSignal.any([timeout, disconnect]) : timeout;
       const git = await readPublishedArtifactEvidence({checkout: claim.checkout, approvedRevision: claim.head,
-        paths: claim.evidence.map(file => file.path), includeBytes, workspaceProject: claim.project, signal});
+        paths: claim.evidence.map(file => file.path), downloadIndex, reserveDownload, workspaceProject: claim.project, signal});
       if (!git.files.every((file, index) => file.sha256 === claim.evidence[index].sha256)) return null;
-      const readback = await prepareArtifactEvidenceReadback({checkout: claim.checkout, head: git.head, files: claim.evidence,
+      const readback = await prepareArtifactEvidenceReadback({checkout: claim.checkout, head: git.head, files: git.files,
         archived: git.archived, workspaceProject: claim.project, signal});
       return readback ? {...git, readback} : null;
-    } catch {
+    } catch (error) {
+      if (error.code === 'CODEX_ARTIFACT_BUFFER_BUSY') throw error;
       return null;
     }
   }
@@ -100,13 +102,13 @@ export function createNativeArtifacts(directory, completedArtifactSource) {
       const following = offset + page.length;
       return {artifacts, nextOffset: following < candidates.length ? following : null};
     },
-    async artifact(project, id, index, part, review) {
+    async artifact(project, id, index, part, review, download) {
       const claim = published(project);
       if (!claim || claim.source.id !== id || claim.review !== review || !Number.isSafeInteger(index) || index < 0 ||
           index + 2 >= claim.evidence.length) throw notFound();
       const fileIndex = {requirements: 0, verification: 1, artifact: index + 2};
       if (!Object.hasOwn(fileIndex, part)) throw notFound();
-      const git = await verify(claim, true);
+      const git = await verify(claim, fileIndex[part], download);
       if (!git?.readback() || !stillPublished(claim)) throw notFound();
       const file = git.files[fileIndex[part]];
       return {bytes: file.bytes, name: basename(file.path)};

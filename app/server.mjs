@@ -46,6 +46,7 @@ const defaultRuntime = process.platform === 'win32'
 const browserPolicy = "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; media-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 const sessionAge = 8 * 60 * 60;
 const nativeObservationTimeout = 4000;
+const maxBufferedCodexArtifactBytes = 64 * 1024 * 1024;
 const nativeActivityWatch = /^([a-z0-9_-]{1,160}):([a-z0-9_-]{1,160})$/i;
 const error = (status, message) => Object.assign(new Error(message), {status});
 const apiMessages = {
@@ -227,6 +228,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
     prepareHandover: (...args) => apiWork.prepareNativeHandover(...args),
   });
   const nativeArtifacts = createNativeArtifacts(directory, operations.completedArtifactSource);
+  let bufferedCodexArtifactBytes = 0;
   const apiEnabled = Boolean(apiDevelopment);
   const apiOptions = apiEnabled && apiDevelopment !== true ? apiDevelopment : {};
   const withProjectWorkLock = (project, act) => operations.updateExecution(project, () => {
@@ -640,9 +642,29 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
           ['id', 'index', 'part', 'review'].some(key => target.searchParams.getAll(key).length !== 1))) {
         throw error(404, apiMessages.API_ARTIFACT_NOT_FOUND);
       }
-      const {bytes, name} = source.length
-        ? await nativeArtifacts.artifact(project, receipt, Number(value), part, target.searchParams.get('review'))
-        : await apiWork.artifact(project, receipt, Number(value));
+      let file;
+      if (source.length) {
+        if (response.destroyed) return;
+        const disconnect = new AbortController();
+        response.once('close', () => disconnect.abort());
+        file = await nativeArtifacts.artifact(project, receipt, Number(value), part, target.searchParams.get('review'), {
+          signal: disconnect.signal,
+          reserveDownload(size) {
+            disconnect.signal.throwIfAborted();
+            if (response.destroyed) throw new Error('Artifact download disconnected');
+            if (bufferedCodexArtifactBytes + size > maxBufferedCodexArtifactBytes) {
+              throw Object.assign(error(503, '大きな成果物を取得中です。取得が終わってから再試行してください。'),
+                {code: 'CODEX_ARTIFACT_BUFFER_BUSY'});
+            }
+            bufferedCodexArtifactBytes += size;
+            response.once('close', () => { bufferedCodexArtifactBytes -= size; });
+          },
+        });
+      } else {
+        file = await apiWork.artifact(project, receipt, Number(value));
+      }
+      const {bytes, name} = file;
+      if (response.destroyed) return;
       if (!signedIn()) throw error(401, 'サインインが必要です。');
       const encoded = encodeURIComponent(name).replace(/[!'()*]/g, char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
       response.writeHead(200, {'Content-Type': 'application/octet-stream', 'Content-Length': bytes.length,

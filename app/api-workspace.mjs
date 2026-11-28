@@ -10,6 +10,8 @@ const SANDBOX = '/usr/bin/sandbox-exec';
 const MAX_FILES = 24;
 const MAX_FILE_BYTES = 96 * 1024;
 const MAX_WORKSPACE_BYTES = 384 * 1024;
+const MAX_PUBLISHED_ARTIFACT_BYTES = 32 * 1024 * 1024;
+const MAX_PUBLICATION_BYTES = 64 * 1024 * 1024;
 const MAX_REVISIONS = 8;
 const VERIFY_TIMEOUT_MS = 15_000;
 const MAX_RUNNER_OUTPUT = 16 * 1024;
@@ -226,11 +228,74 @@ async function windowsCheckoutHead(checkout, signal) {
 
 function regularGitBlob(tree, name) {
   const [mode, actualPath] = tree.split('\t');
-  const blob = /^100(?:644|755) blob ([a-f0-9]{40}|[a-f0-9]{64})$/.exec(mode)?.[1];
+  const blob = /^100(?:644|755) blob ([a-f0-9]{40}|[a-f0-9]{64})(?: +\d+)?$/.exec(mode)?.[1];
   if (!blob || actualPath !== name + '\0') {
     throw new Error('API source must be a regular Git file');
   }
   return blob;
+}
+
+function publishedBlob(tree, name) {
+  const oid = regularGitBlob(tree, name);
+  const size = Number(/ +(\d+)\t/.exec(tree)?.[1]);
+  if (!Number.isSafeInteger(size)) throw new Error('Invalid approved artifact size');
+  return {oid, size};
+}
+
+async function hashArtifactStream(stream, size, includeBytes = false) {
+  const digest = createHash('sha256');
+  const bytes = includeBytes ? Buffer.alloc(size) : undefined;
+  let offset = 0;
+  for await (const chunk of stream) {
+    if (offset + chunk.length > size) throw new Error('Published artifact size changed during readback');
+    digest.update(chunk);
+    if (bytes) chunk.copy(bytes, offset);
+    offset += chunk.length;
+  }
+  if (offset !== size) throw new Error('Published artifact size changed during readback');
+  return {sha256: digest.digest('hex'), ...(bytes && {bytes})};
+}
+
+async function readLargeGitArtifact(checkout, {oid, size}, includeBytes, signal) {
+  const {executable, args, env} = readOnlyGitInvocation(checkout, ['cat-file', 'blob', oid]);
+  const child = spawn(executable, args, {env, signal, stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true});
+  const exited = new Promise(resolve => {
+    child.once('error', () => resolve(false));
+    child.once('close', code => resolve(code === 0));
+  });
+  try {
+    const result = await hashArtifactStream(child.stdout, size, includeBytes);
+    if (!await exited) throw new Error('Could not read the approved artifact from Git');
+    return result;
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+    await exited;
+  }
+}
+
+const evidenceFileStamp = stat => [stat.dev, stat.ino, stat.uid, stat.size, stat.ctimeNs, stat.mtimeNs];
+const sameEvidenceFile = (stat, stamp) => stat.isFile() && stat.nlink === 1n &&
+  evidenceFileStamp(stat).every((value, index) => value === stamp[index]);
+
+async function matchingLargeArtifact(checkout, name, size, sha256, ownerUid, signal) {
+  const {current} = await exactFile(checkout, name);
+  const named = await lstat(current, {bigint: true});
+  const stamp = evidenceFileStamp(named);
+  const handle = await open(current, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+  try {
+    const before = await handle.stat({bigint: true});
+    if (!named.isFile() || !sameEvidenceFile(before, stamp) ||
+        (ownerUid !== undefined && before.uid !== BigInt(ownerUid)) || before.size !== BigInt(size)) {
+      throw new Error('Approved artifact changed since Git HEAD');
+    }
+    const stream = handle.createReadStream({autoClose: false, start: 0, signal});
+    const readback = await hashArtifactStream(stream, size);
+    const after = await handle.stat({bigint: true});
+    if (readback.sha256 !== sha256 || !sameEvidenceFile(after, stamp)) {
+      throw new Error('Approved artifact changed since Git HEAD');
+    }
+    return stamp;
+  } finally { await handle.close(); }
 }
 
 async function committedFile(checkout, baseSha, name, tree, { ownerUid, signal } = {}) {
@@ -255,7 +320,7 @@ export function readPublishedArtifactEvidence(options) {
   return readGitEvidence(options, approvedRevision);
 }
 
-async function readGitEvidence({ checkout, paths, signal, includeBytes = false, workspaceProject }, approvedRevision) {
+async function readGitEvidence({checkout, paths, signal, includeBytes = false, workspaceProject, downloadIndex, reserveDownload}, approvedRevision) {
   signal?.throwIfAborted();
   if (!Array.isArray(paths) || paths.length === 0 || paths.length > MAX_FILES) {
     throw new Error('A bounded list of committed API evidence paths is required');
@@ -285,15 +350,34 @@ async function readGitEvidence({ checkout, paths, signal, includeBytes = false, 
   }
   const files = [];
   let size = 0;
-  for (const name of names) {
+  for (const [index, name] of names.entries()) {
     signal?.throwIfAborted();
-    const tree = (await readGit(checkout, ['ls-tree', '-z', revision, '--', name], signal)).toString('utf8');
+    const treeArgs = ['ls-tree', ...(approvedRevision ? ['-l'] : []), '-z', revision, '--', name];
+    const tree = (await readGit(checkout, treeArgs, signal)).toString('utf8');
+    const maxTotal = approvedRevision ? MAX_PUBLICATION_BYTES : MAX_WORKSPACE_BYTES;
+    const blob = approvedRevision ? publishedBlob(tree, name) : null;
+    const keepBytes = approvedRevision ? downloadIndex === index : includeBytes;
+    if (blob) {
+      // The first two files are the requirements and verification record.
+      const limit = index < 2 ? MAX_FILE_BYTES : MAX_PUBLISHED_ARTIFACT_BYTES;
+      if (blob.size > limit || size + blob.size > maxTotal) throw new Error('Published artifacts exceed their size limit');
+      if (blob.size > MAX_FILE_BYTES) {
+        if (keepBytes) reserveDownload?.(blob.size);
+        const file = await readLargeGitArtifact(checkout, blob, keepBytes, signal);
+        const workspaceStamp = archived ? undefined : await matchingLargeArtifact(checkout, name, blob.size, file.sha256, ownerUid, signal);
+        files.push({path: name, ...file, workspaceStamp});
+        size += blob.size;
+        continue;
+      }
+    }
     const bytes = archived
-      ? await readGit(checkout, ['cat-file', 'blob', regularGitBlob(tree, name)], signal)
-      : await committedFile(checkout, head, name, tree, { ownerUid, signal });
+      ? await readGit(checkout, ['cat-file', 'blob', blob.oid], signal)
+      : await committedFile(checkout, head, name, tree, {ownerUid, signal});
     size += bytes.length;
-    if (bytes.length > MAX_FILE_BYTES || size > MAX_WORKSPACE_BYTES) throw new Error('Committed API evidence exceeds its size limit');
-    files.push({ path: name, sha256: hash(bytes), ...(includeBytes ? {bytes} : {}) });
+    if (bytes.length > MAX_FILE_BYTES || size > maxTotal || (blob && bytes.length !== blob.size)) {
+      throw new Error('Committed API evidence exceeds its size limit');
+    }
+    files.push({path: name, sha256: hash(bytes), ...(keepBytes ? {bytes} : {})});
   }
   signal?.throwIfAborted();
   if (await readHead(checkout, signal) !== head) throw new Error('API evidence Git HEAD changed during readback');
@@ -353,17 +437,25 @@ export function checkedEvidenceIsCurrent({ checkout, head, files, requireClean =
 }
 
 export async function prepareArtifactEvidenceReadback({ checkout, head, files, workspaceProject, signal, archived = false }) {
-  if (!windows) return () => !signal?.aborted && checkedEvidenceIsCurrent({checkout, head, files: archived ? [] : files});
   try {
-    const evidence = archived ? [] : evidenceEntries(files);
-    const names = evidence.map(({name}) => name);
-    await checkWindowsEvidenceScope(checkout, names, workspaceProject, signal);
-    if (!archived && await windowsCheckoutHead(checkout, signal) !== head) return null;
+    const evidence = archived ? [] : files.map(file => ({...file, name: sourcePath(file.path)}));
+    const owner = process.getuid?.();
+    if (windows) await checkWindowsEvidenceScope(checkout, evidence.map(({name}) => name), workspaceProject, signal);
+    else if (owner === undefined) return null;
     // A listing can wait for other projects after this check. Recheck the archived checkout or working bytes at publication.
     return () => {
       try {
-        return !signal?.aborted && workspaceMarkerMatches(checkout, workspaceProject) &&
-          (archived ? checkoutHead(checkout) === head : matchingEvidence(checkout, evidence));
+        if (signal?.aborted || realpathSync(canonicalApiWorkspacePath(checkout)) !== checkout ||
+            (windows && !workspaceMarkerMatches(checkout, workspaceProject)) || checkoutHead(checkout) !== head) return false;
+        const sameFiles = evidence.every(({name, sha256, workspaceStamp}) => {
+          if (!workspaceStamp) return hash(checkedEvidenceBytes(checkout, name, owner, MAX_FILE_BYTES)) === sha256;
+          const file = path.join(checkout, name);
+          if (realpathSync(file) !== file) return false;
+          const fd = openSync(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+          try { return sameEvidenceFile(fstatSync(fd, {bigint: true}), workspaceStamp); }
+          finally { closeSync(fd); }
+        });
+        return sameFiles && checkoutHead(checkout) === head;
       } catch { return false; }
     };
   } catch { return null; }
