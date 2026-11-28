@@ -55,6 +55,7 @@ const ui = {
   threadIds: new Map(Object.entries(savedTab.threadIds ?? {})),
   options: new Map(Object.entries(saved.modelOptions ?? {})),
   scroll: new Map(Object.entries(savedTab.scroll ?? {})),
+  artifactReading: new Map(),
   drafts: new Map(Object.entries(savedTab.drafts ?? {})),
   attachmentDrafts: new Map(),
   searches: new Map(Object.entries(savedTab.searches ?? {})),
@@ -208,21 +209,35 @@ function projectList() {
 function selectedProject() {
   return projectList().find(item => item.id === ui.project);
 }
+function artifactFilterScope(project) {
+  return project && ui.searches.get('artifact-filter') === 'project' ? 'project' : 'all';
+}
 function routeKey(viewName = ui.view, project = ui.project) {
-  return viewName + ':' + project;
+  const key = viewName + ':' + project;
+  return viewName === 'artifacts' ? key + ':' + artifactFilterScope(project) : key;
 }
 function rememberScroll() {
   ui.scroll.set(routeKey(), scrollY);
   storeTab();
 }
-function restoreScroll() {
+function queueViewScroll() {
+  const key = routeKey();
+  const oldArtifactKey = 'artifacts:' + ui.project;
+  if (ui.view === 'artifacts' && ui.scroll.has(oldArtifactKey)) {
+    if (!ui.scroll.has(key)) ui.scroll.set(key, ui.scroll.get(oldArtifactKey));
+    ui.scroll.delete(oldArtifactKey);
+  }
+  const y = ui.scroll.get(key);
+  return {epoch: mounted, y: Number.isFinite(y) ? y : 0};
+}
+function restoreScroll({waitForContent = false} = {}) {
   const desired = pendingScroll;
   if (!desired) return;
   requestAnimationFrame(() => {
     if (pendingScroll !== desired || desired.epoch !== mounted) return;
     const allowed = Math.max(0, document.documentElement.scrollHeight - innerHeight);
     window.scrollTo(0, Math.min(allowed, desired.y));
-    if (allowed >= desired.y) pendingScroll = null;
+    if (!waitForContent && allowed >= desired.y) pendingScroll = null;
   });
 }
 function selectProject(id, reveal = false) {
@@ -318,6 +333,11 @@ function endSession() {
   activitySession = undefined;
   resources.clear();
   ui.attachmentDrafts.clear();
+  ui.artifactReading.clear();
+  for (const key of ui.scroll.keys()) {
+    if (key.startsWith('artifacts:')) ui.scroll.delete(key);
+  }
+  storeTab();
   ui.portfolio = null;
   appHostObservation = undefined;
   dom.content.replaceChildren();
@@ -5385,12 +5405,12 @@ function codex() {
   showThread();
 }
 function artifacts() {
+  const project = ui.project;
   const registered = asArray(ui.portfolio?.artifacts);
   const sources = [
     {label: '通常API', name: undefined, files: new Map(), offset: 0, pages: 0},
     {label: 'Codex', name: 'codex', files: new Map(), offset: 0, pages: 0},
   ];
-  const openProof = new Set();
   let generation = 0;
   const section = panel('確認済みの成果物');
   const scope = node('label', 'picker artifact-filter');
@@ -5401,14 +5421,23 @@ function artifacts() {
   one.value = 'project';
   only.append(every, one);
   only.disabled = !ui.project;
-  only.value = ui.searches.get('artifact-filter') === 'project' && ui.project ? 'project' : 'all';
+  only.value = artifactFilterScope(project);
   only.setAttribute('aria-label', '成果物の表示対象');
   scope.append(only);
   section.header.append(scope);
   const list = node('ul', 'rows');
   const empty = node('p', 'empty');
   const searchWrap = node('div', 'search-wrap');
+  function readingForScope() {
+    const key = routeKey('artifacts', project);
+    if (!ui.artifactReading.has(key)) {
+      ui.artifactReading.set(key, {openProofs: new Set(), pages: new Map()});
+    }
+    return ui.artifactReading.get(key);
+  }
+  let reading = readingForScope();
   function proofFor(artifact) {
+    const {openProofs} = reading;
     const actions = [['要件', artifact.evidence?.requirements], ['検証記録', artifact.evidence?.verification]]
       .flatMap(([label, proof]) => {
         if (typeof proof?.path !== 'string' || !proof.path) return [];
@@ -5421,10 +5450,11 @@ function artifacts() {
     const proof = node('ul', 'marked-list');
     proof.append(...actions);
     details.append(proof);
-    details.open = openProof.has(artifact.href);
+    details.open = openProofs.has(artifact.href);
     details.addEventListener('toggle', () => {
-      if (details.open) openProof.add(artifact.href);
-      else openProof.delete(artifact.href);
+      if (!details.isConnected) return;
+      if (details.open) openProofs.add(artifact.href);
+      else openProofs.delete(artifact.href);
     });
     return details;
   }
@@ -5473,7 +5503,8 @@ function artifacts() {
   for (const source of sources) {
     source.more = button('以前の' + source.label + '成果物を表示', () => loadWork(source));
     source.more.hidden = true;
-    source.retry = button(source.label + 'の成果物を再取得', () => loadWork(source, {refresh: source.refreshFailed}));
+    source.retry = button(source.label + 'の成果物を再取得', () => retryWork(source));
+    source.retry.dataset.continueScroll = '';
     source.retry.hidden = true;
     source.status = node('p', 'muted small');
     source.status.setAttribute('role', 'status');
@@ -5520,14 +5551,18 @@ function artifacts() {
       source.files = files;
       source.offset = offset;
       source.pages = (refresh ? 0 : source.pages) + loaded;
+      const previousPages = reading.pages.get(source.name) ?? 0;
+      reading.pages.set(source.name, offset === null ? source.pages : Math.max(source.pages, previousPages));
       source.more.hidden = source.offset === null;
       source.status.hidden = source.retry.hidden = true;
       if (changed) filter(search.value, refresh);
+      return true;
     } catch (error) {
       if (!current()) return;
       if (error.status === 403 || error.status === 404) {
         source.files.clear();
         source.offset = source.pages = 0;
+        reading.pages.delete(source.name);
         filter(search.value, refresh);
       }
       source.refreshFailed = refresh;
@@ -5541,11 +5576,39 @@ function artifacts() {
       }
     }
   }
-  const search = queryInput('artifact-search', '成果物を検索', '成果物を検索', filter);
+  async function loadReadingPages(source, pages) {
+    while (source.pages < pages && source.offset !== null) {
+      if (!await loadWork(source)) return false;
+    }
+    return true;
+  }
+  async function loadPreviousPages() {
+    const generationAtStart = generation;
+    const loaded = await Promise.all(sources.map(source => loadReadingPages(source, reading.pages.get(source.name) ?? 1)));
+    if (section.root.isConnected && generation === generationAtStart) {
+      restoreScroll({waitForContent: loaded.includes(false)});
+    }
+  }
+  async function retryWork(source) {
+    if (source.refreshFailed) return loadWork(source, {refresh: true});
+    const generationAtStart = generation;
+    const previousPages = reading.pages.get(source.name) ?? 0;
+    const loaded = await loadReadingPages(source, Math.max(source.pages + 1, previousPages));
+    if (section.root.isConnected && generation === generationAtStart) {
+      restoreScroll({waitForContent: !loaded});
+    }
+  }
+  const search = queryInput('artifact-search', '成果物を検索', '成果物を検索', query => {
+    pendingScroll = null;
+    filter(query);
+  });
   only.addEventListener('change', () => {
+    rememberScroll();
     ui.searches.set('artifact-filter', only.value);
     storeTab();
     generation++;
+    reading = readingForScope();
+    pendingScroll = queueViewScroll();
     for (const source of sources) {
       source.request?.abort();
       source.request = null;
@@ -5555,14 +5618,15 @@ function artifacts() {
       source.files.clear();
     }
     filter(search.value);
-    for (const source of sources) void loadWork(source);
+    restoreScroll({waitForContent: true});
+    void loadPreviousPages();
   });
   searchWrap.append(search);
   section.body.remove();
   section.root.append(searchWrap, empty, list, controls);
   dom.content.append(section.root);
   filter(search.value);
-  for (const source of sources) void loadWork(source);
+  void loadPreviousPages();
   const interval = window.setInterval(() => {
     if (canRefreshWork()) for (const source of sources) void loadWork(source, {refresh: true, automatic: true});
   }, 30000);
@@ -5591,8 +5655,7 @@ function render(restore = true, keepNotice = false) {
   stopSpeech();
   for (const stop of runViewCleanups) stop();
   mounted++;
-  const intended = ui.scroll.get(routeKey());
-  pendingScroll = restore ? {epoch: mounted, y: Number.isFinite(intended) ? intended : 0} : null;
+  pendingScroll = restore ? queueViewScroll() : null;
   if (!keepNotice) setNotice();
   dom.content.replaceChildren();
   for (const anchor of dom.navigation.querySelectorAll('[data-view]')) {
@@ -5613,7 +5676,7 @@ function render(restore = true, keepNotice = false) {
   syncChatDevelopment();
   paintActivity();
   void pollActivity();
-  if (restore) restoreScroll();
+  if (restore) restoreScroll({waitForContent: ui.view === 'artifacts'});
 }
 function canRefreshVisibleDashboard() {
   if (connectionState === 'offline' || connectionState === 'checking') return false;
@@ -5761,8 +5824,13 @@ window.addEventListener('offline', () => {
 window.addEventListener('online', () => {
   if (connectionState !== 'connected') void recheckConnection();
 });
-for (const input of ['wheel', 'touchstart', 'pointerdown', 'keydown']) {
-  window.addEventListener(input, () => { pendingScroll = null; }, {passive: true});
+for (const input of ['wheel', 'touchstart', 'touchmove', 'pointerdown', 'keydown']) {
+  window.addEventListener(input, event => {
+    const activatesButton = input === 'pointerdown' || input === 'touchstart' ||
+      (input === 'keydown' && (event.key === 'Enter' || event.key === ' '));
+    if (activatesButton && event.target?.closest?.('button[data-continue-scroll]')) return;
+    pendingScroll = null;
+  }, {passive: true});
 }
 window.addEventListener('pagehide', () => {
   abortLocalDictation();
