@@ -2165,7 +2165,6 @@ function directChatWork(project, conversation, current, reviewed, openWork, refr
     busy = true;
     notFound = false;
     paint();
-    const generation = connectionGeneration;
     const {attempted, conversation:source, ...input} = saved;
     if (post) {
       ui.runIntents.set(key,{...saved,attempted:true});
@@ -2176,7 +2175,8 @@ function directChatWork(project, conversation, current, reviewed, openWork, refr
       const result = await (post ? api(apiPath('/api/chat/handoff',{project,id:source}),{
         method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(input),signal:AbortSignal.timeout(24000),
       }) : api(apiPath('/api/chat/codex-work',{project,id:source,receipt:input.id}),{signal:AbortSignal.timeout(12000)}));
-      if (!active() || generation !== connectionGeneration || intent()?.id !== input.id) return;
+      // A successful receipt read can trigger a connection check itself.
+      if (!active() || intent()?.id !== input.id) return;
       if (!post && Array.isArray(result?.works) && result.works.length === 0) {
         notFound = true;
         status.textContent = 'この受付は確認できません。同じ番号で再送するか、元の会話を更新してから再照合できます。';
