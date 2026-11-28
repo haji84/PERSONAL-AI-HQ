@@ -48,7 +48,7 @@ test('a new runtime is private under the actual host permission model and can be
   if (process.platform !== 'win32') assert.equal((await fs.stat(directory)).mode & 0o077, 0);
 });
 
-test('Windows binds a new runtime to the user and leaves an existing admin-owned runtime unchanged',
+test('Windows creates an owner-private runtime and leaves an existing admin-owned runtime unchanged',
   { skip: process.platform !== 'win32' }, async t => {
     const root = await fixture(t);
     const existing = path.join(root, 'existing'), runtime = path.join(root, 'runtime');
@@ -58,7 +58,7 @@ test('Windows binds a new runtime to the user and leaves an existing admin-owned
         $ErrorActionPreference = 'Stop'
         $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
         $acl = [IO.Directory]::GetAccessControl($env:HQ_TEST_ACL_DIRECTORY)
-        [Console]::Out.Write((@{user=$identity.User.Value; defaultOwner=$identity.Owner.Value;
+        [Console]::Out.Write((@{user=$identity.User.Value;
           owner=$acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value;
           protected=$acl.AreAccessRulesProtected; sddl=$acl.Sddl} | ConvertTo-Json -Compress))
       `, { HQ_TEST_ACL_DIRECTORY: directory });
@@ -71,15 +71,12 @@ test('Windows binds a new runtime to the user and leaves an existing admin-owned
       assert.deepEqual(await acl(existing), baseline);
       assert.deepEqual(await fs.readdir(existing), []);
     }
-    assert.equal(await ensurePrivateDirectory(runtime), runtime);
+    const openings = await Promise.all([ensurePrivateDirectory(runtime), ensurePrivateDirectory(runtime)]);
+    assert.deepEqual(openings, [runtime, runtime]);
     const hardened = await acl(runtime);
     assert.equal(hardened.owner, hardened.user);
-    if (baseline.defaultOwner === adminSid && baseline.owner === adminSid && baseline.user !== adminSid) {
-      assert.equal(hardened.protected, true);
-      const backup = JSON.parse(await fs.readFile(path.join(runtime, '.runtime-acl-backup.json'), 'utf8'));
-      assert.equal(backup.scope, 'new-runtime-directory-only');
-      assert.equal(backup.afterSddl, hardened.sddl);
-    }
+    assert.equal(hardened.protected, true);
+    assert.deepEqual(await fs.readdir(runtime), []);
     await ensurePrivateDirectory(runtime);
     assert.deepEqual(await acl(runtime), hardened);
   });

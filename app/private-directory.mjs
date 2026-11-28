@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { constants, lstatSync, realpathSync } from 'node:fs';
-import { lstat, mkdir, open, realpath, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, open, realpath } from 'node:fs/promises';
 import { dirname, isAbsolute, join, resolve, win32 } from 'node:path';
 import { promisify } from 'node:util';
 
@@ -10,8 +10,7 @@ const powershell = () => join(process.env.SystemRoot ?? 'C:\\Windows', 'System32
 const windowsOwnerACL = `
 $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
 $currentSid = $identity.User.Value
-$administratorsSid = 'S-1-5-32-544'
-$trusted = @($currentSid, 'S-1-5-18', $administratorsSid)
+$trusted = @($currentSid, 'S-1-5-18', 'S-1-5-32-544')
 function Test-Private($acl) {
   if ($acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $currentSid) { return $false }
   $descriptor = [System.Security.AccessControl.RawSecurityDescriptor]::new($acl.GetSecurityDescriptorBinaryForm(), 0)
@@ -23,25 +22,15 @@ function Test-Private($acl) {
   return $true
 }
 `;
-// Paths are passed as data in the child environment, never interpolated into
-// PowerShell. Only a newly created empty runtime may receive a narrower DACL.
+// Windows applies the owner and DACL at creation, leaving any existing directory alone.
 const windowsCheck = `
 $ErrorActionPreference = 'Stop'
 $directory = $env:PERSONAL_AI_HQ_DIRECTORY_CHECK
 ${windowsOwnerACL}
 $item = [IO.DirectoryInfo]::new($directory)
-if (-not $item.Exists -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Invalid runtime' }
-$before = [IO.Directory]::GetAccessControl($directory)
-$changed = $false
-if (-not (Test-Private $before)) {
-  if ($env:PERSONAL_AI_HQ_DIRECTORY_CREATED -ne '1') { throw 'Runtime is not private' }
-  $observedOwner = $before.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
-  # The token default can assign the Administrators group to a directory just created by this user.
-  if ($observedOwner -ne $currentSid -and
-      ($observedOwner -ne $administratorsSid -or $identity.Owner.Value -ne $administratorsSid)) { throw 'Runtime is not private' }
-  for ($entry = $item; $null -ne $entry; $entry = $entry.Parent) {
-    $entry.Refresh()
-    if (-not $entry.Exists -or ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Invalid runtime' }
+if (-not $item.Exists) {
+  for ($entry = $item.Parent; $null -ne $entry; $entry = $entry.Parent) {
+    if ($entry.Exists -and ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Invalid runtime' }
   }
   $restricted = [System.Security.AccessControl.DirectorySecurity]::new()
   $restricted.SetOwner($identity.User)
@@ -50,17 +39,12 @@ if (-not (Test-Private $before)) {
     $rule = [System.Security.AccessControl.FileSystemAccessRule]::new([System.Security.Principal.SecurityIdentifier]::new($sid), [System.Security.AccessControl.FileSystemRights]::FullControl, [System.Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit', [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow)
     $restricted.AddAccessRule($rule)
   }
-  $entries = $item.EnumerateFileSystemInfos().GetEnumerator()
-  try { if ($entries.MoveNext()) { throw 'New runtime is not empty' } }
-  finally { $entries.Dispose() }
+  $item.Create($restricted)
   $item.Refresh()
-  if (-not $item.Exists -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
-      ([IO.Directory]::GetAccessControl($directory)).Sddl -cne $before.Sddl) { throw 'Runtime changed during setup' }
-  [IO.Directory]::SetAccessControl($directory, $restricted)
-  if (-not (Test-Private ([IO.Directory]::GetAccessControl($directory)))) { throw 'Runtime remains accessible' }
-  $changed = $true
 }
-[Console]::Out.Write((@{private=$true; changed=$changed; beforeSddl=$before.Sddl; afterSddl=([IO.Directory]::GetAccessControl($directory)).Sddl} | ConvertTo-Json -Compress))
+if (-not $item.Exists -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+    -not (Test-Private ([IO.Directory]::GetAccessControl($directory)))) { throw 'Runtime is not private' }
+[Console]::Out.Write('private')
 `;
 const windowsFileCheck = `
 $ErrorActionPreference = 'Stop'
@@ -163,27 +147,21 @@ export async function assertWindowsPrivateWorkspace(directory, relativeFiles, si
 
 export async function ensurePrivateDirectory(input) {
   const directory = resolve(input);
-  let created = false;
-  await mkdir(dirname(directory), { recursive: true, mode: 0o700 });
-  try { await mkdir(directory, { mode: 0o700 }); created = true; }
-  catch (error) { if (error.code !== 'EEXIST') throw error; }
-  const stat = await lstat(directory);
-  if (!stat.isDirectory() || stat.isSymbolicLink()) throw invalid();
   if (process.platform !== 'win32') {
-    if ((stat.mode & 0o077) !== 0 || (process.getuid && stat.uid !== process.getuid())) throw invalid();
+    await mkdir(dirname(directory), { recursive: true, mode: 0o700 });
+    try { await mkdir(directory, { mode: 0o700 }); }
+    catch (error) { if (error.code !== 'EEXIST') throw error; }
+    const stat = await lstat(directory);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0 ||
+      (process.getuid && stat.uid !== process.getuid())) throw invalid();
     return directory;
   }
   try {
     const { stdout } = await execute(powershell(), ['-NoProfile', '-NonInteractive', '-Command', windowsCheck], {
-      windowsHide: true, timeout: 10_000, maxBuffer: 16_384,
-      env: { ...process.env, PERSONAL_AI_HQ_DIRECTORY_CHECK: directory, PERSONAL_AI_HQ_DIRECTORY_CREATED: created ? '1' : '0' },
+      windowsHide: true, timeout: 10_000, maxBuffer: 1024,
+      env: { ...process.env, PERSONAL_AI_HQ_DIRECTORY_CHECK: directory },
     });
-    const result = JSON.parse(stdout.trim());
-    if (result.private !== true) throw invalid();
-    if (result.changed) await writeFile(join(directory, '.runtime-acl-backup.json'), JSON.stringify({
-      createdAt: new Date().toISOString(), scope: 'new-runtime-directory-only',
-      beforeSddl: result.beforeSddl, afterSddl: result.afterSddl,
-    }), { flag: 'wx', mode: 0o600 });
+    if (stdout.trim() !== 'private') throw invalid();
     return directory;
   } catch (cause) {
     const problem = invalid();
