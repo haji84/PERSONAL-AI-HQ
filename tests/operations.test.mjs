@@ -505,6 +505,102 @@ test('native completion wins over a pending cancellation and stale receipts cann
     {status: 409, code: 'CODEX_RESUME_TARGET_UNAVAILABLE'});
 });
 
+test('native work measurements follow the exact receipt and retain thread totals after restart', async t => {
+  t.mock.timers.enable({apis:['Date'], now:new Date('2026-05-01T10:00:00Z')});
+  const {project, open} = await fixture(t);
+  const native = {
+    onEvent(listener) { native.emit = listener; },
+    async models() { return {data:[{id:'fixture-model',reasoningEfforts:[{reasoningEffort:'low'}]}]}; },
+    async submit(input) {
+      await input.beforeTurn();
+      assert.equal(input.onThread('measured-thread'),true);
+      return {turn:{id:input.requestId + '-turn',status:'inProgress'}};
+    },
+  };
+  const operations = open(native);
+  const id = 'measured-operation';
+  const turnId = id + '-turn';
+  await operations.start(project,{id,prompt:'Measure this fixture',model:'fixture-model',effort:'low'});
+  await waitForPhase(operations,project,id,'running');
+  const usage = (usingThread, usingTurn, inputTokens, outputTokens, totalTokens = inputTokens + outputTokens) => {
+    native.emit('thread/tokenUsage/updated',{threadId:usingThread,turnId:usingTurn,tokenUsage:{
+      total:{inputTokens,outputTokens,totalTokens},
+      last:{inputTokens:2,outputTokens:1,totalTokens:3},
+    }});
+  };
+  usage('measured-thread',turnId,45,5);
+  usage('unrelated-thread',turnId,9000,10);
+  usage('measured-thread','unrelated-turn',9000,10);
+  usage('measured-thread',turnId,44,6);
+  usage('measured-thread',turnId,200,50,251);
+  t.mock.timers.tick(2460);
+  native.emit('turn/completed',{threadId:'measured-thread',turn:{id:turnId,status:'completed',startedAt:1777629600,
+    completedAt:1777629602,durationMs:2460}});
+  usage('measured-thread',turnId,49,6);
+  operations.close();
+  const restarted = open(native);
+  const {operation} = await restarted.read(project,id);
+  assert.deepEqual(operation.measurement,{
+    requestedModel:'fixture-model',requestedReasoningEffort:'low',
+    startedAt:'2026-05-01T10:00:00.000Z',completedAt:'2026-05-01T10:00:02.000Z',durationMs:2460,
+    tokens:{scope:'codex-thread',inputTokens:49,outputTokens:6,totalTokens:55,observedAt:'2026-05-01T10:00:02.460Z'},
+  });
+  assert.deepEqual(restarted.recentOutcomes([project],Date.now())[0].measurement,operation.measurement);
+  assert.equal(restarted.recentOutcomes([{...project,cwd:[]}],Date.now()).length,0);
+});
+
+test('native work timing can be recovered from an exact terminal turn after a missed notification', async t => {
+  t.mock.timers.enable({apis:['Date'], now:new Date('2026-05-01T10:00:00Z')});
+  const {project, open} = await fixture(t);
+  const id = 'measured-after-restart';
+  const operations = open({async submit(input) {
+    await input.beforeTurn();
+    assert.equal(input.onThread('recover-timing-thread'), true);
+    return {turn:{id:'recover-timing-turn',status:'inProgress'}};
+  }});
+  await operations.start(project,{id,prompt:'Measure this fixture'});
+  await waitForPhase(operations,project,id,'running');
+  operations.close();
+  t.mock.timers.tick(20_000);
+  let readback = {id:'other-turn',status:'completed',nativeTiming:{startedAt:'2026-05-01T10:00:00.000Z',
+    completedAt:'2026-05-01T10:00:07.000Z',durationMs:7200}};
+  const restarted = open({async findSubmission() { return readback; }});
+  assert.equal((await restarted.read(project,id)).operation.measurement,undefined);
+  readback = {...readback,id:'recover-timing-turn'};
+  t.mock.timers.tick(16_000);
+  const {operation} = await restarted.read(project,id);
+  assert.equal(operation.phase,'completed');
+  assert.deepEqual(operation.measurement,readback.nativeTiming);
+});
+
+test('conflicting native turn identities cannot attach measurements to either receipt', async t => {
+  const {project, open, database} = await fixture(t);
+  let emit;
+  const operations = open({onEvent(listener) { emit = listener; }, async submit(input) {
+    await input.beforeTurn();
+    assert.equal(input.onThread('conflicting-thread'),true);
+    return {turn:{id:'conflicting-turn',status:'inProgress'}};
+  }});
+  const id = 'original-measurement';
+  await operations.start(project,{id,prompt:'Measure this fixture'});
+  await waitForPhase(operations,project,id,'running');
+  const db = database();
+  try {
+    db.prepare(`INSERT INTO codex_operations(id,project,workspace,fingerprint,phase,threadId,turnId,createdAt,updatedAt)
+      SELECT 'unrelated-receipt','unrelated-project',workspace,fingerprint,phase,threadId,turnId,createdAt,updatedAt
+      FROM codex_operations WHERE project=? AND id=?`).run(project.id,id);
+    const epoch = Math.floor(Date.now()/1000);
+    emit('turn/completed',{threadId:'conflicting-thread',turn:{id:'conflicting-turn',status:'completed',
+      startedAt:epoch - 2,completedAt:epoch,durationMs:2000}});
+    emit('thread/tokenUsage/updated',{threadId:'conflicting-thread',turnId:'conflicting-turn',tokenUsage:{
+      total:{inputTokens:20,outputTokens:10,totalTokens:30},
+    }});
+    assert.deepEqual(db.prepare('SELECT phase,measurement FROM codex_operations ORDER BY project').all()
+      .map(row=>[row.phase,row.measurement]),[['running',null],['running',null]]);
+    assert.equal((await operations.read(project,id)).operation.measurement,undefined);
+  } finally { db.close(); }
+});
+
 test('selected thread reads and continuations remain tied to that thread and its latest receipt', async t => {
   const {project, open} = await fixture(t);
   const sent = [];

@@ -6,7 +6,7 @@ import {ROUTES, STAGES} from './execution-policy.mjs';
 import {validatedDocument} from './text-attachment.mjs';
 import {validatedImage} from './image-attachment.mjs';
 import {readCurrentProject} from './portfolio.mjs';
-import {observedWorkTime, workOutcomeLimit} from './work-outcomes.mjs';
+import {codexTurnTiming, measuredTokens, observedWorkTime, workOutcomeLimit} from './work-outcomes.mjs';
 
 const active = new Set(['reserved', 'sending', 'running', 'interrupting', 'unconfirmed']);
 const nativeTerminal = new Set(['completed', 'interrupted', 'failed']);
@@ -31,6 +31,22 @@ const freshUsage = observedAt => {
 const resumeUnavailable = () => problem(409, 'このスレッドの最新の作業を照合できません。', 'CODEX_RESUME_TARGET_UNAVAILABLE');
 const phase = value => nativeTerminal.has(value) ? value : value === 'inProgress' ? 'running' : null;
 const visiblePhase = row => row.cancellationRequestedAt && active.has(row.phase) ? 'cancelling' : row.phase;
+const observedChoice = value => typeof value === 'string' && /^[a-z0-9][a-z0-9_.:/-]{0,159}$/i.test(value);
+
+function savedMeasurement(value) {
+  if (!value) return null;
+  try {
+    const result = JSON.parse(value);
+    const {requestedModel, requestedReasoningEffort, startedAt, completedAt, durationMs, tokens:usage} = result;
+    const tokens = usage?.scope === 'codex-thread' && observedWorkTime(usage.observedAt,Date.now()) &&
+      measuredTokens(usage.scope,usage.inputTokens,usage.outputTokens,usage.totalTokens);
+    return { ...(observedChoice(requestedModel) && {requestedModel}),
+      ...(observedChoice(requestedReasoningEffort) && {requestedReasoningEffort}),
+      ...(observedWorkTime(completedAt, Date.now()) && observedWorkTime(startedAt, Date.parse(completedAt)) && {
+        startedAt,completedAt, ...(Number.isSafeInteger(durationMs) && durationMs >= 0 && {durationMs}),
+      }), ...(tokens && {tokens:{...tokens,observedAt:usage.observedAt}})};
+  } catch { return null; }
+}
 
 export function createOperations(directory, native, execution, {prepareHandover, chatConversationForHandoff} = {}) {
   const db = new DatabaseSync(join(directory, 'conversations.sqlite'));
@@ -59,6 +75,7 @@ export function createOperations(directory, native, execution, {prepareHandover,
     if (!columns.includes('cancellationRequestedAt')) db.exec('ALTER TABLE codex_operations ADD COLUMN cancellationRequestedAt TEXT');
     if (!columns.includes('cancellationDispatchedAt')) db.exec('ALTER TABLE codex_operations ADD COLUMN cancellationDispatchedAt TEXT');
     if (!columns.includes('expectedThreadId')) db.exec('ALTER TABLE codex_operations ADD COLUMN expectedThreadId TEXT');
+    if (!columns.includes('measurement')) db.exec('ALTER TABLE codex_operations ADD COLUMN measurement TEXT');
     if (!columns.includes('interruptionDispatchedAt')) {
       db.exec('ALTER TABLE codex_operations ADD COLUMN interruptionDispatchedAt TEXT');
       // Old active pauses did not distinguish preflight from a possibly sent interrupt.
@@ -90,7 +107,7 @@ export function createOperations(directory, native, execution, {prepareHandover,
       cancellationRequestedAt,cancellationDispatchedAt
     FROM codex_operations WHERE project=?
     AND workspace IN (SELECT value FROM json_each(?)) ORDER BY createdAt DESC, rowid DESC LIMIT 1`);
-  const savedOutcomes = db.prepare(`SELECT id,phase,threadId,turnId,createdAt,updatedAt,startedAt,fingerprint
+  const savedOutcomes = db.prepare(`SELECT id,project,phase,threadId,turnId,createdAt,updatedAt,startedAt,fingerprint,measurement
     FROM codex_operations WHERE project=? AND workspace IN (SELECT value FROM json_each(?))
       AND phase IN ('completed','failed') ORDER BY updatedAt DESC, id`);
   const activeRun = db.prepare(`SELECT 1 FROM codex_operations WHERE project=? AND id IS NOT ?
@@ -105,7 +122,9 @@ export function createOperations(directory, native, execution, {prepareHandover,
   // A user item on an existing thread could have been added to another client's active turn.
   const byClientId = db.prepare(`SELECT * FROM codex_operations WHERE threadId=? AND id=? AND turnId IS NULL AND expectedThreadId IS NULL
     AND phase IN ('sending','unconfirmed') LIMIT 1`);
-  const byTurn = db.prepare('SELECT * FROM codex_operations WHERE threadId=? AND turnId=? LIMIT 1');
+  const byTurn = db.prepare(`SELECT * FROM codex_operations AS work WHERE threadId=?1 AND turnId=?2
+    AND NOT EXISTS (SELECT 1 FROM codex_operations AS other WHERE other.rowid<>work.rowid
+      AND other.threadId=?1 AND other.turnId=?2)`);
   const chatForTurn = db.prepare(`SELECT phase, chatConversationId FROM codex_operations
     WHERE project=? AND threadId=? AND turnId=? AND chatConversationId IS NOT NULL
     AND workspace IN (SELECT value FROM json_each(?)) LIMIT 2`);
@@ -124,17 +143,33 @@ export function createOperations(directory, native, execution, {prepareHandover,
     SELECT ?1,?2,?3,?4,'reserved',?5,?6,?7,?8,?9,?10,?12,?13 WHERE ?11 IS NULL OR EXISTS (
       SELECT 1 FROM codex_operations WHERE project=?1 AND id=?11 AND workspace=?3 AND threadId IS NOT NULL AND turnId IS NOT NULL
         AND phase IN ('completed','interrupted','failed'))`);
-  const setThread = db.prepare(`UPDATE codex_operations SET threadId=?,phase='sending',updatedAt=? WHERE project=? AND id=? AND phase='reserved'`);
+  const setThread = db.prepare(`UPDATE codex_operations SET threadId=?,phase='sending',updatedAt=?,measurement=?
+    WHERE project=? AND id=? AND phase='reserved'`);
   const expireReservation = db.prepare(`UPDATE codex_operations SET phase='failed',updatedAt=?
     WHERE project=? AND id=? AND phase='reserved' AND threadId IS NULL AND updatedAt<=?`);
   const markUnconfirmed = db.prepare(`UPDATE codex_operations SET phase='unconfirmed',updatedAt=?
     WHERE project=? AND id=? AND phase='sending' AND turnId IS NULL`);
-  const change = db.prepare(`UPDATE codex_operations SET phase=CASE
+  const change = db.prepare(`UPDATE codex_operations AS work SET phase=CASE
       WHEN ?1='interrupted' AND cancellationRequestedAt IS NOT NULL THEN 'cancelled'
       WHEN ?1='running' AND phase='interrupting' THEN 'interrupting' ELSE ?1 END,
-    turnId=coalesce(turnId,?2), updatedAt=?3, startedAt=coalesce(startedAt,?4)
+    turnId=coalesce(turnId,?2), updatedAt=?3, startedAt=coalesce(startedAt,?4),
+    measurement=CASE WHEN ?7 IS NULL OR ?2 IS NULL OR EXISTS (
+      SELECT 1 FROM codex_operations AS other WHERE other.rowid<>work.rowid
+      AND other.threadId=work.threadId AND other.turnId=?2
+    ) THEN measurement ELSE json_patch(
+      CASE WHEN json_valid(measurement) THEN measurement ELSE '{}' END, ?7) END
     WHERE project=?5 AND id=?6 AND phase NOT IN ('completed','interrupted','failed','cancelled')
     AND (turnId IS NULL OR ?2 IS NULL OR turnId=?2)`);
+  const recordUsage = db.prepare(`UPDATE codex_operations AS work SET measurement=json_patch(
+    CASE WHEN json_valid(measurement) THEN measurement ELSE '{}' END, ?1)
+    WHERE project=?2 AND id=?3 AND threadId=?4 AND turnId=?5
+    AND NOT EXISTS (SELECT 1 FROM codex_operations AS other WHERE other.rowid<>work.rowid
+      AND other.threadId=?4 AND other.turnId=?5)
+    AND CASE WHEN json_valid(measurement) THEN
+      coalesce(json_extract(measurement,'$.tokens.inputTokens'),-1)<=?6 AND
+      coalesce(json_extract(measurement,'$.tokens.outputTokens'),-1)<=?7 AND
+      coalesce(json_extract(measurement,'$.tokens.totalTokens'),-1)<?8
+    ELSE 1 END`);
   const append = db.prepare(`UPDATE codex_operations SET output=substr(output||?,1,48000), updatedAt=?
     WHERE project=? AND id=? AND phase NOT IN ('completed','interrupted','failed','cancelled')`);
   const beginInterrupt = db.prepare(`UPDATE codex_operations SET phase='interrupting',updatedAt=?
@@ -165,10 +200,20 @@ export function createOperations(directory, native, execution, {prepareHandover,
   const cancellationChecks = new Set();
   let closed = false;
 
-  function advance(row, state, turnId, startedAt = null, observedRunning = true) {
+  function receiptMeasurement(row) {
+    if (!row.measurement) return null;
+    if (row.turnId) {
+      const exact = !closed && byTurn.get(row.threadId,row.turnId);
+      if (!exact || exact.project !== row.project || exact.id !== row.id) return null;
+    }
+    return savedMeasurement(row.measurement);
+  }
+
+  function advance(row, state, turnId, {startedAt = null, observedRunning = true, timing = null} = {}) {
     if (closed || !row) return;
     const observedAt = timestamp();
-    const changed = change.run(state, turnId ?? null, observedAt, startedAt, row.project, row.id).changes;
+    const changed = change.run(state, turnId ?? null, observedAt, startedAt, row.project, row.id,
+      timing ? JSON.stringify(timing) : null).changes;
     if (state === 'running') {
       const current = byId.get(row.project, row.id);
       if (observedRunning && changed && current?.phase === 'running' && current.turnId && !current.cancellationRequestedAt) {
@@ -182,8 +227,9 @@ export function createOperations(directory, native, execution, {prepareHandover,
   function response(row) {
     if (!row) return null;
     const {fingerprint, workspace, handoverReview, handoverReceipt, interruptionDispatchedAt, cancellationDispatchedAt,
-      cancellationRequestedAt, expectedThreadId, chatConversationId, ...view} = row;
-    return {...view, phase: visiblePhase(row), ...(handoverReceipt ? {handoverReceipt} : {}),
+      cancellationRequestedAt, expectedThreadId, chatConversationId, measurement: saved, ...view} = row;
+    const measurement = saved && receiptMeasurement(row);
+    return {...view, phase: visiblePhase(row), ...(measurement && {measurement}), ...(handoverReceipt ? {handoverReceipt} : {}),
       ...(cancellationRequestedAt ? {cancellationRequestedAt} : {}), ...(expectedThreadId ? {expectedThreadId} : {})};
   }
 
@@ -197,7 +243,16 @@ export function createOperations(directory, native, execution, {prepareHandover,
     if (closed || !value || typeof value.threadId !== 'string') return;
     if ((method === 'item/started' || method === 'item/completed') && value.item?.type === 'userMessage' &&
         typeof value.item.clientId === 'string' && typeof value.turnId === 'string') {
-      advance(byClientId.get(value.threadId, value.item.clientId), 'running', value.turnId, timestamp());
+      advance(byClientId.get(value.threadId, value.item.clientId), 'running', value.turnId, {startedAt:timestamp()});
+      return;
+    }
+    if (method === 'thread/tokenUsage/updated') {
+      const total = value.tokenUsage?.total;
+      if (typeof value.turnId !== 'string' || !total) return;
+      const row = byTurn.get(value.threadId, value.turnId);
+      const tokens = measuredTokens('codex-thread', total.inputTokens, total.outputTokens, total.totalTokens);
+      if (row && tokens) recordUsage.run(JSON.stringify({tokens:{...tokens,observedAt:timestamp()}}), row.project, row.id,
+        value.threadId, value.turnId, tokens.inputTokens, tokens.outputTokens, tokens.totalTokens);
       return;
     }
     if (method === 'item/agentMessage/delta' && typeof value.delta === 'string') {
@@ -217,7 +272,8 @@ export function createOperations(directory, native, execution, {prepareHandover,
     const row = byTurn.get(value.threadId, incoming.id);
     if (!row || terminal.has(row.phase)) return;
     const next = phase(incoming.status);
-    if (next) advance(row, next, incoming.id, timestamp());
+    if (next) advance(row, next, incoming.id, {startedAt:timestamp(),
+      timing: nativeTerminal.has(next) ? codexTurnTiming(incoming) : null});
   });
 
   async function confirmedWorkspace(project) {
@@ -299,7 +355,8 @@ export function createOperations(directory, native, execution, {prepareHandover,
       const exact = await native.findSubmission(row.workspace, row.threadId, row.id, row.turnId,
         ...(row.expectedThreadId && !row.turnId ? [true] : []));
       const observed = typeof exact?.id === 'string' && exact.id && (!row.turnId || exact.id === row.turnId) ? phase(exact.status) : null;
-      if (observed) advance(row, observed, exact.id, exact.startedAt ?? null);
+      if (observed) advance(row, observed, exact.id, {startedAt:exact.startedAt ?? null,
+        timing:nativeTerminal.has(observed) ? exact.nativeTiming : null});
       else if (row.phase === 'sending' && age >= 30000) markUnconfirmed.run(timestamp(), row.project, row.id);
       return byId.get(row.project, row.id);
     } catch { return closed ? row : byId.get(row.project, row.id); }
@@ -411,8 +468,9 @@ export function createOperations(directory, native, execution, {prepareHandover,
             (row.startedAt === null || observedWorkTime(row.startedAt, Date.parse(row.updatedAt)));
           const unsentFailure = row.phase === 'failed' && row.threadId === null && row.turnId === null && row.startedAt === null;
           if (!exact && !unsentFailure) continue;
+          const measurement = exact && receiptMeasurement(row);
           results.push({projectId:project.id, id:row.id, kind:'codex', phase:row.phase, observedAt:row.updatedAt,
-            ...(exact ? {threadId:row.threadId} : {})});
+            ...(exact && {threadId:row.threadId}), ...(measurement && {measurement})});
           if (++count === workOutcomeLimit) break;
         }
       }
@@ -568,6 +626,8 @@ export function createOperations(directory, native, execution, {prepareHandover,
         }
         usageObservedAt = await checkSubscriptionUsage();
       };
+      const chosen = {...(observedChoice(selection.model) && {requestedModel:selection.model}),
+        ...(observedChoice(selection.effort) && {requestedReasoningEffort:selection.effort})};
       void native.submit({workspace: expected, prompt: submittedPrompt, knownId: previous?.threadId, previousTurnId: previous?.turnId,
         model: selection.model, effort: selection.effort, requestId: input.id, ...(attachment ? {image: attachment.image} : {}),
         ...(reference ? {document: reference.document} : {}),
@@ -579,11 +639,12 @@ export function createOperations(directory, native, execution, {prepareHandover,
         onThread: id => {
           if ((previous && id !== previous.threadId) || !maySubmit() || (beginsHandover && stillCurrent?.() !== true)) return false;
           if (!freshUsage(usageObservedAt)) throw usageProblem('CODEX_SUBSCRIPTION_USAGE_UNCONFIRMED');
-          return setThread.run(id, timestamp(), project.id, input.id).changes === 1;
+          return setThread.run(id, timestamp(), Object.keys(chosen).length ? JSON.stringify(chosen) : null, project.id, input.id).changes === 1;
         },
       }).then(result => {
         const observed = phase(result.turn.status);
-        advance(row, observed ?? 'running', result.turn.id, timestamp(), observed === 'running');
+        advance(row, observed ?? 'running', result.turn.id, {startedAt:timestamp(), observedRunning:observed === 'running',
+          timing:nativeTerminal.has(observed) ? codexTurnTiming(result.turn) : null});
       }).catch(error => {
         if (!closed) {
           const current = byId.get(project.id, input.id);

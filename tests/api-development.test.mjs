@@ -676,7 +676,12 @@ test('portfolio reads settled API work after restart without dispatch or reporti
   const success = store.getWork(id, 'history-advice-success').operation;
   const before = await readFile(ledgerFile);
   const expected = [failure, success].map(work => ({projectId:id, id:work.taskId, kind:'api',
-    phase:work.status, observedAt:work.completedAt}));
+    phase:work.status, observedAt:work.completedAt, measurement:{
+      model:modelId, ...(work.reasoningEffort && {reasoningEffort:work.reasoningEffort}),
+      startedAt:work.dispatchedAt, completedAt:work.completedAt,
+      durationMs:Date.parse(work.completedAt) - Date.parse(work.dispatchedAt),
+      tokens:{scope:'api-responses',inputTokens:100,outputTokens:25,totalTokens:125},
+    }}));
   await open(false);
   assert.equal((await call('/api/portfolio', {auth:false})).status, 401);
   const response = await (await call('/api/portfolio')).text();

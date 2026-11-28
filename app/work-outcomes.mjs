@@ -7,6 +7,21 @@ export function observedWorkTime(value, now) {
   return Number.isFinite(epoch) && epoch <= now && new Date(epoch).toISOString() === value;
 }
 
+export function measuredTokens(scope, inputTokens, outputTokens, totalTokens) {
+  if (![inputTokens, outputTokens, totalTokens].every(count => Number.isSafeInteger(count) && count >= 0) ||
+      inputTokens + outputTokens !== totalTokens) return null;
+  return {scope, inputTokens, outputTokens, totalTokens};
+}
+
+export function codexTurnTiming(turn, now = Date.now()) {
+  const {startedAt, completedAt, durationMs} = turn;
+  if (![startedAt, completedAt].every(Number.isSafeInteger) || startedAt < 0 ||
+      completedAt < startedAt || completedAt * 1000 > now) return null;
+  const elapsed = (completedAt - startedAt) * 1000;
+  return {startedAt:new Date(startedAt * 1000).toISOString(), completedAt:new Date(completedAt * 1000).toISOString(),
+    ...(Number.isSafeInteger(durationMs) && durationMs >= 0 && Math.abs(durationMs - elapsed) < 1000 && {durationMs})};
+}
+
 export function recentWorkOutcomes(directory, projects, operations, apiWork) {
   const current = readProjectExecutionBindings(directory, projects.keys());
   const authorized = new Map();

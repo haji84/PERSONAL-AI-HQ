@@ -5,6 +5,7 @@ import {createConnection} from 'node:net';
 import {setTimeout as delay} from 'node:timers/promises';
 import WebSocket from 'ws';
 import {turnEvidenceItem} from './codex-evidence.mjs';
+import {codexTurnTiming} from './work-outcomes.mjs';
 
 const unavailable = message => Object.assign(new Error(message), {status: 503});
 const missing = message => Object.assign(new Error(message), {status: 404});
@@ -672,7 +673,8 @@ export function createCodexClient({command, socket, loopback} = {}) {
           items(turn.items).some(item => item?.type === 'userMessage' && item.clientId === clientId));
         if (exact) {
           if (requireFirstUser && !await startedBy(rpc, id, exact.id, clientId)) return null;
-          return {id: exact.id, status: exact.status, startedAt: iso(exact.startedAt)};
+          const nativeTiming = terminalTurns.has(exact.status) && codexTurnTiming(exact);
+          return {id: exact.id, status: exact.status, startedAt: iso(exact.startedAt), ...(nativeTiming && {nativeTiming})};
         }
         cursor = cursorText(result.nextCursor);
         if (!cursor) break;

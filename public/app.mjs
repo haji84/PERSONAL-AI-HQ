@@ -1653,6 +1653,22 @@ function applyDashboardExecution(projectId, summary, generation) {
   if (element) paintDashboardExecution(element, project);
 }
 
+function workMeasurementLabel(outcome) {
+  const {durationMs, tokens} = outcome.measurement ?? {};
+  const number = new Intl.NumberFormat('ja-JP', {maximumFractionDigits:1});
+  let elapsed, usage;
+  if (Number.isSafeInteger(durationMs) && durationMs >= 0) {
+    const timeLabel = outcome.kind === 'codex' ? 'ターン' : '処理・検証';
+    elapsed = timeLabel + ' ' + number.format(durationMs / 1000) + '秒';
+  }
+  if (tokens?.scope === (outcome.kind === 'codex' ? 'codex-thread' : 'api-responses') &&
+      Number.isSafeInteger(tokens.totalTokens) && tokens.totalTokens >= 0) {
+    const scope = outcome.kind === 'codex' ? '確認済みスレッド累計' : '確認済みAPI応答合計';
+    usage = scope + ' ' + number.format(tokens.totalTokens) + 'トークン';
+  }
+  return elapsed || usage ? (elapsed ?? '所要時間未取得') + ' · ' + (usage ?? 'トークン未取得') : '計測値未取得';
+}
+
 function recentWorkOutcomesPanel() {
   const projects = new Map(projectList().filter(project => project.registration !== 'github').map(project => [project.id, project]));
   const rows = node('ul', 'rows');
@@ -1672,7 +1688,7 @@ function recentWorkOutcomesPanel() {
         document.getElementById('active-project')?.scrollIntoView({block: 'nearest'});
       } else selectProject(project.id, true);
     };
-    const target = rowButton(project.name, route + ' · ' + time(outcome.observedAt), false, open,
+    const target = rowButton(project.name, route + ' · ' + time(outcome.observedAt) + ' · ' + workMeasurementLabel(outcome), false, open,
       chip(outcome.phase, outcome.phase === 'completed' ? '作業完了' : '作業失敗'));
     target.removeAttribute('aria-pressed');
     rows.append(listItem(target));

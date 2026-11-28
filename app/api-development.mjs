@@ -8,7 +8,7 @@ import {checkedEvidenceIsCurrent, prepareApiWorkspace, readAdvisoryWorkspace, re
 import {STAGES, moneyMicros} from './execution-policy.mjs';
 import {readCurrentProject} from './portfolio.mjs';
 import {ensurePrivateDirectory} from './private-directory.mjs';
-import {observedWorkTime, workOutcomeLimit} from './work-outcomes.mjs';
+import {measuredTokens, observedWorkTime, workOutcomeLimit} from './work-outcomes.mjs';
 
 const taskKey = /^[A-Za-z0-9][A-Za-z0-9_-]{7,79}$/;
 const receiptKey = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
@@ -37,6 +37,23 @@ function latestApiActivity(store, projectId, localJob) {
   return {id: operation.taskId, kind: 'api', phase, route: operation.route, model: operation.model, stage: operation.task?.stage,
     observedAt: observedAt(operation), createdAt: operation.createdAt, startedAt: operation.dispatchedAt ?? null,
     terminal: terminalPhases.has(phase)};
+}
+
+function apiWorkMeasurement(operation) {
+  const {dispatchedAt:startedAt, completedAt, model, reasoningEffort, providerReceipts = []} = operation;
+  const end = Date.parse(completedAt);
+  const durationMs = end - Date.parse(startedAt);
+  const completeUsage = providerReceipts.length &&
+    new Set(providerReceipts.map(receipt => receipt.id)).size === providerReceipts.length &&
+    providerReceipts.every(receipt => receipt.id !== null &&
+      observedWorkTime(receipt.observedAt,end) && receipt.observedAt >= startedAt);
+  let tokens;
+  if (completeUsage) {
+    const input = providerReceipts.reduce((sum, receipt) => sum + receipt.inputTokens, 0);
+    const output = providerReceipts.reduce((sum, receipt) => sum + receipt.outputTokens, 0);
+    tokens = measuredTokens('api-responses',input,output,input + output);
+  }
+  return {model, ...(reasoningEffort && {reasoningEffort}), startedAt, completedAt, durationMs, ...(tokens && {tokens})};
 }
 
 export function createApiDevelopment({directory, store, conversations, withProjectWorkLock, hasNativeWork, hasActiveWork,
@@ -496,7 +513,8 @@ export function createApiDevelopment({directory, store, conversations, withProje
               typeof report.reason !== 'string' || !report.reason || report.candidate !== null ||
               !Array.isArray(report.changes) || report.changes.length) continue;
         }
-        results.push({projectId:project, id:taskId, kind:'api', phase:status, observedAt:completedAt});
+        results.push({projectId:project, id:taskId, kind:'api', phase:status, observedAt:completedAt,
+          measurement:apiWorkMeasurement(operation)});
         if (results.length === workOutcomeLimit) break;
       }
       return results;
