@@ -60,19 +60,23 @@ if (-not (Test-Private ([IO.Directory]::GetAccessControl($directory.FullName))) 
 
 const windowsUserProtection = `
 $ErrorActionPreference = 'Stop'
+[Console]::Error.WriteLine('hq-dpapi:startup')
 Add-Type -AssemblyName System.Security
 $scope = [Security.Cryptography.DataProtectionScope]::CurrentUser
 $entropy = [Text.Encoding]::UTF8.GetBytes('Personal AI HQ ChatGPT credentials v1')
-$inputBytes = [Convert]::FromBase64String([Console]::In.ReadToEnd())
+[Console]::Error.WriteLine('hq-dpapi:input')
+$inputBytes = [Convert]::FromBase64String([Console]::In.ReadLine())
 $outputBytes = $null
 try {
   $destination = $env:PERSONAL_AI_HQ_DPAPI_DESTINATION
+  [Console]::Error.WriteLine('hq-dpapi:cryptography')
   if ([string]::IsNullOrEmpty($destination)) {
     $outputBytes = [Security.Cryptography.ProtectedData]::Unprotect($inputBytes, $entropy, $scope)
     [Console]::Out.Write([Convert]::ToBase64String($outputBytes))
     return
   }
   $outputBytes = [Security.Cryptography.ProtectedData]::Protect($inputBytes, $entropy, $scope)
+  [Console]::Error.WriteLine('hq-dpapi:file')
   ${windowsOwnerACL}
   $acl = [Security.AccessControl.FileSecurity]::new()
   $acl.SetOwner($identity.User)
@@ -187,22 +191,27 @@ export async function assertWindowsPrivateWorkspace(directory, relativeFiles, si
 }
 
 function windowsProtection(data, destination = '') {
-  const unavailable = () => new Error('Windows user data protection is unavailable');
+  const unavailable = (phase = 'launch', timedOut = false) => Object.assign(
+    new Error('Windows user data protection ' + (timedOut ? 'timed out' : 'failed') + ' during ' + phase),
+    {code: 'WINDOWS_USER_PROTECTION_FAILED'});
   const systemRoot = process.env.SystemRoot;
   if (process.platform !== 'win32' || !validWindowsDirectory(systemRoot) ||
       !Buffer.isBuffer(data) || data.length === 0 || data.length > 144 * 1024) throw unavailable();
   return new Promise((resolveOutput, rejectOutput) => {
-    const child = execFile(powershell(), ['-NoProfile', '-NonInteractive', '-Command', windowsUserProtection], {
+    const script = Buffer.from(windowsUserProtection, 'utf16le').toString('base64');
+    const child = execFile(powershell(), ['-NoProfile', '-NonInteractive', '-EncodedCommand', script], {
       cwd: systemRoot, windowsHide: true, timeout: 10_000, maxBuffer: 200 * 1024,
       env: {SystemRoot: systemRoot, WINDIR: systemRoot, SystemDrive: systemRoot.slice(0, 2),
         PERSONAL_AI_HQ_DPAPI_DESTINATION: destination},
-    }, (problem, stdout) => {
+    }, (problem, stdout, stderr) => {
       // Never expose child output or errors, since stdout can contain decrypted data.
-      if (problem) rejectOutput(unavailable());
-      else resolveOutput(stdout);
+      if (problem) {
+        const phase = [...(stderr ?? '').matchAll(/^hq-dpapi:(startup|input|cryptography|file)\r?$/gmu)].at(-1)?.[1];
+        rejectOutput(unavailable(phase, problem.killed === true));
+      } else resolveOutput(stdout);
     });
     child.stdin.on('error', () => {});
-    child.stdin.end(data.toString('base64'));
+    child.stdin.end(data.toString('base64') + '\n');
   });
 }
 

@@ -173,8 +173,10 @@ function createCredentialStore(directory) {
         }
       }
       await rename(tempfile, join(path, filename));
-    } catch {
-      throw failure('STORAGE_UNAVAILABLE');
+    } catch (cause) {
+      const problem = failure('STORAGE_UNAVAILABLE');
+      if (windows && cause?.code === 'WINDOWS_USER_PROTECTION_FAILED') problem.cause = cause;
+      throw problem;
     } finally {
       contents.fill(0);
       await unlink(tempfile).catch(() => {});
