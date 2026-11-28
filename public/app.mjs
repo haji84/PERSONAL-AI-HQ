@@ -226,8 +226,12 @@ function routeKey(viewName = ui.view, project = ui.project) {
   const key = viewName + ':' + project;
   return viewName === 'artifacts' ? key + ':' + artifactFilterScope(project) : key;
 }
+function scrollRouteKey() {
+  const key = routeKey();
+  return ui.view === 'artifacts' && ui.searches.get('artifact-search')?.trim() ? key + ':search' : key;
+}
 function rememberScroll() {
-  ui.scroll.set(routeKey(), scrollY);
+  ui.scroll.set(scrollRouteKey(), scrollY);
   storeTab();
 }
 function queueViewScroll() {
@@ -237,7 +241,7 @@ function queueViewScroll() {
     if (!ui.scroll.has(key)) ui.scroll.set(key, ui.scroll.get(oldArtifactKey));
     ui.scroll.delete(oldArtifactKey);
   }
-  const y = ui.scroll.get(key);
+  const y = ui.scroll.get(scrollRouteKey());
   return {epoch: mounted, y: Number.isFinite(y) ? y : 0};
 }
 function restoreScroll({waitForContent = false} = {}) {
@@ -5743,6 +5747,7 @@ function artifacts() {
     {label: 'Codex', name: 'codex', files: new Map(), offset: 0, pages: 0},
   ];
   let generation = 0;
+  let searchState, searchTimer;
   const section = panel('確認済みの成果物');
   const scope = node('label', 'picker artifact-filter');
   const only = node('select');
@@ -5791,10 +5796,10 @@ function artifacts() {
   }
 
   function filter(query, preserveReading = false) {
-    const visible = [...registered, ...sources.flatMap(source => [...source.files.values()])]
-      .filter(item => (only.value !== 'project' || item.project === ui.project) &&
-        matches(query, item.title, item.description, item.observedAt, time(item.observedAt),
-          projectList().find(candidate => candidate.id === item.project)?.name))
+    const staticMatches = registered.filter(item => matches(query, item.title, item.description, item.observedAt,
+      time(item.observedAt), projectList().find(candidate => candidate.id === item.project)?.name));
+    const visible = [...staticMatches, ...(searchState?.sources ?? sources).flatMap(source => [...source.files.values()])]
+      .filter(item => only.value !== 'project' || item.project === project)
       .sort((a, b) => (Date.parse(b.observedAt) || 0) - (Date.parse(a.observedAt) || 0));
     const anchor = preserveReading ? [...list.children].find(row => {
       const {top, bottom} = row.getBoundingClientRect();
@@ -5827,10 +5832,13 @@ function artifacts() {
       list.append(row);
     }
     if (restoredAnchor) window.scrollBy(0, restoredAnchor.getBoundingClientRect().top - anchorTop);
-    empty.hidden = visible.length > 0;
+    empty.hidden = visible.length > 0 || Boolean(searchState && (searchState.query.length > 200 ||
+      searchState.sources.some(source => source.offset !== null || source.failed)));
     empty.textContent = query ? '一致する成果物がありません。' : '表示できる確認済みの成果物はありません。';
   }
   const controls = node('div', 'pagination run-actions');
+  const searchControls = node('div', 'pagination run-actions');
+  searchControls.hidden = true;
   for (const source of sources) {
     source.more = button('以前の' + source.label + '成果物を表示', () => loadWork(source));
     source.more.hidden = true;
@@ -5846,10 +5854,21 @@ function artifacts() {
   function canRefreshWork() {
     const selected = document.getSelection();
     const copying = selected && !selected.isCollapsed && (list.contains(selected.anchorNode) || list.contains(selected.focusNode));
+    const focused = document.activeElement;
     return section.root.isConnected && !dom.shell.hidden && !document.hidden && connectionState === 'connected' &&
-      !dom['refresh-button'].disabled && !controls.contains(document.activeElement) && !list.contains(document.activeElement) && !copying;
+      !dom['refresh-button'].disabled && !searchWrap.contains(focused) && !(searchState ? searchControls : controls).contains(focused) &&
+      !list.contains(focused) && !copying;
   }
 
+  function readWorkPage(source, scope, offset, signal, query, revision) {
+    return api(apiPath('/api/artifacts/work', {project: scope, source: source.name, offset, q: query, revision}), {signal});
+  }
+  function addWorkFiles(files, source, entries) {
+    for (const file of entries) {
+      if (typeof file?.href !== 'string' || (source.name && file.kind !== 'file')) continue;
+      files.set(file.href, {...file, workSource: source.name});
+    }
+  }
   async function loadWork(source, {refresh = false, automatic = false} = {}) {
     if (source.request || (!refresh && source.offset === null)) return;
     const generationAtStart = generation;
@@ -5866,19 +5885,14 @@ function artifacts() {
       const files = refresh ? new Map() : new Map(source.files);
       let loaded = 0;
       for (; loaded < pages && offset !== null; loaded++) {
-        const result = await api(apiPath('/api/artifacts/work', {
-          project: only.value === 'project' ? ui.project : undefined, source: source.name, offset,
-        }), {signal});
+        const result = await readWorkPage(source, only.value === 'project' ? project : undefined, offset, signal);
         if (!current()) return;
         if (!Array.isArray(result?.artifacts)) throw new Error('Invalid artifact response');
-        for (const file of result.artifacts) {
-          if (typeof file?.href !== 'string' || (source.name && file.kind !== 'file')) continue;
-          files.set(file.href, {...file, workSource: source.name});
-        }
+        addWorkFiles(files, source, result.artifacts);
         offset = Number.isSafeInteger(result.nextOffset) && result.nextOffset > offset ? result.nextOffset : null;
       }
       const changed = JSON.stringify([...files.values()]) !== JSON.stringify([...source.files.values()]);
-      if (automatic && changed && !canRefreshWork()) return;
+      if (automatic && changed && (searchState || !canRefreshWork())) return;
       source.files = files;
       source.offset = offset;
       source.pages = (refresh ? 0 : source.pages) + loaded;
@@ -5886,7 +5900,7 @@ function artifacts() {
       reading.pages.set(source.name, offset === null ? source.pages : Math.max(source.pages, previousPages));
       source.more.hidden = source.offset === null;
       source.status.hidden = source.retry.hidden = true;
-      if (changed) filter(search.value, refresh);
+      if (changed && !searchState) filter('', refresh);
       return true;
     } catch (error) {
       if (!current()) return;
@@ -5894,7 +5908,7 @@ function artifacts() {
         source.files.clear();
         source.offset = source.pages = 0;
         reading.pages.delete(source.name);
-        filter(search.value, refresh);
+        if (!searchState) filter('', refresh);
       }
       source.refreshFailed = refresh;
       source.status.textContent = source.label + (refresh ? 'の成果物を更新できませんでした。' : 'の成果物を読み取れませんでした。');
@@ -5916,7 +5930,7 @@ function artifacts() {
   async function loadPreviousPages() {
     const generationAtStart = generation;
     const loaded = await Promise.all(sources.map(source => loadReadingPages(source, reading.pages.get(source.name) ?? 1)));
-    if (section.root.isConnected && generation === generationAtStart) {
+    if (!searchState && section.root.isConnected && generation === generationAtStart) {
       restoreScroll({waitForContent: loaded.includes(false)});
     }
   }
@@ -5925,14 +5939,139 @@ function artifacts() {
     const generationAtStart = generation;
     const previousPages = reading.pages.get(source.name) ?? 0;
     const loaded = await loadReadingPages(source, Math.max(source.pages + 1, previousPages));
-    if (section.root.isConnected && generation === generationAtStart) {
+    if (!searchState && section.root.isConnected && generation === generationAtStart) {
       restoreScroll({waitForContent: !loaded});
     }
   }
-  const search = queryInput('artifact-search', '成果物を検索', '成果物を検索', query => {
-    pendingScroll = null;
+  function stopSearch() {
+    clearTimeout(searchTimer);
+    searchState?.controller.abort();
+    searchState = undefined;
+    searchControls.replaceChildren();
+    searchControls.hidden = true;
+    controls.hidden = false;
+  }
+  function paintSearchSource(source) {
+    source.more.hidden = !source.scanned || source.failed || source.offset === null;
+    source.retry.hidden = !source.failed;
+    source.more.disabled = source.retry.disabled = source.busy;
+    source.status.textContent = source.busy || !source.scanned ?
+      source.label + (source.refreshing ? 'の検索結果を更新中…' : 'の成果物を検索中…') :
+      source.failed ? source.label + (source.refreshFailed ? 'の検索結果の更新を確認できませんでした。' : 'の成果物を検索できませんでした。') :
+        !source.files.size && source.offset !== null ? source.label + 'の検索には続きがあります。' : '';
+    source.status.hidden = !source.status.textContent;
+  }
+  async function advanceSearch(session, source, {refresh = false, automatic = false} = {}) {
+    const active = () => searchState === session && section.root.isConnected && !dom.shell.hidden;
+    if (!active() || source.busy || (refresh ? !source.pages : source.offset === null)) return;
+    const connection = connectionGeneration;
+    const signal = AbortSignal.any([session.controller.signal, AbortSignal.timeout(10000)]);
+    source.busy = true;
+    source.refreshing = refresh;
+    paintSearchSource(source);
+    const files = refresh ? new Map() : source.files;
+    const originalSize = files.size;
+    const limit = refresh ? source.pages : 6;
+    let offset = refresh ? 0 : source.offset;
+    let revision = refresh ? undefined : source.revision;
+    let scanned = 0;
+    let updateList = !refresh;
+    try {
+      while (scanned < limit && offset !== null) {
+        const result = await readWorkPage(source, session.scope, offset, signal, session.query, revision);
+        if (!active()) return;
+        if (signal.aborted || connection !== connectionGeneration || !Array.isArray(result?.artifacts) ||
+            (result.nextOffset !== null && (!Number.isSafeInteger(result.nextOffset) || result.nextOffset <= offset ||
+              !/^[a-f0-9]{64}$/.test(result.searchRevision ?? '') || (revision !== undefined && revision !== result.searchRevision)))) {
+          throw new Error('Unconfirmed artifact search page');
+        }
+        addWorkFiles(files, source, result.artifacts);
+        offset = result.nextOffset;
+        revision = offset === null ? undefined : result.searchRevision;
+        scanned++;
+        if (!refresh) {
+          source.offset = offset;
+          source.revision = revision;
+          source.pages++;
+          if (files.size > originalSize) break;
+        }
+      }
+      if (refresh) {
+        const changed = JSON.stringify([...files.values()]) !== JSON.stringify([...source.files.values()]);
+        updateList = changed || offset !== source.offset || source.failed;
+        if (automatic && updateList && !canRefreshWork()) { updateList = false; return; }
+        Object.assign(source, {files, offset, revision, pages: scanned});
+      }
+      source.failed = source.refreshFailed = false;
+    } catch (error) {
+      if (!active()) return;
+      const changed = error.status === 409 && error.code === 'ARTIFACT_SEARCH_CHANGED';
+      if (changed || error.status === 403 || error.status === 404) {
+        source.files.clear();
+        source.offset = 0;
+        source.revision = undefined;
+        if (changed || !refresh) source.pages = 0;
+        updateList = true;
+      }
+      source.failed = true;
+      source.refreshFailed = refresh && !changed;
+      empty.hidden = true;
+    } finally {
+      if (active()) {
+        source.busy = source.refreshing = false;
+        source.scanned = true;
+        paintSearchSource(source);
+        if (updateList) {
+          filter(session.query, true);
+          restoreScroll({waitForContent: session.sources.some(current => current.offset !== null || current.failed)});
+        }
+      }
+    }
+  }
+  function beginSearch(query) {
+    stopSearch();
+    if (!query) { filter(''); return; }
+    const session = {query, scope: only.value === 'project' ? project : undefined,
+      controller: new AbortController(), sources: []};
+    searchState = session;
+    searchControls.hidden = false;
+    controls.hidden = true;
+    if (query.length > 200) {
+      searchControls.append(node('p', 'muted small', '検索語は200文字以内で入力してください。'));
+      filter(query);
+      return;
+    }
+    for (const {label, name} of sources) {
+      const source = {label, name, files: new Map(), offset: 0, pages: 0};
+      const next = () => advanceSearch(session, source);
+      source.more = button(label + 'の検索を続ける', next);
+      source.retry = button(label + 'の検索を再試行', () => advanceSearch(session, source, {refresh: source.refreshFailed}));
+      source.status = node('p', 'muted small');
+      source.status.setAttribute('role', 'status');
+      session.sources.push(source);
+      searchControls.append(source.more, source.status, source.retry);
+      paintSearchSource(source);
+    }
     filter(query);
+    searchTimer = setTimeout(() => {
+      for (const source of session.sources) void advanceSearch(session, source);
+    }, 275);
+  }
+  const search = queryInput('artifact-search', '成果物を検索', '成果物を検索', value => {
+    const query = value.trim();
+    if ((searchState?.query ?? '') === query) return;
+    if (query && !searchState) {
+      ui.scroll.set(routeKey('artifacts', project), pendingScroll?.y ?? scrollY);
+      storeTab();
+    }
+    pendingScroll = null;
+    beginSearch(query);
+    if (!query) {
+      pendingScroll = queueViewScroll();
+      restoreScroll();
+    }
   });
+  search.maxLength = 200;
   only.addEventListener('change', () => {
     rememberScroll();
     ui.searches.set('artifact-filter', only.value);
@@ -5948,22 +6087,29 @@ function artifacts() {
       source.more.hidden = source.status.hidden = source.retry.hidden = true;
       source.files.clear();
     }
-    filter(search.value);
+    beginSearch(search.value.trim());
     restoreScroll({waitForContent: true});
     void loadPreviousPages();
   });
   searchWrap.append(search);
   section.body.remove();
-  section.root.append(searchWrap, empty, list, controls);
+  section.root.append(searchWrap, empty, list, controls, searchControls);
   dom.content.append(section.root);
-  filter(search.value);
+  beginSearch(search.value.trim());
   void loadPreviousPages();
   const interval = window.setInterval(() => {
-    if (canRefreshWork()) for (const source of sources) void loadWork(source, {refresh: true, automatic: true});
+    if (!canRefreshWork()) return;
+    const session = searchState;
+    if (session) {
+      for (const source of session.sources) void advanceSearch(session, source, {refresh: true, automatic: true});
+    } else {
+      for (const source of sources) void loadWork(source, {refresh: true, automatic: true});
+    }
   }, 30000);
   const cleanup = () => {
     generation++;
     window.clearInterval(interval);
+    stopSearch();
     for (const source of sources) source.request?.abort();
     runViewCleanups.delete(cleanup);
   };

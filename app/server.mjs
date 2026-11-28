@@ -50,6 +50,10 @@ const nativeObservationTimeout = 4000;
 const maxBufferedCodexArtifactBytes = 64 * 1024 * 1024;
 const nativeActivityWatch = /^([a-z0-9_-]{1,160}):([a-z0-9_-]{1,160})$/i;
 const error = (status, message) => Object.assign(new Error(message), {status});
+const artifactDate = new Intl.DateTimeFormat('ja-JP', {
+  timeZone: 'Asia/Tokyo', year: 'numeric', month: '2-digit', day: '2-digit',
+  hour: '2-digit', minute: '2-digit', hour12: false,
+});
 const apiMessages = {
   SIGN_IN_REQUIRED: 'サインインが必要です。',
   API_AUTHORIZATION_REQUIRED: 'この端末の通常API実行は認証が保留中です。',
@@ -79,6 +83,7 @@ const apiMessages = {
   EXECUTION_HELD: '案件の停止条件または未確定の作業を確認してください。',
   API_ARTIFACT_NOT_FOUND: '検証済みの成果物を確認できません。',
   API_ARTIFACT_CHANGED: '成果物が検証記録と一致しません。',
+  ARTIFACT_SEARCH_CHANGED: '成果物一覧が更新されました。検索をやり直してください。',
   API_TASK_NOT_FOUND: '中断するAPI作業を確認できません。',
   REALTIME_VOICE_AUTHORITY_REQUIRED: 'この案件の音声APIは本人の費用とモデルの確認が必要です。',
   REALTIME_VOICE_AUTHORITY_INVALID: '音声APIの対象案件、モデル、費用上限を照合できません。',
@@ -101,6 +106,18 @@ const apiMessages = {
 function send(response, status, payload, extra = {}) {
   response.writeHead(status, {'Content-Type': 'application/json; charset=utf-8', ...extra});
   response.end(JSON.stringify(payload));
+}
+
+function artifactSearch(value, projects) {
+  const normalize = text => String(text ?? '').normalize('NFKC').toLocaleLowerCase('ja');
+  const query = normalize(value.trim());
+  if (!query) return null;
+  return ({project, title, description, observedAt}) => {
+    const date = Date.parse(observedAt);
+    const displayDate = Number.isFinite(date) ? artifactDate.format(date) + ' JST' : '不明';
+    return [title, description, observedAt, displayDate, projects.get(project)?.name]
+      .some(text => normalize(text).includes(query));
+  };
 }
 
 function activityWatches(params) {
@@ -660,22 +677,45 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       const offset = Number(target.searchParams.get('offset') ?? 0);
       const scope = target.searchParams.get('project');
       const source = target.searchParams.getAll('source');
+      const queries = target.searchParams.getAll('q');
+      const revisions = target.searchParams.getAll('revision');
+      if (!signedIn()) throw error(401, 'サインインが必要です。');
       if (!Number.isSafeInteger(offset) || offset < 0) throw error(400, '成果物一覧の位置が正しくありません。');
+      if (queries.length > 1 || (queries[0]?.length ?? 0) > 200) throw error(400, '成果物の検索語句を200文字以内で指定してください。');
       if (target.searchParams.getAll('project').length > 1) {
         throw error(404, '案件を見つけられませんでした。');
       }
       if (source.length > 1 || (source.length && source[0] !== 'codex')) throw error(400, '成果物の取得元を確認できません。');
+      const query = queries[0]?.trim() ?? '';
+      const matches = artifactSearch(query, portfolio.projects);
+      const validRevision = revisions.length === 1 && /^[a-f0-9]{64}$/u.test(revisions[0]);
+      if (matches && offset > 0 ? !validRevision : revisions.length > 0) {
+        throw error(400, '成果物検索の続き位置が正しくありません。');
+      }
+      const search = matches ? {query,scope,matches,revision:revisions[0]} : null;
       if (scope !== null && !portfolio.projects.has(scope)) {
-        if (portfolio.discoveredProjects.has(scope)) return send(response, 200, {artifacts:[], nextOffset:null});
+        if (portfolio.discoveredProjects.has(scope)) {
+          if (search?.revision) throw Object.assign(error(409, '成果物一覧が更新されました。'),{code:'ARTIFACT_SEARCH_CHANGED'});
+          return send(response, 200, {artifacts:[], nextOffset:null});
+        }
         throw error(404, '案件を見つけられませんでした。');
       }
       if (source[0] === 'codex') {
         const projects = scope === null ? [...portfolio.projects.values()] : [portfolio.projects.get(scope)];
-        const result = await nativeArtifacts.list(projects, offset);
-        if (!signedIn()) throw error(401, 'サインインが必要です。');
-        return send(response, 200, result);
+        if (response.destroyed) return;
+        const disconnect = new AbortController();
+        const cancel = () => disconnect.abort();
+        response.once('close', cancel);
+        try {
+          const result = await nativeArtifacts.list(projects, offset, {search, signal:disconnect.signal});
+          if (response.destroyed) return;
+          if (!signedIn()) throw error(401, 'サインインが必要です。');
+          return send(response, 200, result);
+        } finally {
+          response.off('close', cancel);
+        }
       }
-      return send(response, 200, apiWork.listArtifacts(scope === null ? [...portfolio.projects.keys()] : [scope], offset));
+      return send(response, 200, apiWork.listArtifacts(scope === null ? [...portfolio.projects.keys()] : [scope], offset, search));
     }
 
     const projectId = target.searchParams.get('project');
@@ -1020,7 +1060,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       if (response.headersSent) { response.destroy(); return; }
       const status = typeof problem?.status === 'number' ? problem.status : 500;
       send(response, status, {error: status === 500 ? '状態を読み取れませんでした。' : apiMessages[problem.code] ?? problem.message,
-        ...(['CHAT_HANDOFF_STALE', codexResultStaleCode, 'EXECUTION_HELD', 'CODEX_IMAGE_MODEL_UNAVAILABLE', 'CODEX_RESUME_TARGET_UNAVAILABLE', 'CODEX_SUBSCRIPTION_LIMIT_REACHED',
+        ...(['CHAT_HANDOFF_STALE', codexResultStaleCode, 'EXECUTION_HELD', 'ARTIFACT_SEARCH_CHANGED', 'CODEX_IMAGE_MODEL_UNAVAILABLE', 'CODEX_RESUME_TARGET_UNAVAILABLE', 'CODEX_SUBSCRIPTION_LIMIT_REACHED',
           'CODEX_SUBSCRIPTION_USAGE_UNCONFIRMED'].includes(problem.code) ||
           problem.code?.startsWith('REALTIME_VOICE_') ? {code: problem.code} : {})});
     });

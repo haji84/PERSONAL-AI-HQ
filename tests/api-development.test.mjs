@@ -659,6 +659,16 @@ test('owner API-only work repairs actual source in an isolated Mac and returns a
   assert.equal(published.length, 1);
   assert.equal(published[0].title, 'source.mjs');
   assert.equal(published[0].sha256, operation.changes[0].sha256);
+  const date = published[0].observedAt.slice(0,10);
+  for (const q of ['ＳＯＵＲＣＥ.ｍｊｓ','API fixture',date]) {
+    const found = await (await call('/api/artifacts/work', {query:{q}})).json();
+    assert.deepEqual(found.artifacts,published);
+  }
+  for (const q of ['result.json','定数を修正','Another isolated fixture']) {
+    assert.deepEqual(await (await call('/api/artifacts/work', {query:{q}})).json(),{artifacts:[],nextOffset:null});
+  }
+  assert.equal((await call('/api/artifacts/work', {query:{q:'source.mjs'},auth:false})).status,401);
+  assert.equal((await call('/api/artifacts/work', {query:{q:'source.mjs',offset:16,revision:'a'.repeat(64)}})).status,409);
   const fileQuery = Object.fromEntries(new URLSearchParams(published[0].href.split('?')[1]));
   assert.equal((await call('/api/artifacts/work/file', {query: {...fileQuery, project: 'other-fixture'}})).status, 404);
   assert.equal(await (await call('/api/artifacts/work/file', {query: fileQuery})).text(), 'export const answer = 2;\n');

@@ -7,6 +7,7 @@ import {readCurrentProject} from './portfolio.mjs';
 const evidenceHash = /^[a-f0-9]{64}$/;
 const gitRevision = /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/;
 const pageSize = 8;
+const retainedDescription = 'Codexで検証済み（保存時の版）';
 const windows = process.platform === 'win32';
 const notFound = () => Object.assign(new Error('検証済みの成果物を確認できません。'), {status: 404});
 const validHash = value => typeof value === 'string' && evidenceHash.test(value);
@@ -17,6 +18,10 @@ function fileEvidence(file) {
 
 function downloadLink(project, id, index, part, review) {
   return '/api/artifacts/work/file?' + new URLSearchParams({source: 'codex', project, id, index, part, review});
+}
+
+function artifactFields(claim, file, description) {
+  return {project:claim.project, kind:'file', title:file.path, description, observedAt:claim.source.updatedAt};
 }
 
 function checkedWorkspaceMarker(checkout, projectId) {
@@ -81,26 +86,34 @@ export function createNativeArtifacts(directory, completedArtifactSource) {
   }
 
   return {
-    async list(projects, offset) {
-      const candidates = projects.map(published).filter(Boolean).sort((left, right) =>
+    async list(projects, offset, {search, signal} = {}) {
+      const matches = search?.matches;
+      const candidates = projects.map(published).filter(claim => claim && (!matches ||
+        claim.evidence.slice(2).some(file => matches(artifactFields(claim, file, retainedDescription))))).sort((left, right) =>
         right.source.updatedAt.localeCompare(left.source.updatedAt) || left.project.localeCompare(right.project));
+      const searchRevision = search && createHash('sha256')
+        .update(JSON.stringify([search.query, search.scope, candidates.map(claim => claim.review)])).digest('hex');
+      if (search?.revision && search.revision !== searchRevision) {
+        throw Object.assign(new Error('Artifact search changed'),{status:409,code:'ARTIFACT_SEARCH_CHANGED'});
+      }
       const page = candidates.slice(offset, offset + pageSize);
-      const checks = await Promise.all(page.map(claim => verify(claim)));
+      const checks = await Promise.all(page.map(claim => verify(claim, undefined, {signal})));
       const artifacts = page.flatMap((claim, row) => {
         const check = checks[row];
         if (!check?.readback() || !stillPublished(claim)) return [];
         const [requirements, verification, ...files] = claim.evidence;
         const link = (index, part) => downloadLink(claim.project, claim.source.id, index, part, claim.review);
         return files.map((file, index) => ({
-          project: claim.project, kind: 'file', title: file.path,
-          description: check.archived ? 'Codexで検証済み（保存時の版）' : 'Codexで検証済み',
-          observedAt: claim.source.updatedAt, sha256: file.sha256, href: link(index, 'artifact'),
+          ...artifactFields(claim, file, check.archived ? retainedDescription : 'Codexで検証済み'),
+          sha256: file.sha256, href: link(index, 'artifact'),
           evidence: {requirements: {...requirements, href: link(index, 'requirements')},
             verification: {...verification, href: link(index, 'verification')}},
         }));
       });
       const following = offset + page.length;
-      return {artifacts, nextOffset: following < candidates.length ? following : null};
+      const nextOffset = following < candidates.length ? following : null;
+      return {artifacts:matches ? artifacts.filter(matches) : artifacts, nextOffset,
+        ...(searchRevision && nextOffset !== null && {searchRevision})};
     },
     async artifact(project, id, index, part, review, download) {
       const claim = published(project);

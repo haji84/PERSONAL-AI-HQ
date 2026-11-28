@@ -518,8 +518,11 @@ export function createApiDevelopment({directory, store, conversations, withProje
       }
       return results;
     },
-    listArtifacts(projectIds, offset) {
+    listArtifacts(projectIds, offset, search) {
       const operations = store.listVerifiedApiWork(projectIds);
+      const searchRevision = search && digest([search.query, search.scope, operations.map(({project,operation}) =>
+        [project, operation.executionId, operation.taskId, operation.completedAt, operation.artifactsHash])]);
+      if (search?.revision && search.revision !== searchRevision) throw problem(409,'ARTIFACT_SEARCH_CHANGED');
       const page = operations.slice(offset, offset + 16);
       const files = page.flatMap(({project, operation}) => {
         const report = verifiedReport(project, operation);
@@ -529,7 +532,9 @@ export function createApiDevelopment({directory, store, conversations, withProje
           href: '/api/artifacts/work/file?' + new URLSearchParams({project, id: operation.taskId, index})}));
       });
       const following = offset + page.length;
-      return {artifacts: files, nextOffset: following < operations.length ? following : null};
+      const nextOffset = following < operations.length ? following : null;
+      return {artifacts:search ? files.filter(search.matches) : files, nextOffset,
+        ...(searchRevision && nextOffset !== null && {searchRevision})};
     },
     conversationView(project, result, offset) {
       const {conversation} = result;

@@ -551,6 +551,14 @@ test('GitHub registration promotes only a fresh eligible candidate and preserves
   assert.equal(saved.projects[1].repository, 'https://github.com/fixture-owner/discovered');
   assert.equal(saved.projects[1].state, 'waiting');
   assert.equal(saved.projects[1].enableCodexWrite, undefined);
+  await writeFile(file, JSON.stringify({...seed, projects:[oldProject]}), {mode:0o600});
+  const search = app.url+'/api/artifacts/work?source=codex&project=github-12&q=artifact';
+  const listing = await fetch(search,{headers:{cookie}});
+  assert.equal(listing.status,200);
+  assert.deepEqual(await listing.json(),{artifacts:[],nextOffset:null});
+  const stale = await fetch(search+'&offset=8&revision='+'a'.repeat(64),{headers:{cookie}});
+  assert.equal(stale.status,409);
+  assert.equal((await stale.json()).code,'ARTIFACT_SEARCH_CHANGED');
 });
 
 test('portfolio separates saved modes, accepted route evidence and authoritative stop reasons', async t => {
@@ -2504,6 +2512,22 @@ async function assertPublishedCodexArtifact(t, artifactName, artifactContents) {
   const {artifacts}=await list.json();
   assert.equal(artifacts.length,1);
   assert.equal(artifacts[0].href,downloadItem.href);
+  const search = query => fetch(listPath+'&'+new URLSearchParams({q:query}),{headers:{cookie}});
+  for (const query of [artifactName.toUpperCase(), '検証用プロジェクト', '２０２６/１１/２８ ０９:００']) {
+    const response = await search(query);
+    assert.equal(response.status,200);
+    assert.deepEqual((await response.json()).artifacts,artifacts);
+  }
+  for (const query of ['no-artifacts-match', 'PRIVATE_REQUIREMENTS', '保存時の版']) {
+    assert.deepEqual(await (await search(query)).json(),{artifacts:[],nextOffset:null});
+  }
+  assert.equal((await search('x'.repeat(201))).status,400);
+  assert.equal((await fetch(listPath+'&q=a&q=b',{headers:{cookie}})).status,400);
+  assert.equal((await fetch(listPath+'&q='+encodeURIComponent(artifactName))).status,401);
+  assert.equal((await fetch(listPath+'&q=artifact&offset=8',{headers:{cookie}})).status,400);
+  const staleSearch = await fetch(listPath+'&q=artifact&offset=8&revision='+'a'.repeat(64),{headers:{cookie}});
+  assert.equal(staleSearch.status,409);
+  assert.equal((await staleSearch.json()).code,'ARTIFACT_SEARCH_CHANGED');
   const artifactUrl=app.url+downloadItem.href;
   await writeFile(join(checkout,'.hq-owned-workspace'),'other-project\n');
   assert.equal((await fetch(artifactUrl,{headers:{cookie}})).status,404);
@@ -2537,6 +2561,7 @@ async function assertPublishedCodexArtifact(t, artifactName, artifactContents) {
   assert.equal(after.artifacts.length,1);
   assert.equal(after.artifacts[0].href,artifacts[0].href);
   assert.match(after.artifacts[0].description,/保存時の版/);
+  assert.deepEqual((await (await search('保存時の版')).json()).artifacts,after.artifacts);
   for (const [item,name] of files) {
     const original = await fetch(app.url+item.href,{headers:{cookie}});
     assert.equal(original.status,200);
@@ -2557,6 +2582,7 @@ async function assertPublishedCodexArtifact(t, artifactName, artifactContents) {
   for (const [item] of files) assert.equal((await fetch(app.url+item.href,{headers:{cookie}})).status,404);
   assert.equal(Object.hasOwn((await read('verified-turn')).result,'artifactDownloads'),false);
   assert.deepEqual((await (await fetch(listPath,{headers:{cookie}})).json()).artifacts,[]);
+  assert.deepEqual((await (await search(artifactName)).json()).artifacts,[]);
   await writeFile(join(directory,'portfolio.json'),JSON.stringify({...seed,projects:[project]}),{mode:0o600});
   const unrelated = git([...identity,'commit-tree',next+'^{tree}','-m','separate Git history']);
   git(['checkout','--detach',unrelated]);
