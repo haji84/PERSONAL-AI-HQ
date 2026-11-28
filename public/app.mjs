@@ -1354,6 +1354,7 @@ function projectDetail() {
   if (record?.requirementsReview === true) detail.body.append(requirementsReview(project));
   if (asArray(project.tasks).length) {
     const tasks = node('details', 'scope-info');
+    tasks.dataset.dashboardTasks = '';
     const rows = node('ul', 'task-progress-list');
     rows.append(...project.tasks.map(progressRow));
     tasks.append(node('summary', '', 'この案件の開発タスク'), rows);
@@ -4086,8 +4087,10 @@ function canRefreshVisibleDashboard() {
   if (document.hidden || dom.shell.hidden || ui.view !== 'dashboard' || !ui.portfolio || dom['refresh-button'].disabled) return false;
   const focused = document.activeElement;
   const editing = focused?.matches('input, select, textarea, [contenteditable="true"]');
+  const readingTaskLink = focused?.matches('a') && focused.closest('details[data-dashboard-tasks]');
   const pairing = dom.content.querySelector('[data-pair-expires-at]');
-  return !editing && !dom.content.querySelector('details[open]') && !(Date.parse(pairing?.dataset.pairExpiresAt) > Date.now());
+  return !editing && !readingTaskLink && !dom.content.querySelector('details[open]:not([data-dashboard-tasks])') &&
+    !(Date.parse(pairing?.dataset.pairExpiresAt) > Date.now());
 }
 async function refreshVisibleDashboard() {
   refreshEstimateReadouts();
@@ -4106,11 +4109,27 @@ async function refreshVisibleDashboard() {
       if (setObservedPortfolio(ui.portfolio, connection)) repaintDashboardExecutions();
       return;
     }
-    const focusedProject = document.activeElement?.dataset?.dashboardProject;
+    const focused = document.activeElement;
+    const focusedProject = focused?.dataset?.dashboardProject;
+    const taskList = dom.content.querySelector('details[data-dashboard-tasks][open]');
+    const taskSummaryFocused = Boolean(taskList && focused === taskList.firstElementChild);
+    const bounds = taskList?.getBoundingClientRect();
+    const visibleTaskTop = bounds && bounds.top < innerHeight && bounds.bottom > 0 ? bounds.top : null;
+    const selected = ui.project;
     rememberScroll();
     setObservedPortfolio(latest, connection);
     updateProjectSelect();
     render(true, true);
+    if (taskList && ui.project === selected) {
+      const restoredTasks = dom.content.querySelector('details[data-dashboard-tasks]');
+      if (restoredTasks) {
+        restoredTasks.open = true;
+        if (taskSummaryFocused) restoredTasks.firstElementChild.focus({preventScroll: true});
+        if (visibleTaskTop !== null && pendingScroll) {
+          pendingScroll.y = Math.max(0, scrollY + restoredTasks.getBoundingClientRect().top - visibleTaskTop);
+        }
+      }
+    }
     if (focusedProject) dashboardProjectRow(focusedProject)?.focus({preventScroll: true});
   } catch {
     if (isCurrent()) dom['page-summary'].textContent = dashboardSummary() + ' · 更新できません。前回の情報を表示しています。';
