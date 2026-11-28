@@ -3721,6 +3721,8 @@ function codexTurnEvidence(project, threadId, isCurrent) {
   }};
 }
 
+const codexHistoryPages = new WeakMap();
+
 function codex() {
   const project = ui.project;
   if (!project) return emptyProject();
@@ -3733,7 +3735,11 @@ function codex() {
   const sidebar = node('div', 'stack');
   const current = node('div', 'stack');
   const composer = node('div');
+  const indexKey = memoryKey('codex-index', project);
+  const paging = new Set();
+  let historyRequest;
   let controls;
+  let controlsThread;
   let displayedThread;
   collection.body.remove();
   collection.root.append(items);
@@ -3743,6 +3749,7 @@ function codex() {
   dom.content.append(layout);
   function showControls(target) {
     controls?.cleanup();
+    controlsThread = target?.id;
     if (target === null) {
       controls = null;
       composer.replaceChildren(button('案件全体の操作を表示', () => showControls()));
@@ -3753,7 +3760,7 @@ function codex() {
   }
   showControls();
 
-  function showThread() {
+  function showThread(position) {
     const id = ui.threadIds.get(project);
     if (displayedThread !== id) {
       displayedThread = id;
@@ -3793,8 +3800,17 @@ function codex() {
       destination.append(messages);
       function appendTurns(turns, prepend = false) {
         const rows = asArray(turns);
-        const orderedMessages = rows.flatMap(turn => asArray(turn.messages));
-        messagesInto(messages, orderedMessages, prepend);
+        const chunks = document.createDocumentFragment();
+        for (const turn of rows) {
+          const group = document.createDocumentFragment();
+          messagesInto(group, turn.messages);
+          [...group.children].forEach((message, index) => {
+            message.dataset.historyKey = JSON.stringify([turn.id, index]);
+          });
+          chunks.append(group);
+        }
+        if (prepend) messages.prepend(chunks);
+        else messages.append(chunks);
         return rows.reduce((amount, turn) => amount + (Number.isInteger(turn.itemCount) ? turn.itemCount : 0), 0);
       }
       const itemCount = appendTurns(value?.turns);
@@ -3803,14 +3819,20 @@ function codex() {
       }
       let cursor = value?.nextCursor;
       const more = button('以前のターンを表示', async () => {
+        if (paging.has(key)) return;
+        const connection = connectionGeneration;
+        const canApply = () => messages.isConnected && isCurrent() && connection === connectionGeneration &&
+          resources.get(key)?.value === value;
         more.disabled = true;
+        paging.add(key);
         try {
           const page = await api(apiPath('/api/codex/thread', {project, id, cursor}));
-          if (!destination.isConnected || ui.threadIds.get(project) !== id) return;
+          if (!canApply()) return;
           const initialTop = messages.getBoundingClientRect().height;
           const added = asArray(page?.turns);
           appendTurns(added, true);
           value.turns = [...added, ...asArray(value.turns)];
+          codexHistoryPages.set(value, (codexHistoryPages.get(value) ?? 1) + 1);
           evidence.useTurns(value.turns);
           value.nextCursor = page?.nextCursor;
           cursor = page?.nextCursor;
@@ -3818,8 +3840,8 @@ function codex() {
           if (!more.hidden) messages.prepend(more);
           const growth = messages.getBoundingClientRect().height - initialTop;
           if (growth > 0) scrollBy(0, growth);
-        } catch (error) { setNotice(error.message, true); }
-        finally { more.disabled = false; }
+        } catch (error) { if (canApply()) setNotice(error.message, true); }
+        finally { paging.delete(key); more.disabled = false; }
       });
       more.hidden = typeof cursor !== 'string' || !cursor;
       messages.prepend(more);
@@ -3829,19 +3851,21 @@ function codex() {
           moveToDraft(project, 'chat', recent, 'この案件でのCodexの回答');
         }));
       }
+      restoreHistoryPosition(reading, position);
     }, isCurrent);
   }
-  function showThreads(result, destination) {
+  function showThreads(result, destination, passive = false) {
+    const previousSelection = ui.threadIds.get(project);
     const threads = asArray(result?.data);
     if (!threads.length) {
       const detail = selectedProject()?.codexScopes ?
         'このプロジェクトのスレッドが見つかりません。' : 'このプロジェクトの端末・作業フォルダは未接続です。';
       destination.append(node('p', 'empty', detail));
-      if (!selectedProject()?.codexScopes) {
+      if (!passive && !selectedProject()?.codexScopes) {
         ui.threadIds.delete(project);
         storeTab();
       }
-      showThread();
+      if (!passive || previousSelection !== ui.threadIds.get(project)) showThread();
       return;
     }
     if (!ui.threadIds.get(project)) {
@@ -3856,13 +3880,15 @@ function codex() {
         if (!item?.id || seen.has(item.id)) continue;
         seen.add(item.id);
         added.push(item);
-        rows.append(listItem(rowButton(text(item.title, '無題のスレッド'), '更新 ' + time(item.updatedAt),
+        const row = rowButton(text(item.title, '無題のスレッド'), '更新 ' + time(item.updatedAt),
           ui.threadIds.get(project) === item.id, event => {
             ui.threadIds.set(project, item.id);
             storeTab();
             for (const row of rows.querySelectorAll('button')) row.setAttribute('aria-pressed', String(row === event.currentTarget));
             showThread();
-          }, chip(item.status))));
+          }, chip(item.status));
+        row.dataset.historyKey = item.id;
+        rows.append(listItem(row));
       }
       return added;
     }
@@ -3870,25 +3896,128 @@ function codex() {
     destination.append(rows);
     let cursor = result.nextCursor;
     const next = button('さらにスレッドを表示', async () => {
+      if (paging.has(indexKey)) return;
+      const connection = connectionGeneration;
+      const canApply = () => rows.isConnected && connection === connectionGeneration && resources.get(indexKey)?.value === result;
       next.disabled = true;
+      paging.add(indexKey);
       try {
         const page = await api(apiPath('/api/codex/threads', {project, cursor}));
-        if (!items.isConnected) return;
+        if (!canApply()) return;
         const added = addThreads(asArray(page?.data));
         result.data = [...asArray(result.data), ...added];
+        codexHistoryPages.set(result, (codexHistoryPages.get(result) ?? 1) + 1);
         result.nextCursor = page.nextCursor !== cursor ? page.nextCursor : null;
         cursor = result.nextCursor;
         next.hidden = typeof cursor !== 'string' || !cursor;
-      } catch (error) { setNotice(error.message, true); }
-      finally { next.disabled = false; }
+      } catch (error) { if (canApply()) setNotice(error.message, true); }
+      finally { paging.delete(indexKey); next.disabled = false; }
     });
     next.hidden = typeof cursor !== 'string' || !cursor;
     const pagination = node('div', 'pagination');
     pagination.append(next);
     destination.append(pagination);
-    showThread();
+    if (!passive || previousSelection !== ui.threadIds.get(project)) showThread();
   }
-  fetchView(memoryKey('codex-index', project), apiPath('/api/codex/threads', {project}), items, showThreads);
+
+  function historyPosition(container) {
+    const active = document.activeElement;
+    const rows = [...layout.querySelectorAll('[data-history-key]')];
+    const anchor = layout.contains(active) && !container.contains(active) ? active : rows.find(row => {
+      const {top, bottom} = row.getBoundingClientRect();
+      return top < innerHeight && bottom > 0;
+    });
+    return {anchor, top: anchor?.getBoundingClientRect().top, focus: container.contains(active) ? active?.dataset.historyKey : undefined};
+  }
+
+  function restoreHistoryPosition(container, position) {
+    if (!position) return;
+    const rows = [...container.querySelectorAll('[data-history-key]')];
+    rows.find(row => row.dataset.historyKey === position.focus)?.focus({preventScroll: true});
+    const anchor = position.anchor?.isConnected ? position.anchor : rows.find(row =>
+      row.dataset.historyKey === position.anchor?.dataset.historyKey);
+    if (anchor) scrollBy(0, anchor.getBoundingClientRect().top - position.top);
+  }
+
+  function canRefreshHistory(container) {
+    const selection = document.getSelection();
+    const copying = selection && !selection.isCollapsed &&
+      (container.contains(selection.anchorNode) || container.contains(selection.focusNode));
+    const focused = document.activeElement;
+    return !copying && !container.querySelector('details[open]') &&
+      (!container.contains(focused) || (container === items && focused.hasAttribute('data-history-key')));
+  }
+
+  async function refreshHistoryPane(id, connection, signal) {
+    const key = id ? memoryKey('codex-thread', project, id) : indexKey;
+    const container = id ? reading : items;
+    const field = id ? 'turns' : 'data';
+    const entry = resources.get(key);
+    const current = () => layout.isConnected && !dom.shell.hidden && !document.hidden && !signal.aborted &&
+      ui.view === 'codex' && ui.project === project && connectionGeneration === connection &&
+      resources.get(key) === entry && (!id || ui.threadIds.get(project) === id);
+    if (!entry || entry.pending || paging.has(key) || !canRefreshHistory(container)) return;
+    const previous = entry.value;
+    const pageCount = codexHistoryPages.get(previous) ?? 1;
+    const mayUpdate = () => current() && !paging.has(key) && (codexHistoryPages.get(previous) ?? 1) === pageCount &&
+      canRefreshHistory(container);
+    try {
+      let snapshot, cursor;
+      let page = 0;
+      const batches = [];
+      for (; page < pageCount; page++) {
+        const result = await api(apiPath(id ? '/api/codex/thread' : '/api/codex/threads', {project, id, cursor}), {signal});
+        if (!mayUpdate()) return;
+        if (!Array.isArray(result?.[field]) || (id && result.thread?.id !== id)) throw new Error('Invalid Codex history response');
+        snapshot ??= {...result};
+        batches.push(result[field]);
+        snapshot.nextCursor = typeof result.nextCursor === 'string' && result.nextCursor !== cursor ? result.nextCursor : null;
+        cursor = snapshot.nextCursor;
+        if (!cursor) { page++; break; }
+      }
+      const rows = (id ? batches.reverse() : batches).flat();
+      snapshot[field] = [...new Map(rows.filter(row => row?.id).map(row => [row.id, row])).values()];
+      if (!entry.error && JSON.stringify(snapshot) === JSON.stringify(previous)) return;
+      const position = historyPosition(container);
+      codexHistoryPages.set(snapshot, page);
+      entry.value = snapshot;
+      entry.error = undefined;
+      if (id) showThread(position);
+      else {
+        items.replaceChildren();
+        showThreads(snapshot, items, true);
+        restoreHistoryPosition(items, position);
+      }
+    } catch (error) {
+      if (!current() || ![403, 404].includes(error.status)) return;
+      entry.value = undefined;
+      entry.error = error.message;
+      container.replaceChildren(node('p', 'empty', error.message));
+      if (id) {
+        thread.header.replaceChildren(node('h2', '', 'スレッド詳細'));
+        if (controlsThread === id) showControls(null);
+      }
+    }
+  }
+
+  const interval = window.setInterval(() => {
+    if (historyRequest || document.hidden || dom.shell.hidden || connectionState !== 'connected' || !selectedProject()?.codexScopes) return;
+    const request = new AbortController();
+    historyRequest = request;
+    const signal = AbortSignal.any([request.signal, AbortSignal.timeout(15000)]);
+    const connection = connectionGeneration;
+    const selected = ui.threadIds.get(project);
+    const refresh = [refreshHistoryPane(undefined, connection, signal)];
+    if (selected) refresh.push(refreshHistoryPane(selected, connection, signal));
+    void Promise.allSettled(refresh).finally(() => { historyRequest = undefined; });
+  }, 30000);
+  const cleanup = () => {
+    window.clearInterval(interval);
+    historyRequest?.abort();
+    runViewCleanups.delete(cleanup);
+  };
+  runViewCleanups.add(cleanup);
+  fetchView(indexKey, apiPath('/api/codex/threads', {project}), items, showThreads);
   showThread();
 }
 function artifacts() {
