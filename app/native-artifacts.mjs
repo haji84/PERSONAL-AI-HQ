@@ -1,7 +1,7 @@
 import {createHash} from 'node:crypto';
 import {closeSync, constants, fstatSync, openSync, readSync, realpathSync} from 'node:fs';
 import {basename, join} from 'node:path';
-import {prepareArtifactEvidenceReadback, readCommittedEvidence} from './api-workspace.mjs';
+import {prepareArtifactEvidenceReadback, readPublishedArtifactEvidence} from './api-workspace.mjs';
 import {readCurrentProject} from './portfolio.mjs';
 
 const evidenceHash = /^[a-f0-9]{64}$/;
@@ -64,16 +64,15 @@ export function createNativeArtifacts(directory, completedArtifactSource) {
     }
   }
 
-  function prepareReadback(claim) {
-    return prepareArtifactEvidenceReadback({checkout: claim.checkout, head: claim.head, files: claim.evidence,
-      workspaceProject: claim.project, signal: AbortSignal.timeout(12000)});
-  }
-
   async function verify(claim, includeBytes = false) {
     try {
-      const git = await readCommittedEvidence({checkout: claim.checkout, paths: claim.evidence.map(file => file.path),
-        includeBytes, workspaceProject: claim.project, signal: AbortSignal.timeout(12000)});
-      return git.head === claim.head && git.files.every((file, index) => file.sha256 === claim.evidence[index].sha256) ? git : null;
+      const signal = AbortSignal.timeout(12000);
+      const git = await readPublishedArtifactEvidence({checkout: claim.checkout, approvedRevision: claim.head,
+        paths: claim.evidence.map(file => file.path), includeBytes, workspaceProject: claim.project, signal});
+      if (!git.files.every((file, index) => file.sha256 === claim.evidence[index].sha256)) return null;
+      const readback = await prepareArtifactEvidenceReadback({checkout: claim.checkout, head: git.head, files: claim.evidence,
+        archived: git.archived, workspaceProject: claim.project, signal});
+      return readback ? {...git, readback} : null;
     } catch {
       return null;
     }
@@ -84,13 +83,15 @@ export function createNativeArtifacts(directory, completedArtifactSource) {
       const candidates = projects.map(published).filter(Boolean).sort((left, right) =>
         right.source.updatedAt.localeCompare(left.source.updatedAt) || left.project.localeCompare(right.project));
       const page = candidates.slice(offset, offset + pageSize);
-      const checks = await Promise.all(page.map(async claim => await verify(claim) ? prepareReadback(claim) : null));
+      const checks = await Promise.all(page.map(claim => verify(claim)));
       const artifacts = page.flatMap((claim, row) => {
-        if (!checks[row]?.() || !stillPublished(claim)) return [];
+        const check = checks[row];
+        if (!check?.readback() || !stillPublished(claim)) return [];
         const [requirements, verification, ...files] = claim.evidence;
         const link = (index, part) => downloadLink(claim.project, claim.source.id, index, part, claim.review);
         return files.map((file, index) => ({
-          project: claim.project, kind: 'file', title: file.path, description: 'Codexで検証済み',
+          project: claim.project, kind: 'file', title: file.path,
+          description: check.archived ? 'Codexで検証済み（保存時の版）' : 'Codexで検証済み',
           observedAt: claim.source.updatedAt, sha256: file.sha256, href: link(index, 'artifact'),
           evidence: {requirements: {...requirements, href: link(index, 'requirements')},
             verification: {...verification, href: link(index, 'verification')}},
@@ -106,8 +107,7 @@ export function createNativeArtifacts(directory, completedArtifactSource) {
       const fileIndex = {requirements: 0, verification: 1, artifact: index + 2};
       if (!Object.hasOwn(fileIndex, part)) throw notFound();
       const git = await verify(claim, true);
-      const readback = git && await prepareReadback(claim);
-      if (!readback?.() || !stillPublished(claim)) throw notFound();
+      if (!git?.readback() || !stillPublished(claim)) throw notFound();
       const file = git.files[fileIndex[part]];
       return {bytes: file.bytes, name: basename(file.path)};
     },

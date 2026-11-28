@@ -1491,8 +1491,9 @@ test('Codex chat context includes only committed artifacts attested for the exac
   git(['init','-q']);
   git(['config','core.autocrlf','false']);
   git(['add','--','requirements.txt','verification.txt','artifact.txt']);
-  git(['-c','user.name=Test','-c','user.email=test@example.test','-c','commit.gpgsign=false',
-    '-c','core.hooksPath='+(process.platform==='win32'?'NUL':'/dev/null'),'commit','-qm','isolated fixture']);
+  const identity = ['-c','user.name=Test','-c','user.email=test@example.test','-c','commit.gpgsign=false',
+    '-c','core.hooksPath='+(process.platform==='win32'?'NUL':'/dev/null')];
+  git([...identity,'commit','-qm','isolated fixture']);
   const digest = text => createHash('sha256').update(text).digest('hex');
   const operationId = 'recorded-operation';
   const now = '2026-11-28T00:00:00.000Z';
@@ -1550,6 +1551,44 @@ test('Codex chat context includes only committed artifacts attested for the exac
   const changed = await read('verified-turn');
   assert.equal(changed.coverage.artifactEvidence,'unverified');
   assert.deepEqual(changed.artifacts,[]);
+
+  git(['rm','--','verification.txt']);
+  git(['add','--','artifact.txt']);
+  git([...identity,'commit','-qm','continue with a different artifact']);
+  const next = git(['rev-parse','HEAD']);
+  assert.notEqual(next,project.nativeHandover.checkoutHead);
+  const after = await (await fetch(listPath,{headers:{cookie}})).json();
+  assert.equal(after.artifacts.length,1);
+  assert.equal(after.artifacts[0].href,artifacts[0].href);
+  assert.match(after.artifacts[0].description,/保存時の版/);
+  for (const [item, name] of [[artifacts[0],'artifact.txt'], [artifacts[0].evidence.requirements,'requirements.txt'],
+    [artifacts[0].evidence.verification,'verification.txt']]) {
+    const original = await fetch(app.url+item.href,{headers:{cookie}});
+    assert.equal(original.status,200);
+    assert.equal(await original.text(),fixture[name]);
+  }
+  assert.equal((await read('verified-turn')).coverage.artifactEvidence,'verified');
+  assert.equal(await readFile(join(checkout,'artifact.txt'),'utf8'),'Changed without attestation');
+  assert.equal(git(['rev-parse','HEAD']),next);
+  assert.equal(git(['status','--porcelain']),'?? .hq-owned-workspace');
+  const retainedReadback = await prepareArtifactEvidenceReadback({checkout,head:next,
+    files:project.nativeHandover.artifacts,workspaceProject:'example',archived:true,signal:AbortSignal.timeout(12000)});
+  assert.equal(retainedReadback?.(),true);
+
+  const definition = {...seed,projects:[{...project,nativeHandover:{...project.nativeHandover,shareArtifacts:false}}]};
+  await writeFile(join(directory,'portfolio.json'),JSON.stringify(definition),{mode:0o600});
+  assert.equal((await fetch(artifactUrl,{headers:{cookie}})).status,404);
+  assert.deepEqual((await (await fetch(listPath,{headers:{cookie}})).json()).artifacts,[]);
+  await writeFile(join(directory,'portfolio.json'),JSON.stringify({...seed,projects:[project]}),{mode:0o600});
+  const unrelated = git([...identity,'commit-tree',next+'^{tree}','-m','separate Git history']);
+  git(['checkout','--detach',unrelated]);
+  assert.equal(retainedReadback(),false);
+  assert.equal((await fetch(artifactUrl,{headers:{cookie}})).status,404);
+  assert.deepEqual((await (await fetch(listPath,{headers:{cookie}})).json()).artifacts,[]);
+  const gitInfo = join(checkout,'.git','info');
+  await mkdir(gitInfo,{recursive:true});
+  await writeFile(join(gitInfo,'grafts'),unrelated+' '+project.nativeHandover.checkoutHead+'\n');
+  assert.equal((await fetch(artifactUrl,{headers:{cookie}})).status,404);
 });
 
 test('Codex chat context locates a previously displayed turn from its scoped native history cursor', async t => {

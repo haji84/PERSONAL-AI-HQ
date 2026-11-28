@@ -17,6 +17,7 @@ const UTF8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 const hash = (bytes) => createHash('sha256').update(bytes).digest('hex');
 const windows = process.platform === 'win32';
 const workspaceMarker = '.hq-owned-workspace';
+const gitCommitId = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const execute = promisify(execFile);
 
 function sourcePath(input) {
@@ -127,6 +128,7 @@ export function readOnlyGitInvocation(checkout, args) {
     PATH: windows ? process.env.PATH : '/usr/bin:/bin',
     ...(windows && process.env.SystemRoot && {SystemRoot:process.env.SystemRoot}),
     GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: windows ? 'NUL' : '/dev/null',
+    ...(args[0] === 'merge-base' && {GIT_GRAFT_FILE: windows ? 'NUL' : '/dev/null'}),
     GIT_TERMINAL_PROMPT: '0', GIT_NO_LAZY_FETCH: '1',
   };
   return {executable:windows ? 'git' : '/usr/bin/git',
@@ -137,7 +139,7 @@ function git(checkout, args) {
   try {
     const command = readOnlyGitInvocation(checkout, args);
     return execFileSync(command.executable, command.args, {env:command.env,
-      stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: MAX_FILE_BYTES + 1024, timeout: 3000});
+      stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, maxBuffer: MAX_FILE_BYTES + 1024, timeout: 3000});
   } catch {
     throw new Error('Could not read the approved API source from Git');
   }
@@ -208,7 +210,7 @@ function requireCheckoutRoot(checkout, output) {
 
 function checkedHead(output) {
   const head = output.toString('utf8').trim();
-  if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(head)) throw new Error('Invalid Git HEAD for API workspace');
+  if (!gitCommitId.test(head)) throw new Error('Invalid Git HEAD for API workspace');
   return head;
 }
 
@@ -222,11 +224,17 @@ async function windowsCheckoutHead(checkout, signal) {
   return checkedHead(await readWindowsGit(checkout, ['rev-parse', '--verify', 'HEAD^{commit}'], signal));
 }
 
-async function committedFile(checkout, baseSha, name, tree, { ownerUid, signal } = {}) {
+function regularGitBlob(tree, name) {
   const [mode, actualPath] = tree.split('\t');
-  if (!/^100(?:644|755) blob [a-f0-9]{40,64}$/.test(mode) || actualPath !== name + '\0') {
-    throw new Error('API source must be a regular Git HEAD file');
+  const blob = /^100(?:644|755) blob ([a-f0-9]{40}|[a-f0-9]{64})$/.exec(mode)?.[1];
+  if (!blob || actualPath !== name + '\0') {
+    throw new Error('API source must be a regular Git file');
   }
+  return blob;
+}
+
+async function committedFile(checkout, baseSha, name, tree, { ownerUid, signal } = {}) {
+  regularGitBlob(tree, name);
   const file = await exactFile(checkout, name);
   if (ownerUid !== undefined && file.stat.uid !== ownerUid) throw new Error('API evidence file must belong to the checkout owner');
   const readGit = windows ? readWindowsGit : git;
@@ -235,7 +243,19 @@ async function committedFile(checkout, baseSha, name, tree, { ownerUid, signal }
   return bytes;
 }
 
-export async function readCommittedEvidence({ checkout, paths, signal, includeBytes = false, workspaceProject }) {
+export function readCommittedEvidence(options) {
+  return readGitEvidence(options);
+}
+
+export function readPublishedArtifactEvidence(options) {
+  const { approvedRevision } = options;
+  if (typeof approvedRevision !== 'string' || !gitCommitId.test(approvedRevision)) {
+    throw new Error('A pinned Git revision is required for published artifacts');
+  }
+  return readGitEvidence(options, approvedRevision);
+}
+
+async function readGitEvidence({ checkout, paths, signal, includeBytes = false, workspaceProject }, approvedRevision) {
   signal?.throwIfAborted();
   if (!Array.isArray(paths) || paths.length === 0 || paths.length > MAX_FILES) {
     throw new Error('A bounded list of committed API evidence paths is required');
@@ -247,27 +267,38 @@ export async function readCommittedEvidence({ checkout, paths, signal, includeBy
   const root = await canonicalDirectory(checkout);
   const ownerUid = process.getuid?.();
   if (windows) {
-    await checkWindowsEvidenceScope(checkout, names, workspaceProject, signal);
+    await checkWindowsEvidenceScope(checkout, approvedRevision ? [] : names, workspaceProject, signal);
   } else if (ownerUid === undefined || root.uid !== ownerUid) {
     throw new Error('API evidence checkout must belong to the current user');
   }
   const readHead = windows ? windowsCheckoutHead : checkoutHead;
   const readGit = windows ? readWindowsGit : git;
   const head = await readHead(checkout, signal);
+  const revision = approvedRevision ?? head;
+  const archived = revision !== head;
+  if (archived) {
+    const pinned = await readGit(checkout, ['rev-parse', '--verify', revision + '^{commit}'], signal);
+    if (checkedHead(pinned) !== revision) throw new Error('The published artifact revision is not a pinned commit');
+    await readGit(checkout, ['merge-base', '--is-ancestor', revision, head], signal);
+  } else if (windows && approvedRevision) {
+    await checkWindowsEvidenceScope(checkout, names, workspaceProject, signal);
+  }
   const files = [];
   let size = 0;
   for (const name of names) {
     signal?.throwIfAborted();
-    const tree = await readGit(checkout, ['ls-tree', '-z', head, '--', name], signal);
-    const bytes = await committedFile(checkout, head, name, tree.toString('utf8'), { ownerUid, signal });
+    const tree = (await readGit(checkout, ['ls-tree', '-z', revision, '--', name], signal)).toString('utf8');
+    const bytes = archived
+      ? await readGit(checkout, ['cat-file', 'blob', regularGitBlob(tree, name)], signal)
+      : await committedFile(checkout, head, name, tree, { ownerUid, signal });
     size += bytes.length;
-    if (size > MAX_WORKSPACE_BYTES) throw new Error('Committed API evidence exceeds its size limit');
+    if (bytes.length > MAX_FILE_BYTES || size > MAX_WORKSPACE_BYTES) throw new Error('Committed API evidence exceeds its size limit');
     files.push({ path: name, sha256: hash(bytes), ...(includeBytes ? {bytes} : {}) });
   }
   signal?.throwIfAborted();
   if (await readHead(checkout, signal) !== head) throw new Error('API evidence Git HEAD changed during readback');
   signal?.throwIfAborted();
-  return { head, files };
+  return { head, files, ...(approvedRevision && {archived}) };
 }
 
 function checkedEvidenceBytes(checkout, name, ownerUid, maxBytes) {
@@ -321,18 +352,18 @@ export function checkedEvidenceIsCurrent({ checkout, head, files, requireClean =
   } catch { return false; }
 }
 
-export async function prepareArtifactEvidenceReadback({ checkout, head, files, workspaceProject, signal }) {
-  if (!windows) return () => checkedEvidenceIsCurrent({checkout, head, files});
+export async function prepareArtifactEvidenceReadback({ checkout, head, files, workspaceProject, signal, archived = false }) {
+  if (!windows) return () => !signal?.aborted && checkedEvidenceIsCurrent({checkout, head, files: archived ? [] : files});
   try {
-    const evidence = evidenceEntries(files);
+    const evidence = archived ? [] : evidenceEntries(files);
     const names = evidence.map(({name}) => name);
     await checkWindowsEvidenceScope(checkout, names, workspaceProject, signal);
-    if (await windowsCheckoutHead(checkout, signal) !== head) return null;
-    // The caller checks working bytes after the last asynchronous read, even when listing several projects.
+    if (!archived && await windowsCheckoutHead(checkout, signal) !== head) return null;
+    // A listing can wait for other projects after this check. Recheck the archived checkout or working bytes at publication.
     return () => {
       try {
         return !signal?.aborted && workspaceMarkerMatches(checkout, workspaceProject) &&
-          matchingEvidence(checkout, evidence);
+          (archived ? checkoutHead(checkout) === head : matchingEvidence(checkout, evidence));
       } catch { return false; }
     };
   } catch { return null; }
