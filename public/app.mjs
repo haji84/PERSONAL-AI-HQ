@@ -1286,6 +1286,9 @@ function developmentTasks() {
   if (source?.status === 'current') {
     const record = link(source.evidence?.label, source.evidence?.url);
     if (record) area.body.append(node('p', 'small muted', '案件の観測 ' + time(source.observedAt) + ' '), record);
+    if (source.refresh === 'unavailable') {
+      area.body.append(node('p', 'small muted', 'GitHubの更新を確認できません。確認済みの記録を表示しています。'));
+    }
     if (shared.length) area.body.append(sharedLocalTasks(shared));
     const unlinkedCount = source.unmatched - shared.length;
     if (unlinkedCount > 0) area.body.append(node('p', 'small muted',

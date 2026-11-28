@@ -7,6 +7,7 @@ import {dirname, join} from 'node:path';
 import test from 'node:test';
 import {readCurrentProject, readPortfolio, registerProject} from '../app/portfolio.mjs';
 import * as deliveryRecords from '../app/delivery-records.mjs';
+import {createGithubProjects} from '../app/github-projects.mjs';
 import {startOwnerApp} from '../app/server.mjs';
 import {ensurePrivateDirectory} from '../app/private-directory.mjs';
 
@@ -120,6 +121,122 @@ test('dashboard task observations follow committed records and preserve project 
   assert.equal(scoped.taskProgressSource.unmatched,1);
   assert.equal(scoped.projects[0].tasks[0].title,'Locally recorded task');
   assert.deepEqual(scoped.projects.find(project=>project.id==='github-candidate').tasks,[]);
+});
+
+test('the verified remote branch updates dashboard observations while the saved Git reference and pauses stay intact', async t => {
+  const {directory, checkout, commit, configure, portfolioPath} = await fixture(t);
+  const path = initiative + '/portfolio-observation.json';
+  const recorded = '2026-11-27T06:00:00.000Z';
+  const remoteRef = 'refs/remotes/origin/observed/progress';
+  const tracked = 'https://github.com/fixture-owner/tracked';
+  const record = title => JSON.stringify({taskProgress:{observedAt:recorded,projects:[{
+    repository:tracked,tasks:[{id:'inspection',title,status:'active'}],
+  }]}});
+  const base = await commit({[path]:record('Saved local progress')});
+  const tip = await commit({[path]:record('New GitHub progress')});
+  execFileSync('git',['update-ref',remoteRef,base],{cwd:checkout});
+  await configure([{id:'tracked',name:'Tracked',state:'paused',repository:tracked}]);
+  const settings = JSON.parse(await readFile(portfolioPath,'utf8'));
+  settings.taskProgressSource = {checkout,repository,ref:remoteRef};
+  await writeFile(portfolioPath,JSON.stringify(settings));
+  let observed;
+  let result = {status:'synced',revision:tip,file:Buffer.from(record('New GitHub progress'))};
+  const github = {view:()=>null, taskProgress: async scope => { observed=scope; return result; }};
+  const remote = (await readPortfolio(directory,github,true)).view;
+  assert.deepEqual(observed,{repository,ref:remoteRef,revision:base});
+  assert.equal(remote.projects[0].tasks[0].title,'New GitHub progress');
+  assert.equal(remote.projects[0].state,'paused');
+  assert.deepEqual(remote.projects[0].forecast.schedule.readyTaskIds,[]);
+  assert.equal(remote.taskProgressSource.refresh,'synced');
+  assert.ok(remote.taskProgressSource.evidence.url.includes(tip));
+  assert.equal(execFileSync('git',['rev-parse',remoteRef],{cwd:checkout,encoding:'utf8'}).trim(),base);
+  assert.deepEqual(JSON.parse(await readFile(portfolioPath,'utf8')),settings);
+
+  result = {status:'synced',revision:tip,file:Buffer.from('invalid progress')};
+  const fallback = (await readPortfolio(directory,github,true)).view;
+  assert.equal(fallback.projects[0].tasks[0].title,'Saved local progress');
+  assert.equal(fallback.taskProgressSource.refresh,'unavailable');
+  assert.ok(fallback.taskProgressSource.evidence.url.includes(base));
+});
+
+test('GitHub progress checks are coalesced for the verified owner and preserve the last record on network failure', async t => {
+  const {directory} = await fixture(t);
+  const scope = {repository,ref:'refs/remotes/origin/observed/progress',revision:'a'.repeat(40)};
+  const tip = 'b'.repeat(40);
+  const file = Buffer.from(JSON.stringify({taskProgress:{observedAt:'2026-11-27T06:00:00Z',projects:[]}}));
+  const requests = [];
+  let time = 1000;
+  let account = {id:17,login:'fixture-owner'};
+  let failure;
+  const github = createGithubProjects(directory,{owner:'fixture-owner',now:()=>time,
+    read:async () => ({account,repositories:[{id:41,name:'delivery-records',
+      owner:account,disabled:false,archived:false,fork:false}]}),
+    readTask:async query => {
+      requests.push(query);
+      if (failure === 'network') throw new Error('simulated network loss');
+      if (failure === 'malformed') return {revision:'c'.repeat(40),file:Buffer.from('malformed')};
+      if (failure === 'limited') throw Object.assign(new Error('GitHub request failed'),
+        {stderr:'gh: API rate limit exceeded (HTTP 403)'});
+      if (failure === 'denied') throw Object.assign(new Error('GitHub request failed'),
+        {stderr:'gh: Resource not accessible to this app (HTTP 403)'});
+      return {revision:tip,file};
+    },
+  });
+  const settled = () => new Promise(resolve=>setImmediate(resolve));
+  const discover = async () => {
+    github.view([],true);
+    await settled();
+  };
+  try {
+    assert.deepEqual(github.taskProgress(scope),{status:'unavailable'});
+    github.view([],true);
+    assert.equal(github.taskProgress({...scope,ref:'refs/heads/local'}),null);
+    assert.deepEqual([github.taskProgress(scope),github.taskProgress(scope)], [{status:'checking'},{status:'checking'}]);
+    assert.equal(requests.length,0);
+    await settled();
+    assert.deepEqual(github.taskProgress(scope),{status:'synced',revision:tip,file});
+    assert.deepEqual(requests,[{owner:'fixture-owner',accountId:17,repositoryId:41,name:'delivery-records',
+      branch:'observed/progress',base:scope.revision}]);
+    assert.equal(requests.length,1);
+
+    time += 61_000;
+    failure = 'malformed';
+    await discover();
+    assert.deepEqual(github.taskProgress(scope),{status:'synced',revision:tip,file});
+    await settled();
+    assert.deepEqual(github.taskProgress(scope),{status:'unavailable',revision:tip,file});
+    assert.equal(requests.length,2);
+    assert.equal(requests[1].base,tip);
+    time += 61_000;
+    failure = 'network';
+    await discover();
+    github.taskProgress(scope);
+    await settled();
+    assert.deepEqual(github.taskProgress(scope),{status:'unavailable',revision:tip,file});
+    assert.equal(requests.length,3);
+    assert.equal(requests[2].base,tip);
+    time += 61_000;
+    failure = 'limited';
+    await discover();
+    github.taskProgress(scope);
+    await settled();
+    assert.deepEqual(github.taskProgress(scope),{status:'unavailable',revision:tip,file});
+    assert.equal(requests.length,4);
+    time += 61_000;
+    failure = 'denied';
+    await discover();
+    github.taskProgress(scope);
+    await settled();
+    assert.deepEqual(github.taskProgress(scope),{status:'unavailable'});
+    assert.equal(requests.length,5);
+    time += 61_000;
+    account = {id:98,login:'other-account'};
+    await discover();
+    assert.deepEqual(github.taskProgress(scope),{status:'unavailable'});
+    assert.equal(requests.length,5);
+  } finally {
+    await github.close();
+  }
 });
 
 test('the initial estimate and actual first usable delivery come from fixed commits while the next action updates', async t => {

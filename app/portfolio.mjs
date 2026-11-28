@@ -373,7 +373,7 @@ export async function readPortfolio(directory, githubProjects, refreshGithub = f
   const related = raw.projects.filter(row => row.deliverySource).slice(0,8);
   const [deliveryEntries, taskRecords] = refreshGithub ? await Promise.all([
     Promise.all(related.map(async row => [row.id, await readDeliveryRecord(row.deliverySource)])),
-    raw.taskProgressSource ? readPortfolioTaskRecords(raw.taskProgressSource) : null,
+    raw.taskProgressSource ? readPortfolioTaskRecords(raw.taskProgressSource, githubProjects?.taskProgress) : null,
   ]) : [[], null];
   const deliveryRecords = new Map(deliveryEntries);
   const definitions = new Map(raw.projects.map(row => [row.id, row]));
@@ -417,6 +417,7 @@ export async function readPortfolio(directory, githubProjects, refreshGithub = f
       ...(github && {githubRegistration: {status:github.status, observedAt:github.observedAt, count:github.count}}),
       ...(refreshGithub && raw.taskProgressSource && {taskProgressSource: taskRecords ?
         {status:'current', observedAt:taskRecords.observedAt, evidence:taskRecords.source, unmatched:unmatchedTaskRecords.length,
+          ...(taskRecords.refresh && {refresh:taskRecords.refresh}),
           ...(unlinkedLocalProjects.length && {unlinkedLocalProjects})} :
         {status: 'unavailable'}}),
       projects: visible.map(({cwd, handoverRequirements, nativeHandover, ...project}) => {
