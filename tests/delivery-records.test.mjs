@@ -63,6 +63,8 @@ const plan = `# 実行記録
 const first = {goalStartedAt:'2026-11-27T06:25:25Z', firstUsableAt:'2026-11-27T06:51:19Z',
   elapsedToFirstUsableSeconds:1554, observedAt:'2026-11-27T07:08:21Z', platform:'MacBook',
   localReadback:{anonymousDataStatus:401, ownerSessionStatus:303, portfolioRows:18}};
+const longerTimeline = '\n### 過去の観測\n' +
+  '- 実機から取得した工程の観測行を保存しました。\r\n'.repeat(5000);
 
 test('dashboard task observations follow committed records and preserve project identity and pause state', async t => {
   const {directory, checkout, commit, configure, portfolioPath} = await fixture(t);
@@ -160,6 +162,18 @@ test('the initial estimate and actual first usable delivery come from fixed comm
   assert.equal((await view())[0].deliveryRecord.nextAction, undefined);
   await commit({[initiative + '/DELIVERY.md']:plan + '\n### 新しい観測\n- 次は短い予定。\n- 次は' + '長'.repeat(361) + '\n'});
   assert.equal((await view())[0].deliveryRecord.nextAction, undefined);
+  assert.ok(Buffer.byteLength(longerTimeline) > 256 * 1024);
+  const expanded = await commit({[initiative + '/DELIVERY.md']:plan + longerTimeline + '\n### 最新の観測\r\n- 次は 最新の作業を続ける。'});
+  [row] = await view();
+  assert.equal(row.deliveryRecord.status, 'current');
+  assert.equal(row.deliveryRecord.nextAction, '最新の作業を続ける。');
+  assert.equal(row.deliveryRecord.firstUsable.baselineMinutes.standard, 270);
+  assert.equal(row.deliveryRecord.firstUsable.elapsedSeconds, 1554);
+  assert.ok(row.deliveryRecord.links.some(link => link.url.includes(expanded)));
+  await commit({[initiative + '/DELIVERY.md']:plan + longerTimeline + '\n- 次は 前の節で記録した作業。\n### まだ次工程を記録していない'});
+  [row] = await view();
+  assert.equal(row.deliveryRecord.status, 'current');
+  assert.equal(row.deliveryRecord.nextAction, undefined);
   definitions[0].deliverySource.repository = 'https://github.com/different-owner/delivery-records';
   await configure(definitions);
   assert.equal((await view())[0].deliveryRecord.status, 'unavailable');
@@ -188,6 +202,14 @@ test('execution forecasts read committed matching project records and require th
   assert.deepEqual((await deliveryRecords.readExecutionEstimateSource(condition,'unrelated')).rows,[]);
   await writeFile(join(checkout,file),withRows([{...estimate,firstUsableMinutes:{optimistic:99,standard:99,cautious:99}}]));
   assert.equal((await deliveryRecords.readExecutionEstimateSource(condition,'integration')).rows[0].firstUsableMinutes.standard,6);
+  await commit({[file]:withRows([estimate])+longerTimeline+'\n### 最新の記録\n'});
+  const longRead = await deliveryRecords.readExecutionEstimateSource(condition,'integration');
+  assert.equal(longRead.unavailable,false);
+  assert.deepEqual(longRead.rows.map(row=>row.firstUsableMinutes),[estimate.firstUsableMinutes]);
+  await commit({[file]:withRows([estimate])+longerTimeline+'\n'+fence+'route-estimates\n[]'});
+  assert.deepEqual(await deliveryRecords.readExecutionEstimateSource(condition,'integration'),{rows:[],unavailable:true});
+  await commit({[file]:withRows([estimate])+longerTimeline.repeat(14)});
+  assert.deepEqual(await deliveryRecords.readExecutionEstimateSource(condition,'integration'),{rows:[],unavailable:true});
   await commit({[file]:withRows([{...estimate,evidence:['absent-observation.json']}])});
   assert.deepEqual(await deliveryRecords.readExecutionEstimateSource(condition,'integration'),{rows:[],unavailable:true});
 });

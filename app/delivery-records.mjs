@@ -3,7 +3,7 @@ import {createHash} from 'node:crypto';
 import {lstat, realpath} from 'node:fs/promises';
 import {dirname, isAbsolute, join, normalize} from 'node:path';
 import {promisify} from 'node:util';
-import {readBoundedWorkspaceFile, readOnlyGitInvocation} from './api-workspace.mjs';
+import {readBoundedWorkspaceFile, readOnlyGitInvocation, readOnlyGitOutput} from './api-workspace.mjs';
 
 const cli = promisify(execFile);
 const initiative = 'docs/initiatives/chatgpt-codex-integration';
@@ -22,6 +22,8 @@ const accepted = new Set(['ACCEPTED_RUNTIME_BOTH_HOSTS', 'PROVEN_WITH_LIMITS', '
 const recordScope = {'integration-milestone':'統合アプリの初回提供', 'environment-audit':'共通開発環境の初期構築'};
 const coverageStatuses = ['verified','partial','open','blocked','reference'];
 const evidenceName = /^(?:[a-z0-9.-]+-observation\.json|DELIVERY\.md|EXECUTION_MODES\.md)$/;
+const evidenceBytes = 256 * 1024;
+const timelineBytes = 4 * 1024 * 1024;
 
 function gitHubRepository(value) {
   return typeof value === 'string' ?
@@ -57,7 +59,7 @@ async function openSource(source, {allowHead=false, localOnly=false} = {}) {
   async function git(...arguments_) {
     const command = readOnlyGitInvocation(checkout, arguments_);
     return (await cli(command.executable, command.args, {env:command.env, signal, encoding:'buffer',
-      timeout:3000, maxBuffer:256 * 1024})).stdout;
+      timeout:3000, maxBuffer:evidenceBytes})).stdout;
   }
   const root = await git('rev-parse','--show-toplevel');
   if (normalize(root.toString().trim()) !== checkout) throw new Error('Delivery source identity did not match');
@@ -66,18 +68,44 @@ async function openSource(source, {allowHead=false, localOnly=false} = {}) {
   const revision = selected.toString().trim();
   if ((!localOnly && gitHubRepository(origin.toString().trim())?.toLowerCase() !== repository.toLowerCase()) ||
       !commitId.test(revision)) throw new Error('Delivery source identity did not match');
-  async function objects(version, names) {
-    const tree = (await git('ls-tree','-z',version,'--',...names)).toString().split('\0');
+  async function treeEntries(version, names, includeSize = false) {
+    const flags = includeSize ? ['-l','-z'] : ['-z'];
+    const tree = (await git('ls-tree',...flags,version,'--',...names)).toString().split('\0');
     return names.map(name => {
-      const object = tree.find(line => line.endsWith('\t' + name))?.split('\t')[0];
-      if (!/^100(?:644|755) blob (?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(object ?? '')) throw new Error('Delivery record is not a file');
-      return object.split(' ')[2];
+      const entry = tree.find(line => line.indexOf('\t') >= 0 && line.slice(line.indexOf('\t') + 1) === name);
+      const match = /^100(?:644|755) blob ([a-f0-9]{40}(?:[a-f0-9]{24})?)(?: +(\d+))?$/.exec(entry?.split('\t',1)[0] ?? '');
+      if (!match) throw new Error('Delivery record is not a file');
+      return {oid:match[1],size:Number(match[2])};
     });
+  }
+  async function objects(version, names) {
+    return (await treeEntries(version,names)).map(entry => entry.oid);
   }
   async function files(version, names) {
     return Promise.all((await objects(version,names)).map(object => git('cat-file','blob',object)));
   }
-  return {repository, revision, git, files, objects};
+  async function* timelineLines() {
+    const [{oid,size}] = await treeEntries(revision,[timelinePath],true);
+    if (!Number.isSafeInteger(size) || size < 0 || size > timelineBytes) throw new Error('Invalid delivery timeline size');
+    const decoder = new TextDecoder('utf-8',{fatal:true});
+    let sizeRead = 0;
+    let remainder = '';
+    for await (const chunk of readOnlyGitOutput(checkout,['cat-file','blob',oid],signal)) {
+      sizeRead += chunk.length;
+      if (sizeRead > size) throw new Error('Delivery timeline did not match its Git blob');
+      const lines = (remainder + decoder.decode(chunk,{stream:true})).split('\n');
+      remainder = lines.pop();
+      if (remainder.length > evidenceBytes) throw new Error('Delivery timeline line is too long');
+      for (const line of lines) {
+        if (line.length > evidenceBytes) throw new Error('Delivery timeline line is too long');
+        yield line.endsWith('\r') ? line.slice(0,-1) : line;
+      }
+    }
+    if (sizeRead !== size) throw new Error('Delivery timeline did not match its Git blob');
+    const tail = remainder + decoder.decode();
+    if (tail) yield tail.endsWith('\r') ? tail.slice(0,-1) : tail;
+  }
+  return {repository, revision, git, files, objects, timelineLines};
 }
 
 function originalPlan(text) {
@@ -101,8 +129,8 @@ async function integrationRecord(source, reader) {
       typeof observationCommit !== 'string' || !commitId.test(observationCommit)) throw new Error('Missing fixed delivery records');
   await Promise.all([git('merge-base','--is-ancestor',baselineCommit,observationCommit),
     git('merge-base','--is-ancestor',observationCommit,revision)]);
-  const [[baseline], [evidence], [current], commitDate, initialCommitDate, evidenceCommitDate] = await Promise.all([
-    files(baselineCommit,[timelinePath]), files(observationCommit,[firstReleasePath]), files(revision,[timelinePath]),
+  const [[baseline], [evidence], nextAction, commitDate, initialCommitDate, evidenceCommitDate] = await Promise.all([
+    files(baselineCommit,[timelinePath]), files(observationCommit,[firstReleasePath]), latestTimelineAction(reader),
     git('show','-s','--format=%cI',revision), git('show','-s','--format=%cI',baselineCommit),
     git('show','-s','--format=%cI',observationCommit),
   ]);
@@ -121,9 +149,6 @@ async function integrationRecord(source, reader) {
       proof.localReadback?.anonymousDataStatus !== 401 || proof.localReadback?.ownerSessionStatus !== 303) {
     throw new Error('First usable observation did not match the original timeline');
   }
-  const latestSection = current.toString().trimEnd().split(/^#{2,3} [^\r\n]+\r?\n/m).at(-1);
-  const nextItems = [...latestSection.matchAll(/^- 次は([^\r\n]*)\r?$/gm)].map(item => item[1].trim());
-  const nextAction = nextItems.length === 1 && nextItems[0].length <= 360 ? nextItems[0] || undefined : undefined;
   return {observedAt:iso(commitDate.toString().trim()), nextAction,
     originalFullForecast:plan.originalFullForecast,
     firstUsable:{baselineRecordedAt:plan.baselineRecordedAt,baselineMinutes:plan.baselineMinutes,actualAt,elapsedSeconds,
@@ -131,6 +156,21 @@ async function integrationRecord(source, reader) {
     links:[link(repository,baselineCommit,timelinePath,'着手前の見積もり'),
       link(repository,observationCommit,firstReleasePath,'実際の初回提供'),
       link(repository,revision,timelinePath,'開発の進行記録')]};
+}
+
+async function latestTimelineAction(reader) {
+  let count = 0;
+  let next;
+  for await (const line of reader.timelineLines()) {
+    if (/^#{2,3} .+$/.test(line)) {
+      count = 0;
+      next = undefined;
+    } else if (line.startsWith('- 次は')) {
+      count++;
+      next = line.slice('- 次は'.length).trim();
+    }
+  }
+  return count === 1 && next && next.length <= 360 ? next : undefined;
 }
 
 async function environmentRecord(source, reader) {
@@ -181,17 +221,28 @@ export async function readExecutionEstimateSource(source, projectId) {
   try {
     const reader = await openSource(source);
     const {repository, revision} = reader;
-    const [timeline] = await reader.files(revision,[timelinePath]);
-    const text = timeline.toString('utf8');
-    const fences = [...text.matchAll(/^```route-estimates[ \t]*\r?$/gm)];
-    const blocks = [...text.matchAll(/^```route-estimates[ \t]*\r?\n([\s\S]*?)^```[ \t]*\r?$/gm)];
-    if (fences.length !== blocks.length) throw new Error('Incomplete route estimate');
-    const rows = blocks.flatMap(match=>{
-      const items = JSON.parse(match[1]);
-      if (!Array.isArray(items) || items.some(item=>typeof item?.project !== 'string')) throw new Error('Invalid route estimate');
-      return items.filter(item=>item.project === projectId);
-    });
-    if (rows.length > 256 || rows.some(row=>!Array.isArray(row.evidence) || !row.evidence.length ||
+    const rows = [];
+    let block = null;
+    let blockBytes = 0;
+    for await (const line of reader.timelineLines()) {
+      if (/^```route-estimates[ \t]*$/.test(line)) {
+        if (block) throw new Error('Incomplete route estimate');
+        block = [];
+        blockBytes = 0;
+      } else if (block && /^```[ \t]*$/.test(line)) {
+        const items = JSON.parse(block.join('\n'));
+        if (!Array.isArray(items) || items.some(item => typeof item?.project !== 'string')) throw new Error('Invalid route estimate');
+        rows.push(...items.filter(item => item.project === projectId));
+        if (rows.length > 256) throw new Error('Too many route estimates');
+        block = null;
+      } else if (block) {
+        blockBytes += Buffer.byteLength(line) + 1;
+        if (blockBytes > evidenceBytes) throw new Error('Route estimate block is too large');
+        block.push(line);
+      }
+    }
+    if (block) throw new Error('Incomplete route estimate');
+    if (rows.some(row=>!Array.isArray(row.evidence) || !row.evidence.length ||
       row.evidence.length > 8 || row.evidence.some(name=>typeof name !== 'string' || !evidenceName.test(name)))) {
       throw new Error('Route estimate evidence is invalid');
     }

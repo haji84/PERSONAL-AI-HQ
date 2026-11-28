@@ -256,21 +256,25 @@ async function hashArtifactStream(stream, size, includeBytes = false) {
   return {sha256: digest.digest('hex'), ...(bytes && {bytes})};
 }
 
-async function readLargeGitArtifact(checkout, {oid, size}, includeBytes, signal) {
-  const {executable, args, env} = readOnlyGitInvocation(checkout, ['cat-file', 'blob', oid]);
+export async function* readOnlyGitOutput(checkout, command, signal) {
+  const {executable, args, env} = readOnlyGitInvocation(checkout, command);
   const child = spawn(executable, args, {env, signal, stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true});
   const exited = new Promise(resolve => {
     child.once('error', () => resolve(false));
     child.once('close', code => resolve(code === 0));
   });
   try {
-    const result = await hashArtifactStream(child.stdout, size, includeBytes);
-    if (!await exited) throw new Error('Could not read the approved artifact from Git');
-    return result;
+    yield* child.stdout;
+    if (!await exited) throw new Error('Could not read the approved Git data');
+    signal?.throwIfAborted();
   } finally {
     if (child.exitCode === null && child.signalCode === null) child.kill();
     await exited;
   }
+}
+
+function readLargeGitArtifact(checkout, {oid, size}, includeBytes, signal) {
+  return hashArtifactStream(readOnlyGitOutput(checkout, ['cat-file', 'blob', oid], signal), size, includeBytes);
 }
 
 const evidenceFileStamp = stat => [stat.dev, stat.ino, stat.uid, stat.size, stat.ctimeNs, stat.mtimeNs];
