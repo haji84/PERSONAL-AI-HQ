@@ -2084,7 +2084,7 @@ function moveToDraft(project, kind, item, description) {
   location.hash = kind;
 }
 
-function directChatWork(project, conversation, current, reviewed, openWork) {
+function directChatWork(project, conversation, current, reviewed, openWork, refreshSource) {
   const key = chatDirectWorkKey(project);
   const draftKey = memoryKey('chat-direct-codex-draft',project,conversation);
   const area = node('section','run-control');
@@ -2098,9 +2098,12 @@ function directChatWork(project, conversation, current, reviewed, openWork) {
   status.setAttribute('role','status');
   const send = button('この会話からCodexに依頼', () => void start());
   const check = button('依頼の受付を照合', () => void reconcile(false));
-  const retry = button('同じ受付番号で再送', () => void reconcile(true));
+  const refresh = button('元の会話を更新', () => {
+    if (active() && intent() && notFound && !busy) refreshSource();
+  });
+  const retry = button('同じ受付番号で再送', () => void retryWithReview());
   const actions = node('div','run-actions');
-  actions.append(send,check,retry);
+  actions.append(send,check,refresh,retry);
   area.append(label,actions,status);
 
   const active = () => area.isConnected && current();
@@ -2111,6 +2114,10 @@ function directChatWork(project, conversation, current, reviewed, openWork) {
   const busyElsewhere = () => (pending() && !intent()) || ui.runIntents.has(project) ||
     ui.runIntents.has(projectDispatchKey(project)) || ui.runIntents.has(memoryKey('api-work',project));
   let policy, timer, busy = false, notFound = false;
+  const updatedReview = saved => {
+    const review = reviewed();
+    return review && review.sha256 !== saved?.sha256 ? review : null;
+  };
 
   function paint() {
     const saved = intent();
@@ -2118,8 +2125,10 @@ function directChatWork(project, conversation, current, reviewed, openWork) {
     send.hidden = Boolean(saved);
     send.disabled = busy || Boolean(busyElsewhere()) || !reviewed();
     check.hidden = !saved;
+    refresh.hidden = !saved || !notFound;
     retry.hidden = !saved || !notFound;
-    check.disabled = busy;
+    retry.textContent = updatedReview(saved) ? '再照合した会話で同じ受付番号を送信' : '同じ受付番号で再送';
+    check.disabled = refresh.disabled = busy;
     retry.disabled = busy || !allowed();
     if (pending() && !saved) status.textContent = '別の会話からの依頼を先に照合してください。';
   }
@@ -2135,6 +2144,17 @@ function directChatWork(project, conversation, current, reviewed, openWork) {
     }
     ui.runIntents.set(key,{conversation,id:crypto.randomUUID(),prompt,...review});
     storeTab();
+    await reconcile(true);
+  }
+
+  async function retryWithReview() {
+    const saved = intent();
+    if (!active() || !allowed() || busy || !saved || !notFound) return;
+    const review = updatedReview(saved);
+    if (review) {
+      ui.runIntents.set(key,{...saved,...review});
+      storeTab();
+    }
     await reconcile(true);
   }
 
@@ -2159,7 +2179,7 @@ function directChatWork(project, conversation, current, reviewed, openWork) {
       if (!active() || generation !== connectionGeneration || intent()?.id !== input.id) return;
       if (!post && Array.isArray(result?.works) && result.works.length === 0) {
         notFound = true;
-        status.textContent = 'この受付は確認できません。同じ番号で再送できます。';
+        status.textContent = 'この受付は確認できません。同じ番号で再送するか、元の会話を更新してから再照合できます。';
         return;
       }
       const work = post ? result?.operation : result?.works?.length === 1 ? result.works[0] : null;
@@ -2202,7 +2222,7 @@ function directChatWork(project, conversation, current, reviewed, openWork) {
   return {area,paint,activate};
 }
 
-function chatCodexHandoff(project, conversation, isCurrent, openWork) {
+function chatCodexHandoff(project, conversation, isCurrent, openWork, refreshSource) {
   const details = node('details', 'scope-info');
   details.append(node('summary', '', '会話と資料をCodexへ'));
   const status = node('p', 'small muted');
@@ -2223,7 +2243,7 @@ function chatCodexHandoff(project, conversation, isCurrent, openWork) {
   let loading = false;
   const draftKey = memoryKey('codex-draft', project);
   const direct = directChatWork(project,conversation.id,() => details.open && isCurrent(),() =>
-    prepared?.generation === connectionGeneration ? prepared.review : null,openWork);
+    prepared?.generation === connectionGeneration ? prepared.review : null,openWork,refreshSource);
 
   async function prepare() {
     if (loading || !details.open || !isCurrent()) return;
@@ -2314,6 +2334,7 @@ function chatCodexHandoff(project, conversation, isCurrent, openWork) {
     void prepare();
   });
   details.append(label, refresh, status, preview, direct.area, attach);
+  if (ui.runIntents.get(chatDirectWorkKey(project))?.conversation === conversation.id) details.open = true;
   return details;
 }
 
@@ -3661,7 +3682,11 @@ function chat() {
           destination.append(work.root);
         }
         if (asArray(conversation.messages).length && selectedProject()?.codexWrite === true && ui.capabilities.codexWrite === true) {
-          destination.append(chatCodexHandoff(project,conversation,detailIsCurrent,() => work?.show()));
+          destination.append(chatCodexHandoff(project,conversation,detailIsCurrent,() => work?.show(),() => {
+            if (!detailIsCurrent()) return;
+            evictChats(project);
+            showChatDetails();
+          }));
         }
       }
       if (apiArchive && conversation.outcome === 'completed') {
