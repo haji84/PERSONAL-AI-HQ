@@ -1883,6 +1883,7 @@ function memoryKey(...parts) {
   return JSON.stringify(parts);
 }
 const projectDispatchKey = project => memoryKey('project-dispatch', project);
+const chatDirectWorkKey = project => memoryKey('chat-direct-codex',project);
 function evictChats(project) {
   for (const key of resources.keys()) {
     const [kind, id] = JSON.parse(key);
@@ -2083,7 +2084,125 @@ function moveToDraft(project, kind, item, description) {
   location.hash = kind;
 }
 
-function chatCodexHandoff(project, conversation, isCurrent) {
+function directChatWork(project, conversation, current, reviewed, openWork) {
+  const key = chatDirectWorkKey(project);
+  const draftKey = memoryKey('chat-direct-codex-draft',project,conversation);
+  const area = node('section','run-control');
+  const label = node('label','picker');
+  const draft = node('textarea','draft');
+  draft.maxLength = 16000;
+  draft.value = ui.drafts.get(draftKey) ?? '';
+  draft.addEventListener('input', () => { ui.drafts.set(draftKey,draft.value); storeTab(); });
+  label.append(node('span','','Codexへの作業指示'),draft);
+  const status = node('p','small muted');
+  status.setAttribute('role','status');
+  const send = button('この会話からCodexに依頼', () => void start());
+  const check = button('依頼の受付を照合', () => void reconcile(false));
+  const retry = button('同じ受付番号で再送', () => void reconcile(true));
+  const actions = node('div','run-actions');
+  actions.append(send,check,retry);
+  area.append(label,actions,status);
+
+  const active = () => area.isConnected && current();
+  const pending = () => ui.runIntents.get(key);
+  const intent = () => pending()?.conversation === conversation ? pending() : undefined;
+  const allowed = () => ui.capabilities.codexWrite === true && selectedProject()?.codexWrite === true &&
+    asArray(policy?.value?.settings?.allowedRoutes).includes('subscription');
+  const busyElsewhere = () => (pending() && !intent()) || ui.runIntents.has(project) ||
+    ui.runIntents.has(projectDispatchKey(project)) || ui.runIntents.has(memoryKey('api-work',project));
+  let policy, timer, busy = false, notFound = false;
+
+  function paint() {
+    const saved = intent();
+    area.hidden = !allowed() && !saved;
+    send.hidden = Boolean(saved);
+    send.disabled = busy || Boolean(busyElsewhere()) || !reviewed();
+    check.hidden = !saved;
+    retry.hidden = !saved || !notFound;
+    check.disabled = busy;
+    retry.disabled = busy || !allowed();
+    if (pending() && !saved) status.textContent = '別の会話からの依頼を先に照合してください。';
+  }
+
+  async function start() {
+    const review = reviewed();
+    if (!active() || !allowed() || !review || busy || pending() || busyElsewhere()) return;
+    const prompt = draft.value.trim();
+    if (!prompt || prompt.length > 16000) {
+      status.textContent = '16,000字以内で作業指示を入力してください。';
+      draft.focus();
+      return;
+    }
+    ui.runIntents.set(key,{conversation,id:crypto.randomUUID(),prompt,...review});
+    storeTab();
+    await reconcile(true);
+  }
+
+  async function reconcile(post) {
+    const saved = intent();
+    if (!active() || busy || !saved || (post && !allowed())) return;
+    clearTimeout(timer);
+    busy = true;
+    notFound = false;
+    paint();
+    const generation = connectionGeneration;
+    const {attempted, conversation:source, ...input} = saved;
+    if (post) {
+      ui.runIntents.set(key,{...saved,attempted:true});
+      storeTab();
+    }
+    status.textContent = post ? '会話とCodexの利用条件を照合しています…' : 'この会話の受付を照合しています…';
+    try {
+      const result = await (post ? api(apiPath('/api/chat/handoff',{project,id:source}),{
+        method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(input),signal:AbortSignal.timeout(24000),
+      }) : api(apiPath('/api/chat/codex-work',{project,id:source,receipt:input.id}),{signal:AbortSignal.timeout(12000)}));
+      if (!active() || generation !== connectionGeneration || intent()?.id !== input.id) return;
+      if (!post && Array.isArray(result?.works) && result.works.length === 0) {
+        notFound = true;
+        status.textContent = 'この受付は確認できません。同じ番号で再送できます。';
+        return;
+      }
+      const work = post ? result?.operation : result?.works?.length === 1 ? result.works[0] : null;
+      if (work?.id !== input.id || !Object.hasOwn(runPhases,work.phase) || (post && work.project !== project)) {
+        throw new Error('この会話の受付を確認できませんでした。');
+      }
+      status.textContent = '契約内Codex · ' + runPhases[work.phase];
+      openWork();
+      if (work.turnId || finishedPhases.has(work.phase)) {
+        if (work.turnId && work.phase !== 'failed' && draft.value.trim() === input.prompt) {
+          ui.drafts.delete(draftKey);
+          draft.value = '';
+        }
+        ui.runIntents.delete(key);
+        storeTab();
+      } else if (work.phase !== 'unconfirmed' && !document.hidden) {
+        timer = setTimeout(() => void reconcile(false),2500);
+      }
+    } catch (error) {
+      if (!active() || intent()?.id !== input.id) return;
+      status.textContent = error.message;
+      if (post && !attempted && [400,403,409,413].includes(error.status)) {
+        ui.runIntents.delete(key);
+        storeTab();
+      }
+    } finally {
+      busy = false;
+      if (active()) paint();
+    }
+  }
+  function activate() {
+    if (!policy) {
+      policy = viewResource(memoryKey('execution-settings',project),apiPath('/api/execution/settings',{project}));
+      if (policy.pending) void policy.pending.then(() => { if (active()) paint(); });
+    }
+    paint();
+    if (intent()) void reconcile(false);
+  }
+  area.hidden = true;
+  return {area,paint,activate};
+}
+
+function chatCodexHandoff(project, conversation, isCurrent, openWork) {
   const details = node('details', 'scope-info');
   details.append(node('summary', '', '会話と資料をCodexへ'));
   const status = node('p', 'small muted');
@@ -2103,12 +2222,15 @@ function chatCodexHandoff(project, conversation, isCurrent) {
   let prepared;
   let loading = false;
   const draftKey = memoryKey('codex-draft', project);
+  const direct = directChatWork(project,conversation.id,() => details.open && isCurrent(),() =>
+    prepared?.generation === connectionGeneration ? prepared.review : null,openWork);
 
   async function prepare() {
     if (loading || !details.open || !isCurrent()) return;
     prepared = undefined;
     preview.hidden = true;
     attach.disabled = true;
+    direct.paint();
     const displayed = asArray(conversation.messages).length;
     const through = Number(endPicker.value);
     endPicker.max = String(displayed);
@@ -2119,10 +2241,11 @@ function chatCodexHandoff(project, conversation, isCurrent) {
     loading = true;
     refresh.disabled = true;
     status.textContent = '会話と資料を照合しています…';
+    const generation = connectionGeneration;
     try {
       const viewed = asArray(conversation.messages).slice(Math.max(0, through - 40), through);
       const viewSha256 = await attachmentDigest(new TextEncoder().encode(JSON.stringify(viewed)));
-      if (!isCurrent() || !details.open || Number(endPicker.value) !== through) return;
+      if (!isCurrent() || !details.open || generation !== connectionGeneration || Number(endPicker.value) !== through) return;
       const result = await api(apiPath('/api/chat/handoff',
         {project, id: conversation.id, through, observedAt: conversation.importedAt, viewSha256}),
         {signal: AbortSignal.timeout(8000)});
@@ -2144,14 +2267,16 @@ function chatCodexHandoff(project, conversation, isCurrent) {
         throw new Error('対象の会話と収録範囲を確認できませんでした。');
       }
       const digest = await attachmentDigest(bytes, document.name);
-      if (!isCurrent() || !details.open || Number(endPicker.value) !== through) return;
+      if (!isCurrent() || !details.open || generation !== connectionGeneration || Number(endPicker.value) !== through) return;
       const rangeLabel = '発言 ' + (range.start + 1) + '〜' + range.end + ' を収録';
       status.textContent = [rangeLabel, (range.hasEarlier || range.hasLater) && 'ほかの発言は会話履歴で確認',
         imageCount && '画像' + imageCount + '件の参照を収録'].filter(Boolean).join(' · ');
       preview.textContent = document.text;
       preview.hidden = false;
-      prepared = {file: new File([bytes], document.name, {type: 'application/json'}), digest, rangeLabel};
+      prepared = {file:new File([bytes],document.name,{type:'application/json'}),digest,rangeLabel,generation,
+        review:{through,observedAt:conversation.importedAt,viewSha256,sha256}};
       attach.disabled = false;
+      direct.paint();
     } catch (error) {
       if (isCurrent() && details.open) status.textContent = error.message;
     } finally {
@@ -2163,7 +2288,7 @@ function chatCodexHandoff(project, conversation, isCurrent) {
   function stage() {
     if (!prepared || !details.open || !isCurrent() || selectedProject()?.codexWrite !== true ||
         ui.capabilities.codexWrite !== true) return;
-    if (ui.runIntents.has(project) || ui.steerIntents.has(project)) {
+    if (ui.runIntents.has(project) || ui.runIntents.has(chatDirectWorkKey(project)) || ui.steerIntents.has(project)) {
       status.textContent = 'Codexで保留中の受付を照合してから添付してください。';
       return;
     }
@@ -2180,13 +2305,15 @@ function chatCodexHandoff(project, conversation, isCurrent) {
     prepared = undefined;
     attach.disabled = true;
     preview.hidden = true;
+    direct.paint();
   });
   details.addEventListener('toggle', () => {
     if (!details.open) return;
     endPicker.value = String(asArray(conversation.messages).length);
+    direct.activate();
     void prepare();
   });
-  details.append(label, refresh, status, preview, attach);
+  details.append(label, refresh, status, preview, direct.area, attach);
   return details;
 }
 
@@ -3383,7 +3510,10 @@ function linkedCodexWork(project, conversation, isCurrent, stageResult) {
       rows.replaceChildren();
     }
   });
-  return details;
+  return {root:details,show() {
+    if (!details.open) details.open = true;
+    void load();
+  }};
 }
 
 const validLinkedCodexId = value => typeof value === 'string' && codexRecordId.test(value);
@@ -3525,11 +3655,13 @@ function chat() {
       updateTransfer();
       destination.append(transfer);
       if (['chatgpt-export', 'chatgpt-live'].includes(conversation.source)) {
+        let work;
         if (selectedProject()?.codexScopes) {
-          destination.append(linkedCodexWork(project, conversation.id, detailIsCurrent, plan?.stageCodexResult));
+          work = linkedCodexWork(project,conversation.id,detailIsCurrent,plan?.stageCodexResult);
+          destination.append(work.root);
         }
         if (asArray(conversation.messages).length && selectedProject()?.codexWrite === true && ui.capabilities.codexWrite === true) {
-          destination.append(chatCodexHandoff(project, conversation, detailIsCurrent));
+          destination.append(chatCodexHandoff(project,conversation,detailIsCurrent,() => work?.show()));
         }
       }
       if (apiArchive && conversation.outcome === 'completed') {
@@ -3909,7 +4041,7 @@ function mountCodexRun(area, project, draft, draftKey, choices, apiReady, {hando
   }
   function hasRoom() {
     return run.known && !readingAttachment && (!apiMode || apiReady()?.available === true) && !ui.runIntents.has(runKey) &&
-      !ui.runIntents.has(projectDispatchKey(project)) &&
+      !ui.runIntents.has(projectDispatchKey(project)) && !ui.runIntents.has(chatDirectWorkKey(project)) &&
       (!run.operation || finishedPhases.has(run.operation.phase));
   }
   function paint() {
@@ -4350,7 +4482,8 @@ function mountProjectDispatch(area, project, draft, draftKey, settings, choices,
   const current = () => !disposed && section.isConnected && ui.view === 'codex' && ui.project === project;
   const eligible = () => Boolean(intent()) || ['auto','hybrid'].includes(settings?.value?.settings?.mode);
   const terminal = operation => finishedPhases.has(operation.phase);
-  const otherIntent = () => ui.runIntents.has(project) || ui.runIntents.has(memoryKey('api-work',project));
+  const otherIntent = () => ui.runIntents.has(project) || ui.runIntents.has(memoryKey('api-work',project)) ||
+    ui.runIntents.has(chatDirectWorkKey(project));
 
   function paint() {
     section.hidden = !eligible();

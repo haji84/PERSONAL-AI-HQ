@@ -486,13 +486,19 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
       const params = target.searchParams;
       const projectId = params.get('project');
       const id = params.get('id');
+      const receipt = params.get('receipt');
       const missing = () => error(404, 'この案件のChatGPT会話を確認できません。');
-      if (params.size !== 2 || !projectId || !id || id.length > 160) throw missing();
+      if (params.size !== (receipt === null ? 2 : 3) || params.getAll('project').length !== 1 ||
+          params.getAll('id').length !== 1 || !projectId || !id || id.length > 160) throw missing();
       const project = readCurrentProject(directory,projectId);
       if (!project) throw missing();
       const conversation = chats.read(project.id,id,0,{reconcile:false})?.conversation;
       if (conversation?.id !== id || !['chatgpt-export','chatgpt-live'].includes(conversation.source)) throw missing();
-      return send(response, 200, {works:operations.workForChat(project,id)});
+      const works = await operations.workForChat(project,id,receipt);
+      if (!signedIn()) throw error(401,'サインインが必要です。');
+      const current = readCurrentProject(directory,projectId);
+      if (!current || current.cwd.length !== project.cwd.length || current.cwd.some(cwd=>!project.cwd.includes(cwd))) throw missing();
+      return send(response, 200, {works});
     }
     if (get && route === '/api/chat/plan' && plan) return send(response, 200, await plan.auth.status());
     if (post && route === '/api/chat/plan/authorize' && plan) {
@@ -711,6 +717,41 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
     }
     if (get && route === '/api/chat/handoff') {
       return send(response, 200, readChatHandoff(chats, project, target.searchParams));
+    }
+    if (post && route === '/api/chat/handoff') {
+      const params = target.searchParams;
+      const conversationId = params.get('id');
+      if (params.size !== 2 || params.getAll('project').length !== 1 || !conversationId || conversationId.length > 160) {
+        throw error(400,'案件と会話を1件指定してください。');
+      }
+      const input = await jsonBody(request,64000);
+      const fields = ['id','prompt','through','observedAt','viewSha256','sha256'];
+      if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).length !== fields.length ||
+          fields.some(key=>!Object.hasOwn(input,key)) || !Number.isSafeInteger(input.through) ||
+          typeof input.observedAt !== 'string' || typeof input.viewSha256 !== 'string' ||
+          typeof input.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(input.sha256)) {
+        throw error(400,'指示と照合済みの会話範囲を指定してください。');
+      }
+      const review = new URLSearchParams({project:project.id,id:conversationId,through:input.through,
+        observedAt:input.observedAt,viewSha256:input.viewSha256});
+      const currentScope = () => {
+        if (!signedIn()) throw error(401,'サインインが必要です。');
+        const current = readCurrentProject(directory,project.id);
+        if (!current || current.cwd.length !== project.cwd.length || current.cwd.some(cwd=>!project.cwd.includes(cwd))) {
+          throw error(404,'この案件の作業先を確認できません。');
+        }
+        return current;
+      };
+      const assertCurrent = () => {
+        const checked = readChatHandoff(chats,currentScope(),review);
+        if (checked.sha256 !== input.sha256) throw error(409,'会話と資料をもう一度照合してください。');
+        return checked.document;
+      };
+      const document = assertCurrent();
+      const result = await operations.start(project,{id:input.id,prompt:input.prompt,stage:'implementation',route:'subscription',document},
+        {canDispatch:signedIn,chatReview:{conversationId,assertCurrent}});
+      currentScope();
+      return send(response,202,result);
     }
     if (route === '/api/chat/live') {
       if (get) return send(response, 200, {turn: chats.readLive(project.id, target.searchParams.get('id'))});

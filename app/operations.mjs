@@ -134,7 +134,8 @@ export function createOperations(directory, native, execution, {prepareHandover,
           AND conflict.threadId=saved.threadId AND conflict.turnId=saved.turnId
           AND conflict.workspace IN (SELECT value FROM json_each(?3)))`;
   const linkedChatRows = db.prepare(`SELECT saved.id,saved.phase,saved.threadId,saved.turnId,saved.createdAt,saved.updatedAt,
-      saved.cancellationRequestedAt,saved.fingerprint FROM codex_operations AS saved WHERE ${linkedChatScope}
+      saved.cancellationRequestedAt,saved.fingerprint FROM codex_operations AS saved
+    WHERE ${linkedChatScope} AND (?5 IS NULL OR saved.id=?5)
     ORDER BY saved.createdAt DESC, saved.rowid DESC LIMIT ?4`);
   const linkedChatReceipt = db.prepare(`SELECT saved.workspace,saved.fingerprint,saved.phase,saved.threadId,saved.turnId,
       saved.createdAt,saved.updatedAt,saved.startedAt,saved.cancellationRequestedAt
@@ -404,10 +405,19 @@ export function createOperations(directory, native, execution, {prepareHandover,
           (row.cancellationRequestedAt !== null && !observedWorkTime(row.cancellationRequestedAt, updated))) return null;
       return {workspace:row.workspace, snapshot:JSON.stringify(row)};
     },
-    workForChat(project, conversationId) {
+    async workForChat(project, conversationId, receipt = null) {
+      const scope = JSON.stringify(project.cwd);
+      if (receipt !== null) {
+        if (typeof receipt !== 'string' || !allowedId.test(receipt)) {
+          throw problem(400,'この会話の作業受付番号を指定してください。');
+        }
+        if (linkedChatReceipt.get(project.id,conversationId,scope,receipt)) {
+          await runtimeResult(byId.get(project.id,receipt));
+        }
+      }
       const works = [];
       const now = Date.now();
-      for (const row of linkedChatRows.all(project.id, conversationId, JSON.stringify(project.cwd), workOutcomeLimit)) {
+      for (const row of linkedChatRows.all(project.id,conversationId,scope,workOutcomeLimit,receipt)) {
         if (!allowedId.test(row.id) || !reviewHash.test(row.fingerprint) ||
             (!active.has(row.phase) && !terminal.has(row.phase)) || !observedWorkTime(row.updatedAt, now)) continue;
         const updated = Date.parse(row.updatedAt);
@@ -501,7 +511,7 @@ export function createOperations(directory, native, execution, {prepareHandover,
       return {activity: {id: row.id, kind: 'codex', phase: isTerminal || isRecent || currentPhase === 'cancelling' ? currentPhase : 'unconfirmed',
         observedAt: row.updatedAt, createdAt: row.createdAt, startedAt: row.startedAt, terminal: isTerminal}};
     },
-    async start(project, input, {expectedRevision, replayOnly = false, canDispatch} = {}) {
+    async start(project, input, {expectedRevision, replayOnly = false, canDispatch, chatReview} = {}) {
       const handover = input?.handover;
       const beginsHandover = handover !== undefined;
       const threadTarget = input?.expectedThreadId;
@@ -538,7 +548,10 @@ export function createOperations(directory, native, execution, {prepareHandover,
       const digest = createHash('sha256').update(JSON.stringify(identity)).digest('hex');
       const duplicate = () => {
         const row = byId.get(project.id, input.id);
-        if (row && (row.fingerprint !== digest || row.workspace !== expected)) throw problem(409, '送信IDが別の指示に使われています。');
+        if (row && (row.fingerprint !== digest || row.workspace !== expected ||
+            (chatReview && row.chatConversationId !== chatReview.conversationId))) {
+          throw problem(409, '送信IDが別の指示に使われています。');
+        }
         return row;
       };
       let row = duplicate();
@@ -596,7 +609,9 @@ export function createOperations(directory, native, execution, {prepareHandover,
           if (expectedRevision !== undefined && !execution.isCurrent(project, expectedRevision, stage, expected, route, handoverReceipt)) {
             throw problem(409,'案件の実行設定が変わりました。','EXECUTION_SETTINGS_CHANGED');
           }
-          const chatConversationId = reference ? chatConversationForHandoff?.(project, reference) ?? null : null;
+          chatReview?.assertCurrent();
+          const chatConversationId = chatReview?.conversationId ??
+            (reference ? chatConversationForHandoff?.(project,reference) ?? null : null);
           if (!freshUsage(admissionObservedAt)) throw usageProblem('CODEX_SUBSCRIPTION_USAGE_UNCONFIRMED');
           if (!insert.run(project.id, input.id, expected, digest, timestamp(), timestamp(), stage, route, handoverReceipt,
             handover?.review ?? null, input.resume ?? null, previous?.threadId ?? null, chatConversationId).changes) throw resumeUnavailable();
@@ -634,11 +649,13 @@ export function createOperations(directory, native, execution, {prepareHandover,
         beforeThread: () => {
           if (!maySubmit()) return false;
           if (!freshUsage(admissionObservedAt)) throw usageProblem('CODEX_SUBSCRIPTION_USAGE_UNCONFIRMED');
+          chatReview?.assertCurrent();
           return true;
         }, beforeTurn,
         onThread: id => {
           if ((previous && id !== previous.threadId) || !maySubmit() || (beginsHandover && stillCurrent?.() !== true)) return false;
           if (!freshUsage(usageObservedAt)) throw usageProblem('CODEX_SUBSCRIPTION_USAGE_UNCONFIRMED');
+          chatReview?.assertCurrent();
           return setThread.run(id, timestamp(), Object.keys(chosen).length ? JSON.stringify(chosen) : null, project.id, input.id).changes === 1;
         },
       }).then(result => {
@@ -651,7 +668,8 @@ export function createOperations(directory, native, execution, {prepareHandover,
           if (current?.phase === 'reserved') {
             const failure = Object.hasOwn(subscriptionUsageMessages, error?.code) ? subscriptionUsageMessages[error.code] :
               error?.code === 'CODEX_RESUME_TARGET_UNAVAILABLE' ? resumeUnavailable().message :
-                handoverReceipt ? '送信直前の引継ぎ条件またはCodex接続を確認できませんでした。' : '';
+                chatReview ? '会話の照合条件またはCodex接続を確認できず、送信前に停止しました。' :
+                  handoverReceipt ? '送信直前の引継ぎ条件またはCodex接続を確認できませんでした。' : '';
             if (failure) append.run(failure, timestamp(), project.id, input.id);
             advance(current, 'failed');
           }

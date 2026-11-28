@@ -1262,6 +1262,119 @@ test('chat handoff preserves a bounded, displayed message range of a same-projec
   assert.equal((await read({through:'42'})).status, 413);
 });
 
+test('direct ChatGPT handoff binds exactly one Codex receipt to the approved conversation', async t => {
+  const {directory, start} = await runtimeFixture(t);
+  const checkout = join(directory, 'workspaces', 'example');
+  await mkdir(checkout, {recursive: true, mode: 0o700});
+  await writeFile(join(checkout, '.hq-owned-workspace'), 'example\n');
+  await writeFile(join(directory, 'portfolio.json'), JSON.stringify({...seed, projects: [
+    {...seed.projects[0], cwd: checkout, enableCodexWrite: true},
+    {id: 'other', name: 'Different project'},
+  ]}), {mode: 0o600});
+  const sends = [];
+  let beforeWire;
+  const app = await start({codex: {
+    canWrite: true, subscriptionReady: async () => true, usage: async () => ordinaryUsage(),
+    models: async () => ({accountType: 'chatgpt', data: [{id: 'controlled', isDefault: true, reasoningEfforts: []}]}),
+    async submit(options) {
+      assert.equal(options.beforeThread(), true);
+      await options.beforeTurn();
+      await beforeWire?.();
+      const thread = 'wire-' + options.requestId;
+      if (options.onThread(thread) !== true) throw new Error('Fixture send gate denied');
+      sends.push({id: options.requestId, document: options.document, prompt: options.prompt});
+      return {turn: {id: 'turn-' + options.requestId, status: 'completed'}};
+    },
+  }});
+  const cookie = await login(app);
+  const call = (route, params = {}, data, authenticated = true) => fetch(app.url + route + '?' +
+    new URLSearchParams({project: 'example', ...params}), {
+      method: data ? 'POST' : 'GET',
+      headers: {...(authenticated && {cookie}), ...(data && {Origin: app.url, 'Content-Type': 'application/json'})},
+      ...(data && {body: JSON.stringify(data)}),
+    });
+  const selected = {id: 'direct-conversation'};
+  const archive = (id, modified = 1, message = '確認済みの作業条件') => ({id, title: id, update_time: modified, current_node: 'm',
+    mapping: {m: {parent: null, message: {author: {role: 'user'}, content: {parts: [message]}}}}});
+  const other = {id: 'other-conversation'};
+  assert.equal((await call('/api/chat/import', {}, [archive(selected.id), archive(other.id)])).status, 200);
+  assert.equal((await call('/api/chat/import', {project: 'other'}, [archive(selected.id)])).status, 200);
+  const {conversation} = await (await call('/api/chat', selected)).json();
+  const scope = {through: 1, observedAt: conversation.importedAt,
+    viewSha256: createHash('sha256').update(JSON.stringify(conversation.messages)).digest('hex')};
+  const preview = await call('/api/chat/handoff', {...selected, ...scope});
+  assert.equal(preview.status, 200);
+  const {document, sha256} = await preview.json();
+  const input = {id: 'direct-chat-receipt', prompt: 'この手順を確かめる', ...scope, sha256};
+  assert.equal((await call('/api/chat/handoff', selected, input, false)).status, 401);
+  assert.equal((await call('/api/chat/handoff', {...selected, project: 'unknown-project'}, input)).status, 404);
+  assert.equal((await call('/api/chat/handoff', selected, {...input, viewSha256: '0'.repeat(64)})).status, 409);
+  assert.equal((await call('/api/chat/handoff', selected, {...input, sha256: 'f'.repeat(64)})).status, 409);
+  assert.equal((await call('/api/chat/handoff', selected, {...input, document})).status, 400);
+  assert.equal((await call('/api/chat/handoff', other, input)).status, 409);
+  assert.equal((await call('/api/chat/handoff', {...selected, project: 'other'}, input)).status, 409);
+
+  const settings = (revision, mode) => call('/api/execution/settings', {},
+    {revision, settings: {mode, ...(mode === 'api-only' && {apiBudgetUsd: 1})}});
+  assert.equal((await settings(0, 'api-only')).status, 200);
+  assert.equal((await call('/api/chat/handoff', selected, input)).status, 409);
+  assert.deepEqual(sends, []);
+  assert.equal((await settings(1, 'subscription-only')).status, 200);
+
+  const startFromChat = (data = input) => call('/api/chat/handoff', selected, data);
+  const accepted = await Promise.all([startFromChat(), startFromChat()]);
+  for (const reply of accepted) {
+    assert.equal(reply.status, 202, await reply.clone().text());
+    assert.equal((await reply.json()).operation.id, input.id);
+  }
+  const readOperation = async (id, phase) => {
+    for (let attempt = 0; attempt < 30; attempt++) {
+      const reply = await call('/api/codex/run', {id});
+      assert.equal(reply.status, 200);
+      const {operation} = await reply.json();
+      if (operation?.phase === phase) return operation;
+      await delay(20);
+    }
+    assert.fail('The fixture did not reach the expected Codex receipt phase');
+  };
+  const completed = await readOperation(input.id, 'completed');
+  assert.equal(completed.explicitRoute, 'subscription');
+  assert.deepEqual(sends, [{id: input.id, document, prompt: input.prompt}]);
+  assert.equal((await startFromChat()).status, 202);
+  assert.equal((await startFromChat({...input, prompt: 'Changed request'})).status, 409);
+  const getWork = (params, authenticated = true) => call('/api/chat/codex-work', params, undefined, authenticated);
+  const exact = {...selected, receipt: input.id};
+  assert.equal((await getWork(exact, false)).status, 401);
+  const found = await getWork(exact);
+  assert.equal(found.status, 200);
+  const {works: [receipt]} = await found.json();
+  assert.deepEqual(receipt, {id: input.id, phase: 'completed', threadId: completed.threadId,
+    turnId: completed.turnId, observedAt: completed.updatedAt});
+  assert.deepEqual(await (await getWork(selected)).json(), {works: [receipt]});
+  for (const otherScope of [{...other, receipt: input.id}, {...exact, project: 'other'}, {...exact, receipt: 'missing-receipt'}]) {
+    const hidden = await getWork(otherScope);
+    assert.equal(hidden.status, 200);
+    assert.deepEqual(await hidden.json(), {works: []});
+  }
+
+  beforeWire = async () => {
+    const updated = await call('/api/chat/import', {}, [archive(selected.id, 2, '送信前に変わった作業条件')]);
+    assert.equal(updated.status, 200);
+  };
+  const stale = {...input, id: 'direct-chat-stale'};
+  const reserved = await startFromChat(stale);
+  assert.equal(reserved.status, 202);
+  const unsuccessful = await readOperation(stale.id, 'failed');
+  assert.equal(unsuccessful.threadId, null);
+  assert.equal(unsuccessful.turnId, null);
+  const {conversation: refreshed} = await (await call('/api/chat', selected)).json();
+  assert.equal(refreshed.messages[0].text, '送信前に変わった作業条件');
+  assert.deepEqual(await (await getWork({...selected, receipt: stale.id})).json(), {works: [
+    {id: stale.id, phase: 'failed', threadId: null, turnId: null, observedAt: unsuccessful.updatedAt},
+  ]});
+  assert.deepEqual(sends, [{id: input.id, document, prompt: input.prompt}]);
+});
+
 test('chat handoff preserves complete live text attachments and only includes image references', async t => {
   const {directory, start} = await runtimeFixture(t);
   await writeFile(join(directory, 'portfolio.json'), JSON.stringify(seed), {mode: 0o600});
