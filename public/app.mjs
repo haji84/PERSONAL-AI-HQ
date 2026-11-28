@@ -52,6 +52,7 @@ const ui = {
   theme: ['light', 'dark', 'system'].includes(saved.theme) ? saved.theme : 'system',
   showChatDevelopment: savedTab.showChatDevelopment === true,
   chatIds: new Map(Object.entries(savedTab.chatIds ?? {})),
+  chatNativeLocations: new Map(),
   threadIds: new Map(Object.entries(savedTab.threadIds ?? {})),
   options: new Map(Object.entries(saved.modelOptions ?? {})),
   scroll: new Map(Object.entries(savedTab.scroll ?? {})),
@@ -333,6 +334,7 @@ function endSession() {
   activitySession = undefined;
   resources.clear();
   ui.attachmentDrafts.clear();
+  ui.chatNativeLocations.clear();
   ui.artifactReading.clear();
   for (const key of ui.scroll.keys()) {
     if (key.startsWith('artifacts:')) ui.scroll.delete(key);
@@ -3611,10 +3613,25 @@ function chat() {
   const readContainer = thread.body;
   const adviceHost = node('div', 'stack');
   const items = node('div');
-  const searchWrap = node('div', 'search-wrap');
+  const searchWrap = node('form', 'search-wrap');
   const codexStatus = node('div', 'small muted');
   const codexThreads = new Map();
+  const bodyMatches = new Map();
+  const bodyStatus = node('p', 'small muted');
+  bodyStatus.setAttribute('role', 'status');
+  const searchAvailable = Boolean(details.codexScopes);
+  const chatIsCurrent = () => layout.isConnected && ui.view === 'chat' && ui.project === project;
+  const latestTurns = button('最新のターンを表示', () => {
+    if (!chatIsCurrent()) return;
+    ui.chatNativeLocations.delete(project);
+    showChatDetails();
+  });
+  latestTurns.hidden = true;
+  thread.header.append(latestTurns);
   let debounce;
+  let bodySearchRequest;
+  let bodySearchCursor;
+  let bodySearchComplete = false;
   let nextThreadPage = null;
   let explicitSelection = Boolean(ui.chatIds.get(project));
   let cleanupHandoff;
@@ -3635,7 +3652,7 @@ function chat() {
     adviceHost.replaceChildren(advice.root);
     cleanupAdvice = advice.cleanup;
   }
-  function showChatDetails() {
+  function showChatDetails(revealMatch = false) {
     abortLocalDictation();
     stopSpeech();
     cleanupHandoff?.();
@@ -3647,14 +3664,20 @@ function chat() {
       realtime?.conversationChanged(id);
     }
     const nativeId = id?.startsWith('codex/') ? id.slice('codex/'.length) : null;
+    const savedLocation = ui.chatNativeLocations.get(project);
+    const match = savedLocation?.id === id ? savedLocation : null;
+    const initialCursor = match?.turnCursor ?? null;
+    latestTurns.hidden = initialCursor === null;
     showAdvice(nativeId);
     if (!id) {
       readContainer.replaceChildren(node('p', 'muted', '履歴から会話を選んでください。'));
       return;
     }
     const detail = (offset, cursor) => nativeId ? apiPath('/api/codex/thread', {project, id: nativeId, cursor}) : apiPath('/api/chat', {project, id, offset});
-    const key = memoryKey('chat-detail', project, id);
-    fetchView(key, detail(0), readContainer, (result, destination) => {
+    const detailSelectionCurrent = () => chatIsCurrent() && ui.chatIds.get(project) === id &&
+      ui.chatNativeLocations.get(project) === savedLocation;
+    const key = memoryKey('chat-detail', project, id, initialCursor);
+    fetchView(key, detail(0, initialCursor), readContainer, (result, destination) => {
       cleanupHandoff?.();
       cleanupHandoff = undefined;
       const conversation = nativeId ? {title: result?.thread?.title, source: 'codex-history', importedAt: result?.thread?.updatedAt,
@@ -3663,7 +3686,7 @@ function chat() {
         destination.append(node('p', 'empty', '会話を読み込めませんでした。'));
         return;
       }
-      thread.header.replaceChildren(node('h2', '', text(conversation.title, '会話')));
+      thread.header.replaceChildren(node('h2', '', text(conversation.title, '会話')), latestTurns);
       const apiArchive = conversation.source === 'api-development';
       const source = chatSourceLabels[conversation.source] ?? '取得元未確認';
       const observed = conversation.source === 'chatgpt-export' ? '取り込み ' : '更新 ';
@@ -3678,9 +3701,35 @@ function chat() {
       const empty = node('p', 'muted', '表示できる発言がありません。');
       const imageScope = conversation.source === 'chatgpt-live' ? {project, id, reuseImage: plan?.reuseImage} : undefined;
       if (!messagesInto(messages, conversation.messages, false, imageScope)) messages.append(empty);
+      if (match) {
+        let index = 0;
+        let target;
+        for (const turn of asArray(result.turns)) {
+          for (const message of asArray(turn.messages)) {
+            if (!['user', 'assistant', 'agent'].includes(message?.role)) continue;
+            if (!target && result.thread?.id === nativeId && turn.id === match.turnId &&
+                typeof message.text === 'string' && message.text.toLowerCase().includes(match.query)) {
+              target = messages.children[index];
+            }
+            index++;
+          }
+        }
+        if (target) {
+          target.tabIndex = -1;
+          target.setAttribute('role', 'group');
+          target.setAttribute('aria-label', '検索に一致した発言');
+          if (revealMatch) requestAnimationFrame(() => {
+            if (!detailSelectionCurrent() || !target.isConnected) return;
+            target.focus({preventScroll: true});
+            target.scrollIntoView({block: 'center'});
+          });
+        } else {
+          destination.insertBefore(node('p', 'small muted', '一致した発言を確認できません。履歴を検索し直してください。'), messages);
+        }
+      }
       let offset = result.nextOffset;
       let cursor = result.nextCursor;
-      const detailIsCurrent = () => messages.isConnected && ui.project === project && ui.chatIds.get(project) === id;
+      const detailIsCurrent = () => messages.isConnected && detailSelectionCurrent();
       if (conversation.source === 'openai-realtime' && ui.capabilities.realtimeVoice === true && realtimeConversationId.test(id) &&
           asArray(conversation.messages).some(message => typeof message.turnId === 'string')) {
         const continueVoice = button(realtimeContinueLabel, () => {
@@ -3751,18 +3800,22 @@ function chat() {
       if (apiArchive && conversation.outcome === 'completed') {
         cleanupHandoff = mountChatHandoff(destination, project, conversation, detailIsCurrent);
       }
-    }, () => ui.chatIds.get(project) === id);
+    }, detailSelectionCurrent);
   }
   function searchChats(query) {
     const key = memoryKey('chat-index', project, query);
     const path = apiPath('/api/chat', {project, q: query});
     fetchView(key, path, items, (result, destination) => {
       const needle = query.trim().toLowerCase();
-      const conversations = [...asArray(result?.conversations),
-        ...[...codexThreads.values()].filter(thread => !needle || (thread.title ?? '').toLowerCase().includes(needle))]
+      const codexConversations = new Map([...codexThreads].filter(([, thread]) => !needle ||
+        (thread.title ?? '').toLowerCase().includes(needle)));
+      for (const [id, match] of bodyMatches) codexConversations.set(id, match);
+      const conversations = [...asArray(result?.conversations), ...codexConversations.values()]
         .sort((a, b) => (Date.parse(b.importedAt) || 0) - (Date.parse(a.importedAt) || 0));
       if (!conversations.length) {
-        destination.append(node('p', 'empty', query ? '一致する会話がありません。' : 'このプロジェクトの会話履歴はありません。'));
+        if (!needle || !searchAvailable) {
+          destination.append(node('p', 'empty', needle ? '一致する会話がありません。' : 'このプロジェクトの会話履歴はありません。'));
+        }
         if (!ui.chatIds.get(project)) showChatDetails();
         return;
       }
@@ -3773,24 +3826,102 @@ function chat() {
       }
       const rows = node('ul', 'rows');
       for (const conversation of conversations) {
+        const match = bodyMatches.get(conversation.id);
         rows.append(listItem(rowButton(text(conversation.title, '無題の会話'),
-          `${chatSourceLabels[conversation.source] ?? '取得元未確認'} · ${time(conversation.importedAt)}`,
+          [chatSourceLabels[conversation.source] ?? '取得元未確認', time(conversation.importedAt),
+            match && '本文で一致'].filter(Boolean).join(' · '),
           ui.chatIds.get(project) === conversation.id, event => {
+            if (!chatIsCurrent() || search.value !== query) return;
             explicitSelection = true;
             ui.chatIds.set(project, conversation.id);
+            if (match) {
+              ui.chatNativeLocations.set(project, match);
+              pendingScroll = null;
+            } else ui.chatNativeLocations.delete(project);
             storeTab();
             for (const row of rows.querySelectorAll('button')) row.setAttribute('aria-pressed', String(row === event.currentTarget));
-            showChatDetails();
+            showChatDetails(Boolean(match));
           })));
       }
       destination.append(rows);
-      if (needle && codexThreads.size) destination.append(node('p', 'small muted', 'Codexは取得済みのスレッド名を検索します。'));
-    }, () => search.value === query);
+    }, () => chatIsCurrent() && search.value === query);
   }
   const search = queryInput(routeKey(), '会話を検索', 'タイトル・本文を検索', query => {
+    bodySearchRequest?.abort();
+    bodySearchRequest = undefined;
+    bodyMatches.clear();
+    bodySearchCursor = undefined;
+    bodySearchComplete = false;
+    bodyStatus.textContent = '';
+    updateBodySearchButton();
     clearTimeout(debounce);
     debounce = setTimeout(() => { if (items.isConnected) searchChats(query); }, 180);
   });
+  search.maxLength = 200;
+  const searchBody = node('button', 'button secondary');
+  searchBody.type = 'submit';
+  function updateBodySearchButton() {
+    searchBody.hidden = !searchAvailable || !search.value.trim();
+    searchBody.disabled = Boolean(bodySearchRequest);
+    searchBody.textContent = bodySearchCursor ? 'さらに検索' : bodySearchComplete ? '再検索' : 'Codex本文検索';
+    searchBody.setAttribute('aria-label', bodySearchCursor ? 'Codex本文をさらに検索' :
+      bodySearchComplete ? 'Codex本文を再検索' : 'Codex本文を検索');
+  }
+  searchWrap.addEventListener('submit', async event => {
+    event.preventDefault();
+    if (!searchAvailable || searchBody.hidden || searchBody.disabled || !chatIsCurrent()) return;
+    const typed = search.value;
+    const q = typed.trim().slice(0, 200);
+    if (bodySearchComplete) {
+      bodyMatches.clear();
+      bodySearchCursor = undefined;
+      bodySearchComplete = false;
+      searchChats(typed);
+    }
+    const controller = new AbortController();
+    bodySearchRequest = controller;
+    updateBodySearchButton();
+    bodyStatus.textContent = 'Codex本文を検索中…';
+    const current = () => chatIsCurrent() && bodySearchRequest === controller && search.value === typed;
+    try {
+      const result = await api(apiPath('/api/codex/history-search', {project, q, cursor: bodySearchCursor}),
+        {signal: controller.signal});
+      if (!current()) return;
+      if (!Array.isArray(result?.matches) || (result.nextCursor !== null &&
+          (typeof result.nextCursor !== 'string' || !result.nextCursor || result.nextCursor === bodySearchCursor))) {
+        throw new Error('Invalid Codex history search response');
+      }
+      for (const match of result.matches) {
+        if (!validLinkedCodexId(match?.id) || !validLinkedCodexId(match.turnId) ||
+            (match.turnCursor !== null && (typeof match.turnCursor !== 'string' || !match.turnCursor))) continue;
+        const id = `codex/${match.id}`;
+        if (!bodyMatches.has(id)) bodyMatches.set(id, {
+          id, title: match.title, importedAt: match.updatedAt, source: 'codex-history',
+          turnId: match.turnId, turnCursor: match.turnCursor, query: q.toLowerCase(),
+        });
+      }
+      bodySearchCursor = result.nextCursor;
+      bodySearchComplete = bodySearchCursor === null;
+      bodyStatus.textContent = bodySearchCursor ? `Codex本文 ${bodyMatches.size}件一致。検索を続けられます。` :
+        bodyMatches.size ? `Codex本文 ${bodyMatches.size}件一致。` : 'Codex本文に一致する会話がありません。';
+      searchChats(typed);
+    } catch {
+      if (current()) bodyStatus.textContent = 'Codex本文を検索できませんでした。再試行してください。';
+    } finally {
+      if (bodySearchRequest === controller) {
+        bodySearchRequest = undefined;
+        updateBodySearchButton();
+      }
+    }
+  });
+  updateBodySearchButton();
+  function stopHistorySearch() {
+    clearTimeout(debounce);
+    bodySearchRequest?.abort();
+    bodySearchRequest = undefined;
+    runViewCleanups.delete(stopHistorySearch);
+  }
+  runViewCleanups.add(stopHistorySearch);
   const nextCodex = button('以前のCodexスレッドを取得', async () => {
     nextCodex.disabled = true;
     try {
@@ -3811,6 +3942,7 @@ function chat() {
     searchChats(search.value);
   }
   searchWrap.append(search);
+  if (searchAvailable) searchWrap.append(searchBody, bodyStatus);
   collection.body.remove();
   collection.root.append(searchWrap, items, codexStatus);
   if (ui.capabilities.chatImport === true) collection.root.append(importSection(project));
@@ -3820,6 +3952,7 @@ function chat() {
     if (ui.view !== 'chat' || ui.project !== project || !layout.isConnected) return;
     explicitSelection = true;
     ui.chatIds.set(project, id);
+    ui.chatNativeLocations.delete(project);
     storeTab();
     evictChats(project);
     showChatDetails();
@@ -3839,6 +3972,7 @@ function chat() {
   if (requestedVoice && ui.capabilities.realtimeVoice === true) {
     explicitSelection = true;
     ui.chatIds.set(project, `codex/${requestedVoice.thread}`);
+    ui.chatNativeLocations.delete(project);
     storeTab();
     realtime.consultCodex(requestedVoice.thread, requestedVoice.turn, requestedVoice.title);
   }

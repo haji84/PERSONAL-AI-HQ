@@ -78,6 +78,37 @@ async function fixture(t, {accountType = 'chatgpt', redirect, thread = fixtureTh
   }};
 }
 
+test('Codex history search resumes into older visible messages without reading a foreign thread', async t => {
+  const scoped = {...fixtureThread, name: 'First conversation'};
+  const foreign = {...fixtureThread, id: 'outside', cwd: foreignWorkspace};
+  const {client, calls} = await fixture(t, {rpcResults: {
+    'thread/list': ({cwd, cursor, limit}) => {
+      assert.deepEqual(cwd, [workspace]);
+      assert.equal(limit, 1);
+      return cursor ? {data: [foreign], nextCursor: null} : {data: [scoped], nextCursor: 'outside-page'};
+    },
+    'thread/read': ({threadId}) => ({thread: threadId === scoped.id ? scoped : foreign}),
+    'thread/turns/list': ({threadId, cursor}) => {
+      assert.equal(threadId, scoped.id);
+      const page = cursor === null ? 0 : Number(cursor);
+      return {data: [{id: 'turn-' + page, items: page === 7
+        ? [{type:'userMessage',content:[{type:'text',text:'release CHECKPOINT note'}]}]
+        : [{type:'reasoning',summary:['private checkpoint']}, {type:'agentMessage',text:'Ordinary update'}]}],
+      nextCursor: page === 7 ? null : String(page + 1)};
+    },
+  }});
+  const native = client();
+  const recent = await native.searchHistory([workspace], 'checkpoint', null);
+  assert.deepEqual(recent.matches, []);
+  assert.ok(recent.nextCursor);
+  assert.equal(calls.filter(([method]) => method === 'thread/turns/list').length, 6);
+  const older = await native.searchHistory([workspace], 'checkpoint', recent.nextCursor);
+  assert.equal(older.nextCursor, null);
+  assert.deepEqual(older.matches, [{id:scoped.id,title:scoped.name,updatedAt:null,turnId:'turn-7',turnCursor:'7'}]);
+  assert.ok(!calls.some(([, params]) => params?.threadId === foreign.id));
+  assert.ok(calls.every(([method]) => ['initialize','initialized','thread/list','thread/read','thread/turns/list'].includes(method)));
+});
+
 test('native activity reports only scoped live flags and verified exact turn transitions', async t => {
   const active = (id, activeFlags = [], extra = {}) => ({id, cwd: workspace, preview: 'private prompt',
     status: {type: 'active', activeFlags}, ...extra});

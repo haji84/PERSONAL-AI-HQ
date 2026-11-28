@@ -12,7 +12,8 @@ import {readCurrentProject, readPortfolio, readProjectDeliverySource, readProjec
 import {normalizeSettings} from './execution-policy.mjs';
 import {readExecutionEstimateSource, readOwnerRequirementCoverage} from './delivery-records.mjs';
 import {createChatStore} from './chat-store.mjs';
-import {createCodexClient, emptyNativeActivity, isCodexLoopbackUrl, validEvidenceCursor, validEvidenceTarget} from './codex.mjs';
+import {createCodexClient, emptyNativeActivity, historySearchCursorLimit, isCodexLoopbackUrl,
+  validEvidenceCursor, validEvidenceTarget} from './codex.mjs';
 import {createOperations} from './operations.mjs';
 import {createExecutionAccess, executionHeld} from './execution-access.mjs';
 import {executionEstimates} from './execution-estimates.mjs';
@@ -229,6 +230,7 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
   });
   const nativeArtifacts = createNativeArtifacts(directory, operations.completedArtifactSource);
   let bufferedCodexArtifactBytes = 0;
+  let codexHistorySearches = 0;
   const apiEnabled = Boolean(apiDevelopment);
   const apiOptions = apiEnabled && apiDevelopment !== true ? apiDevelopment : {};
   const withProjectWorkLock = (project, act) => operations.updateExecution(project, () => {
@@ -832,6 +834,44 @@ export async function startOwnerApp({directory = defaultRuntime, port = 4328, so
     if (get && route === '/api/codex/threads') {
       const result = project.cwd.length ? await native.listThreads(project.cwd, target.searchParams.get('cursor')) : {data: [], nextCursor: null};
       return send(response, 200, result);
+    }
+    if (get && route === '/api/codex/history-search') {
+      const params = target.searchParams;
+      const query = params.get('q')?.trim();
+      const cursor = params.get('cursor');
+      if (params.getAll('project').length !== 1 || params.getAll('q').length !== 1 ||
+          params.size !== (cursor === null ? 2 : 3) || !query || query.length > 200 ||
+          (cursor !== null && (!cursor || cursor.length > historySearchCursorLimit))) {
+        throw error(400, '案件、検索する語句、続き位置を確認してください。');
+      }
+      if (!project.cwd.length) throw error(404, 'この案件のCodex接続情報がありません。');
+      if (!native.searchHistory) throw error(503, 'このCodex接続から会話本文を検索できません。');
+      if (codexHistorySearches >= 2) throw error(429, 'Codexの検索が混み合っています。');
+      if (response.destroyed) return;
+      const disconnect = new AbortController();
+      const cancel = () => disconnect.abort();
+      const timeout = AbortSignal.timeout(10000);
+      const signal = AbortSignal.any([disconnect.signal, timeout]);
+      response.once('close', cancel);
+      codexHistorySearches++;
+      try {
+        const result = await native.searchHistory(project.cwd, query, cursor, {signal});
+        if (response.destroyed) return;
+        signal.throwIfAborted();
+        if (!signedIn()) throw error(401, 'サインインが必要です。');
+        const current = readCurrentProject(directory, project.id);
+        if (!current || current.cwd.length !== project.cwd.length || current.cwd.some(cwd => !project.cwd.includes(cwd))) {
+          throw error(404, 'この案件のCodex接続情報がありません。');
+        }
+        return send(response, 200, result);
+      } catch (problem) {
+        if (response.destroyed) return;
+        if (timeout.aborted) throw error(503, '時間内に検索できませんでした。');
+        throw problem;
+      } finally {
+        codexHistorySearches--;
+        response.off('close', cancel);
+      }
     }
     if (get && route === '/api/codex/thread') {
       if (!project.cwd.length || target.searchParams.getAll('project').length !== 1 || target.searchParams.getAll('id').length !== 1) {

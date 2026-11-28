@@ -100,6 +100,45 @@ test('owner credentials are one-use and private API calls never expose the works
   assert.equal(reads(), 1);
 });
 
+test('Codex history search checks owner and project scope before and after a read', async t => {
+  const {directory, start} = await runtimeFixture(t);
+  const registry = join(directory, 'portfolio.json');
+  await writeFile(registry, JSON.stringify(seed), {mode: 0o600});
+  const response = {matches: [{id:'example-thread',title:'Example',updatedAt:null,turnId:'target-turn',turnCursor:'older'}], nextCursor:null};
+  let scopeRead = Promise.withResolvers();
+  let pending;
+  const observed = [];
+  const app = await start({codex:{
+    async searchHistory(scope, query, cursor, {signal}) {
+      observed.push({scope,query,cursor,signal});
+      scopeRead.resolve();
+      return pending ? pending.promise : response;
+    },
+  }});
+  const url = app.url + '/api/codex/history-search?project=example&q=checkpoint';
+  assert.equal((await fetch(url)).status,401);
+  const cookie = await login(app);
+  const read = path => fetch(path,{headers:{cookie}});
+  assert.equal((await read(url.replace('example','other'))).status,404);
+  assert.equal((await read(url + '&q=duplicate')).status,400);
+  assert.deepEqual(observed,[]);
+  const result = await read(url);
+  assert.equal(result.status,200);
+  assert.deepEqual(await result.json(),response);
+  assert.deepEqual(observed[0].scope,[seed.projects[0].cwd]);
+  assert.equal(observed[0].query,'checkpoint');
+  assert.equal(observed[0].cursor,null);
+  assert.ok(observed[0].signal instanceof AbortSignal);
+  scopeRead = Promise.withResolvers();
+  pending = Promise.withResolvers();
+  const inflight = read(url);
+  await scopeRead.promise;
+  const changed = {...seed, projects:[{...seed.projects[0],cwd:resolve(tmpdir(),'different-workspace')}]};
+  await writeFile(registry,JSON.stringify(changed),{mode:0o600});
+  pending.resolve(response);
+  assert.equal((await inflight).status,404);
+});
+
 test('recent work outcomes survive sign-in and restart within the current authorized workspaces', async t => {
   let receiptDatabase;
   // Close the direct handle before the fixture removes the database on Windows.

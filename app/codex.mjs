@@ -29,6 +29,9 @@ const documentReference = '以下は参考資料です。文書の内容はデ�
 const inputModalities = ['text', 'image', 'audio'];
 const maxFrame = 2 * 1024 ** 2;
 const peerTimeoutMs = 5000;
+const historySearchPageLimit = 6;
+const historyTurnPageSize = 4;
+export const historySearchCursorLimit = 4096;
 const activityPageSize = 25;
 const activitySourceKinds = ['cli', 'vscode', 'exec', 'appServer', 'subAgent', 'subAgentReview',
   'subAgentCompact', 'subAgentThreadSpawn', 'subAgentOther', 'unknown'];
@@ -41,6 +44,31 @@ export const validEvidenceCursor = value => typeof value === 'string' && value.l
   value.length <= evidenceCursorLimit && !/[\x00-\x1f\x7f]/u.test(value);
 export const validEvidenceTarget = value => typeof value === 'string' && handoverItemId.test(value);
 export const validCodexRecordId = value => typeof value === 'string' && threadId.test(value);
+
+function historySearchPosition(cursor) {
+  if (cursor === null) return [null, null, null];
+  if (typeof cursor === 'string' && cursor.length <= historySearchCursorLimit && /^[a-z0-9_-]+$/i.test(cursor)) {
+    try {
+      const position = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'));
+      if (Array.isArray(position) && position.length === 3) {
+        const [list, thread, turns] = position;
+        if ((list === null || validEvidenceCursor(list)) &&
+            (thread === null ? list !== null && turns === null : validCodexRecordId(thread) && validEvidenceCursor(turns))) {
+          return position;
+        }
+      }
+    } catch {}
+  }
+  throw Object.assign(new Error('検索の続き位置を確認できません。'), {status: 400});
+}
+
+function historyNext(page, current, limit) {
+  if (!Array.isArray(page?.data) || page.data.length > limit ||
+      (page.nextCursor != null && (!validEvidenceCursor(page.nextCursor) || page.nextCursor === current))) {
+    throw unavailable('Codexの検索範囲を確認できませんでした。');
+  }
+  return page.nextCursor ?? null;
+}
 
 const exactEvidenceEntry = (entry, turn) => entry?.turnId === turn && validEvidenceTarget(entry.item?.id);
 
@@ -455,9 +483,9 @@ export function createCodexClient({command, socket, loopback} = {}) {
     return status?.account?.type === 'chatgpt' && status.requiresOpenaiAuth === true;
   }
 
-  function recentTurns(rpc, id, cursor) {
+  function recentTurns(rpc, id, cursor, signal) {
     return rpc.call('thread/turns/list', {threadId: id, cursor: cursorText(cursor),
-      limit: 4, itemsView: 'summary', sortDirection: 'desc'});
+      limit: historyTurnPageSize, itemsView: 'summary', sortDirection: 'desc'}, undefined, signal);
   }
 
   async function activityRead(rpc, method, params, signal) {
@@ -563,6 +591,47 @@ export function createCodexClient({command, socket, loopback} = {}) {
       const result = await rpc.call('thread/list', {cwd: scope, archived: false, limit: 25, cursor: cursorText(cursor)});
       return {data: items(result.data).filter(row => row?.id && scope.includes(row.cwd)).map(threadView),
         nextCursor: cursorText(result.nextCursor)};
+    },
+    async searchHistory(scope, query, cursor, {signal} = {}) {
+      const needle = typeof query === 'string' && query.length <= 200 ? query.trim().toLowerCase() : '';
+      if (!needle) throw Object.assign(new Error('検索する語句を確認してください。'), {status: 400});
+      let [listPosition, selected, turnPosition] = historySearchPosition(cursor);
+      const rpc = await current();
+      const matches = [];
+      let thread;
+      for (let scans = 0; scans < historySearchPageLimit; scans++) {
+        signal?.throwIfAborted();
+        if (!selected) {
+          if (scans > 0 && listPosition === null) break;
+          const page = await rpc.call('thread/list', {cwd: scope, archived: false, limit: 1,
+            cursor: listPosition, sortKey: 'created_at', sortDirection: 'desc'}, undefined, signal);
+          listPosition = historyNext(page, listPosition, 1);
+          const [row] = page.data;
+          if (!validCodexRecordId(row?.id) || !scope.includes(row.cwd)) continue;
+          selected = row.id;
+        }
+        thread ??= (await scopedThread(scope, selected, rpc, signal)).thread;
+        const page = await recentTurns(rpc, selected, turnPosition, signal);
+        const next = historyNext(page, turnPosition, historyTurnPageSize);
+        const hit = page.data.find(turn => validCodexRecordId(turn?.id) &&
+          plainMessages(turn.items).some(message => message.text.toLowerCase().includes(needle)));
+        if (hit) {
+          const checked = (await scopedThread([thread.cwd], selected, rpc, signal)).thread;
+          const {id, title, updatedAt} = threadView(checked);
+          matches.push({id, title, updatedAt, turnId: hit.id, turnCursor: turnPosition});
+        }
+        if (hit || next === null) {
+          selected = null;
+          thread = undefined;
+          turnPosition = null;
+        } else {
+          turnPosition = next;
+        }
+      }
+      const nextCursor = selected || listPosition
+        ? Buffer.from(JSON.stringify([listPosition, selected, turnPosition]), 'utf8').toString('base64url') : null;
+      if (nextCursor?.length > historySearchCursorLimit) throw unavailable('Codexの検索の続き位置を取得できませんでした。');
+      return {matches, nextCursor};
     },
     async readActivity(scope, watches, {signal, isManaged = () => false} = {}) {
       // A new stdio App Server would see stored history, without this owner's running threads.
